@@ -1,0 +1,39 @@
+[package]
+name = "corr-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Real-time correlator host side: multicast receive, frame assembly, block scheduling, output"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+[build-dependencies]
+cmake = "0.1"
+
+[[bin]]
+name = "corr"
+path = "src/main.rs"
+
+[[bin]]
+name = "corr-replay"
+path = "src/bin/replay.rs"
+
+[profile.release]
+# The receive path is a busy-poll loop that must never be deoptimised into
+# something slower than the kernel's own copy; keep overflow checks off and let
+# LTO see across the crate, but keep debug assertions separate so that a debug
+# build can still trip the layout invariants.
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 1
+
+[profile.dev]
+opt-level = 1

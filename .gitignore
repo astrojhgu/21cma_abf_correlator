@@ -1,0 +1,18 @@
+# Rust build products
+corr-rs/target/
+
+# CUDA/CMake build products (corr-rs/build.rs builds this out-of-tree into target/,
+# but a manual cmake build lands here)
+corr-cuda/build/
+*.o
+*.so
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

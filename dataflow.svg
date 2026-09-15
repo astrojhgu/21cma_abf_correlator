@@ -1,0 +1,355 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1310" viewBox="0 0 1600 1310" font-family="Noto Sans CJK SC, Noto Sans CJK JP, sans-serif">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#202124"/></marker><marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#d93025"/></marker><marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#7b1fa2"/></marker></defs>
+<rect width="1600" height="1310" fill="#ffffff"/>
+<text x="60" y="30" font-size="21" font-weight="700" fill="#202124">相关机数据流（当前实现）</text>
+<text x="430" y="30" font-size="12.5" fill="#5f6368" text-anchor="start">1 s 积分 · 24 路 · 每站 195,312.5 包/s · 4104 B/包(8 B counter + 4096 int8) · 帧 = 8192 样本 @ 97,656.25 Hz · 行 = 97,792 帧 = 1.0014 s</text>
+<rect x="14" y="48" width="30" height="104" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="100.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 100.0)">① 入口</text>
+<rect x="60" y="48" width="500" height="104" rx="10" fill="#e8f0fe" stroke="#1967d2" stroke-width="1.6"/>
+<text x="72" y="69" font-size="15" font-weight="600" fill="#1967d2">RFSoC 前端（3 块板 × 24 站）</text>
+<text x="72" y="88" font-size="12.5" fill="#202124">每站一个多播组 239.1.13x/16x:100xx，counter 是三块板共享的全局包计数</text>
+<text x="72" y="104.5" font-size="12.5" fill="#202124">每包 4104 B：8 B little-endian counter + 4096 个 int8 样本</text>
+<text x="72" y="121.0" font-size="12.5" fill="#202124">合计 4.69 Mpps / 155 Gbit/s（24 路）；40 路将是 7.81 Mpps / 259 Gbit/s</text>
+<rect x="580" y="48" width="420" height="104" rx="10" fill="#e8f0fe" stroke="#1967d2" stroke-width="1.6"/>
+<text x="592" y="69" font-size="15" font-weight="600" fill="#1967d2">ens2f0np0（200 Gb/s，NUMA node 0）</text>
+<text x="592" y="88" font-size="12.5" fill="#202124">每组一个 socket，SO_RCVBUF 实测授予 512 MiB/组</text>
+<text x="592" y="104.5" font-size="12.5" fill="#202124">recvmmsg 批量 32；SO_BUSY_POLL 返回 EPERM（无 root）</text>
+<text x="592" y="121.0" font-size="12.5" fill="#202124">40 路时入口需 ≥400G 或 2×200G bond（这块网卡是 24 路的量级）</text>
+<rect x="1020" y="48" width="540" height="104" rx="10" fill="#f8f9fa" stroke="#5f6368" stroke-width="1.6"/>
+<text x="1032" y="69" font-size="15" font-weight="600" fill="#5f6368">入口实测（本轮）</text>
+<text x="1032" y="88" font-size="12.5" fill="#202124">dry-run（只收包，无 GPU）：196 kpps/站 · 4.69 Mpps 总 · 丢包 0 · 0.5 s 内无缺口</text>
+<text x="1032" y="104.5" font-size="12.5" fill="#202124">⇒ 收包路径本身不丢包，也没有被其他用户的负载拖垮</text>
+<text x="1032" y="121.0" font-size="12.5" fill="#202124">produce 模式下收到的速率上限 = 管线的消费速率（见 ④）</text>
+<line x1="560" y1="100" x2="578" y2="100" stroke="#202124" stroke-width="1.6" marker-end="url(#ah)"/>
+<line x1="1000" y1="100" x2="1018" y2="100" stroke="#202124" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="14" y="172" width="30" height="158" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="251.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 251.0)">② 拼帧</text>
+<rect x="60" y="172" width="1500" height="158" rx="10" fill="#e6f4ea" stroke="#137333" stroke-width="1.6"/>
+<text x="72" y="193" font-size="15" font-weight="600" fill="#137333">收包线程 ×24（每站 1 个，绑核 0..23）</text>
+<rect x="76" y="200" width="258" height="66" rx="8" fill="#ffffff" stroke="#137333" stroke-width="1.3"/>
+<text x="86" y="221" font-size="13.5" font-weight="600" fill="#137333">recvmmsg 批量取包</text>
+<text x="86" y="238" font-size="11.5" fill="#202124">32 个/次，非阻塞轮询 + 5 ms 超时</text>
+<line x1="336" y1="233" x2="350" y2="233" stroke="#137333" stroke-width="1.3" marker-end="url(#ah)"/>
+<rect x="352" y="200" width="258" height="66" rx="8" fill="#ffffff" stroke="#137333" stroke-width="1.3"/>
+<text x="362" y="221" font-size="13.5" font-weight="600" fill="#137333">解析 counter</text>
+<text x="362" y="238" font-size="11.5" fill="#202124">frame_id = counter / P（P =</text>
+<text x="362" y="253" font-size="11.5" fill="#202124">n_freq/2048 = 2）</text>
+<line x1="612" y1="233" x2="626" y2="233" stroke="#137333" stroke-width="1.3" marker-end="url(#ah)"/>
+<rect x="628" y="200" width="258" height="66" rx="8" fill="#ffffff" stroke="#137333" stroke-width="1.3"/>
+<text x="638" y="221" font-size="13.5" font-weight="600" fill="#137333">定位 staging</text>
+<text x="638" y="238" font-size="11.5" fill="#202124">slot_seq = frame_id/256；slot =</text>
+<text x="638" y="253" font-size="11.5" fill="#202124">slot_seq % 3；帧内偏移 = frame_id %</text>
+<text x="638" y="268" font-size="11.5" fill="#202124">256</text>
+<line x1="888" y1="233" x2="902" y2="233" stroke="#137333" stroke-width="1.3" marker-end="url(#ah)"/>
+<rect x="904" y="200" width="300" height="66" rx="8" fill="#ffffff" stroke="#137333" stroke-width="1.3"/>
+<text x="914" y="221" font-size="13.5" font-weight="600" fill="#137333">写整帧</text>
+<text x="914" y="238" font-size="11.5" fill="#202124">2 个包拼成 8192 B，落进该站自己的 staging</text>
+<text x="914" y="253" font-size="11.5" fill="#202124">区域；缺包的帧整帧补零</text>
+<line x1="1206" y1="233" x2="1220" y2="233" stroke="#137333" stroke-width="1.3" marker-end="url(#ah)"/>
+<rect x="1222" y="200" width="258" height="66" rx="8" fill="#ffffff" stroke="#137333" stroke-width="1.3"/>
+<text x="1232" y="221" font-size="13.5" font-weight="600" fill="#137333">发布进度</text>
+<text x="1232" y="238" font-size="11.5" fill="#202124">progress = 第一个未 final</text>
+<text x="1232" y="253" font-size="11.5" fill="#202124">的帧；last_packet_ns = 现在</text>
+<text x="76" y="292" font-size="12.5" fill="#5f6368" text-anchor="start">实测：196 kpps/站、4.69 Mpps、丢包 0（dry-run）；自适应等待下进程 CPU 6.1 核（纯自旋为 21.5 核）——收包路径不是瓶颈</text>
+<text x="76" y="310" font-size="12.5" fill="#5f6368" text-anchor="start">补零上限：单站累计补零 &gt; 488,281 帧 → 干净停止并报出是哪一路（防止无限产零）</text>
+<rect x="14" y="350" width="30" height="176" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="438.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 438.0)">③ staging</text>
+<rect x="60" y="350" width="1500" height="176" rx="10" fill="#fef7e0" stroke="#b06000" stroke-width="1.6"/>
+<text x="72" y="371" font-size="15" font-weight="600" fill="#b06000">共享 pinned staging：24 站 × 3 槽 × 256 帧 × 8192 B = 144 MiB（cudaHostAllocPortable，收包线程写一次，多张卡同时读）</text>
+<text x="76" y="396" font-size="12.5" fill="#202124" font-weight="600" text-anchor="start">布局 [站][槽][帧][样本]：</text>
+<rect x="96" y="408" width="150" height="52" rx="6" fill="#ffe9b8" stroke="#b06000" stroke-width="1.2"/>
+<text x="104" y="426" font-size="12" font-weight="600" fill="#8a4b00">槽 0：256 帧</text>
+<rect x="104" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="119" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="138" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="153" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="172" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="187" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="206" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="221" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<text x="171" y="445" font-size="10" fill="#5f6368" text-anchor="middle">… 256 帧 = 2 MiB</text>
+<rect x="264" y="408" width="150" height="52" rx="6" fill="#ffe9b8" stroke="#b06000" stroke-width="1.2"/>
+<text x="272" y="426" font-size="12" font-weight="600" fill="#8a4b00">槽 1：256 帧</text>
+<rect x="272" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="287" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="306" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="321" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="340" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="355" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="374" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="389" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<text x="339" y="445" font-size="10" fill="#5f6368" text-anchor="middle">… 256 帧 = 2 MiB</text>
+<rect x="432" y="408" width="150" height="52" rx="6" fill="#ffe9b8" stroke="#b06000" stroke-width="1.2"/>
+<text x="440" y="426" font-size="12" font-weight="600" fill="#8a4b00">槽 2：256 帧</text>
+<rect x="440" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="455" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="474" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="489" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="508" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="523" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<rect x="542" y="432" width="30" height="18" rx="3" fill="#fff7e0" stroke="#b06000" stroke-width="0.8"/>
+<text x="557" y="445" font-size="10" fill="#5f6368" text-anchor="middle">帧</text>
+<text x="507" y="445" font-size="10" fill="#5f6368" text-anchor="middle">… 256 帧 = 2 MiB</text>
+<text x="608" y="442" font-size="13" fill="#202124" font-weight="600">… 站 1 … 站 23（每站 3 槽 = 6 MiB，24 站合计 144 MiB）</text>
+<text x="76" y="462" font-size="12.5" fill="#202124" text-anchor="start">① 一张卡的 resident 站集合是分散的 → 拷贝按“站”发（每站一段连续内存，1D 拷贝）；resident 恰好是全部站时退化成一条 2D 描述符</text>
+<text x="76" y="480" font-size="12.5" fill="#202124" text-anchor="start">② slot 释放 = 所有持有该站副本的卡都拷完（AND）——多读者，R 越大抖动越大</text>
+<text x="76" y="498" font-size="12.5" fill="#202124" text-anchor="start">③ 起始帧是按嗅探 counter 预测的；第一包若落在窗口之外，ring 会前移（启动时允许）或报 StartupGap 干净停止</text>
+<rect x="14" y="548" width="30" height="330" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="713.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 713.0)">④ 计算</text>
+<text x="76" y="560" font-size="13" fill="#202124" font-weight="600" text-anchor="start">每张卡 = 一个 CUDA context（一条 copy stream + 一条 compute stream + 一条 fetch stream，事件串联）</text>
+<rect x="60" y="580" width="356" height="288" rx="10" fill="#f3e8fd" stroke="#7b1fa2" stroke-width="1.8"/>
+<text x="72" y="602" font-size="15" font-weight="700" fill="#7b1fa2">GPU 0  L20 · node 2 · Gen4 x16</text>
+<text x="72" y="620" font-size="12.5" fill="#202124">resident 16 站 · 基线 0..73（73 条） · 实测 10.2~12.0 GB/s</text>
+<text x="72" y="638" font-size="11" fill="#5f6368">resident 集合（0..23）：</text>
+<rect x="72" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="82" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="92" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="102" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="112" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="122" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="132" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="142" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="152" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="162" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="172" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="182" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="192" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="202" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="212" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="222" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="232" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="242" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="252" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="262" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="272" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="282" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="292" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="302" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="72" y="668" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="683.5" font-size="12" fill="#202124">H2D 逐站拷贝（copy stream，异步）</text>
+<line x1="238.0" y1="690" x2="238.0" y2="695" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="695" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="710.5" font-size="12" fill="#202124">int8 → float32（convert kernel）</text>
+<line x1="238.0" y1="717" x2="238.0" y2="722" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="722" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="737.5" font-size="12" fill="#202124">cuFFT R2C，长度 8192，批 = 本卡站数×256</text>
+<line x1="238.0" y1="744" x2="238.0" y2="749" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="749" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="764.5" font-size="12" fill="#202124">相关 kernel（本卡 pair 表，j ≤ k）</text>
+<line x1="238.0" y1="771" x2="238.0" y2="776" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="776" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="791.5" font-size="12" fill="#202124">行累加器 +=  Y_j · conj(Y_k)（显存常驻）</text>
+<line x1="238.0" y1="798" x2="238.0" y2="803" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="803" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="818.5" font-size="12" fill="#202124">scale ÷ n_cum → 行栈 rows_per_fetch</text>
+<line x1="238.0" y1="825" x2="238.0" y2="830" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="72" y="830" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="82" y="845.5" font-size="12" fill="#202124">D2H：本卡基线 slice → host 行缓冲</text>
+<text x="72" y="872" font-size="11.5" fill="#5f6368" text-anchor="start">R = Σ resident / 站数 = 62/24 = 2.58 → 每卡需求 12.4 GB/s；纯拷贝能力 20.3 GB/s/卡</text>
+<rect x="428" y="580" width="356" height="288" rx="10" fill="#f3e8fd" stroke="#7b1fa2" stroke-width="1.8"/>
+<text x="440" y="602" font-size="15" font-weight="700" fill="#7b1fa2">GPU 1  L20 · node 2 · Gen4 x16</text>
+<text x="440" y="620" font-size="12.5" fill="#202124">resident 16 站 · 基线 1..79（77 条） · 实测 10.2~12.0 GB/s</text>
+<text x="440" y="638" font-size="11" fill="#5f6368">resident 集合（0..23）：</text>
+<rect x="440" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="450" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="460" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="470" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="480" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="490" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="500" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="510" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="520" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="530" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="540" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="550" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="560" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="570" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="580" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="590" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="600" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="610" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="620" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="630" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="640" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="650" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="660" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="670" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="440" y="668" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="683.5" font-size="12" fill="#202124">H2D 逐站拷贝（copy stream，异步）</text>
+<line x1="606.0" y1="690" x2="606.0" y2="695" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="695" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="710.5" font-size="12" fill="#202124">int8 → float32（convert kernel）</text>
+<line x1="606.0" y1="717" x2="606.0" y2="722" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="722" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="737.5" font-size="12" fill="#202124">cuFFT R2C，长度 8192，批 = 本卡站数×256</text>
+<line x1="606.0" y1="744" x2="606.0" y2="749" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="749" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="764.5" font-size="12" fill="#202124">相关 kernel（本卡 pair 表，j ≤ k）</text>
+<line x1="606.0" y1="771" x2="606.0" y2="776" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="776" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="791.5" font-size="12" fill="#202124">行累加器 +=  Y_j · conj(Y_k)（显存常驻）</text>
+<line x1="606.0" y1="798" x2="606.0" y2="803" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="803" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="818.5" font-size="12" fill="#202124">scale ÷ n_cum → 行栈 rows_per_fetch</text>
+<line x1="606.0" y1="825" x2="606.0" y2="830" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="440" y="830" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="450" y="845.5" font-size="12" fill="#202124">D2H：本卡基线 slice → host 行缓冲</text>
+<rect x="796" y="580" width="356" height="288" rx="10" fill="#f3e8fd" stroke="#7b1fa2" stroke-width="1.8"/>
+<text x="808" y="602" font-size="15" font-weight="700" fill="#7b1fa2">GPU 2  L20 · node 7 · Gen4 x16</text>
+<text x="808" y="620" font-size="12.5" fill="#202124">resident 15 站 · 基线 2..76（75 条） · 实测 9.6~11.2 GB/s</text>
+<text x="808" y="638" font-size="11" fill="#5f6368">resident 集合（0..23）：</text>
+<rect x="808" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="818" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="828" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="838" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="848" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="858" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="868" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="878" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="888" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="898" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="908" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="918" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="928" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="938" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="948" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="958" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="968" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="978" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="988" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="998" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1008" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1018" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1028" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1038" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="808" y="668" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="683.5" font-size="12" fill="#202124">H2D 逐站拷贝（copy stream，异步）</text>
+<line x1="974.0" y1="690" x2="974.0" y2="695" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="695" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="710.5" font-size="12" fill="#202124">int8 → float32（convert kernel）</text>
+<line x1="974.0" y1="717" x2="974.0" y2="722" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="722" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="737.5" font-size="12" fill="#202124">cuFFT R2C，长度 8192，批 = 本卡站数×256</text>
+<line x1="974.0" y1="744" x2="974.0" y2="749" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="749" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="764.5" font-size="12" fill="#202124">相关 kernel（本卡 pair 表，j ≤ k）</text>
+<line x1="974.0" y1="771" x2="974.0" y2="776" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="776" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="791.5" font-size="12" fill="#202124">行累加器 +=  Y_j · conj(Y_k)（显存常驻）</text>
+<line x1="974.0" y1="798" x2="974.0" y2="803" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="803" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="818.5" font-size="12" fill="#202124">scale ÷ n_cum → 行栈 rows_per_fetch</text>
+<line x1="974.0" y1="825" x2="974.0" y2="830" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="808" y="830" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="818" y="845.5" font-size="12" fill="#202124">D2H：本卡基线 slice → host 行缓冲</text>
+<rect x="1164" y="580" width="356" height="288" rx="10" fill="#f3e8fd" stroke="#7b1fa2" stroke-width="1.8"/>
+<text x="1176" y="602" font-size="15" font-weight="700" fill="#7b1fa2">GPU 3  L20 · node 7 · Gen4 x16</text>
+<text x="1176" y="620" font-size="12.5" fill="#202124">resident 15 站 · 基线 3..80（75 条） · 实测 9.6~11.2 GB/s</text>
+<text x="1176" y="638" font-size="11" fill="#5f6368">resident 集合（0..23）：</text>
+<rect x="1176" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1186" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1196" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1206" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1216" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1226" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1236" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1246" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1256" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1266" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1276" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1286" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1296" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1306" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1316" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1326" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1336" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1346" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1356" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1366" y="644" width="9" height="9" rx="1.5" fill="#ffffff" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1376" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1386" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1396" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1406" y="644" width="9" height="9" rx="1.5" fill="#7b1fa2" stroke="#7b1fa2" stroke-width="0.8"/>
+<rect x="1176" y="668" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="683.5" font-size="12" fill="#202124">H2D 逐站拷贝（copy stream，异步）</text>
+<line x1="1342.0" y1="690" x2="1342.0" y2="695" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="695" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="710.5" font-size="12" fill="#202124">int8 → float32（convert kernel）</text>
+<line x1="1342.0" y1="717" x2="1342.0" y2="722" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="722" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="737.5" font-size="12" fill="#202124">cuFFT R2C，长度 8192，批 = 本卡站数×256</text>
+<line x1="1342.0" y1="744" x2="1342.0" y2="749" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="749" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="764.5" font-size="12" fill="#202124">相关 kernel（本卡 pair 表，j ≤ k）</text>
+<line x1="1342.0" y1="771" x2="1342.0" y2="776" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="776" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="791.5" font-size="12" fill="#202124">行累加器 +=  Y_j · conj(Y_k)（显存常驻）</text>
+<line x1="1342.0" y1="798" x2="1342.0" y2="803" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="803" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="818.5" font-size="12" fill="#202124">scale ÷ n_cum → 行栈 rows_per_fetch</text>
+<line x1="1342.0" y1="825" x2="1342.0" y2="830" stroke="#7b1fa2" stroke-width="1.1" marker-end="url(#ahg)"/>
+<rect x="1176" y="830" width="332" height="22" rx="5" fill="#ffffff" stroke="#7b1fa2" stroke-width="1"/>
+<text x="1186" y="845.5" font-size="12" fill="#202124">D2H：本卡基线 slice → host 行缓冲</text>
+<line x1="238.0" y1="528" x2="238.0" y2="578" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="606.0" y1="528" x2="606.0" y2="578" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="974.0" y1="528" x2="974.0" y2="578" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="1342.0" y1="528" x2="1342.0" y2="578" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<text x="760" y="546" font-size="12" fill="#7b1fa2" text-anchor="middle">H2D：按卡自己的 resident 集合搬（同一站的字节被 R 张卡各搬一次）</text>
+<line x1="238.0" y1="870" x2="238.0" y2="906" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="606.0" y1="870" x2="606.0" y2="906" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="974.0" y1="870" x2="974.0" y2="906" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<line x1="1342.0" y1="870" x2="1342.0" y2="906" stroke="#7b1fa2" stroke-width="1.8" marker-end="url(#ahg)"/>
+<rect x="14" y="908" width="30" height="150" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="983.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 983.0)">⑤ 调度</text>
+<rect x="60" y="908" width="1000" height="150" rx="10" fill="#e8eaed" stroke="#3c4043" stroke-width="1.6"/>
+<text x="72" y="929" font-size="15" font-weight="600" fill="#3c4043">管道线程（1 个，绑核 24）——它只排队和等待，不算数</text>
+<rect x="76" y="938" width="178" height="52" rx="7" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+<text x="86" y="957" font-size="12.5" font-weight="600" fill="#3c4043">水位线</text>
+<text x="86" y="974" font-size="11" fill="#202124">min(各站 progress)</text>
+<line x1="256" y1="964" x2="268" y2="964" stroke="#3c4043" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="270" y="938" width="178" height="52" rx="7" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+<text x="280" y="957" font-size="12.5" font-weight="600" fill="#3c4043">提交槽</text>
+<text x="280" y="974" font-size="11" fill="#202124">corr_row_accumulate</text>
+<line x1="450" y1="964" x2="462" y2="964" stroke="#3c4043" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="464" y="938" width="178" height="52" rx="7" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+<text x="474" y="957" font-size="12.5" font-weight="600" fill="#3c4043">释放槽</text>
+<text x="474" y="974" font-size="11" fill="#202124">corr_row_slot_free（等所有卡）</text>
+<line x1="644" y1="964" x2="656" y2="964" stroke="#3c4043" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="658" y="938" width="178" height="52" rx="7" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+<text x="668" y="957" font-size="12.5" font-weight="600" fill="#3c4043">关行</text>
+<text x="668" y="974" font-size="11" fill="#202124">corr_row_end（÷n_cum）</text>
+<line x1="838" y1="964" x2="850" y2="964" stroke="#3c4043" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="852" y="938" width="178" height="52" rx="7" fill="#ffffff" stroke="#3c4043" stroke-width="1.2"/>
+<text x="862" y="957" font-size="12.5" font-weight="600" fill="#3c4043">取行</text>
+<text x="862" y="974" font-size="11" fill="#202124">rows_wait + rows_fetch</text>
+<text x="76" y="1010" font-size="12.5" fill="#202124" font-weight="600" text-anchor="start">实测时间分解（24 路 4 卡 covering）：排队 0.6 s、等释放 10.0 s（占 71%）、取行 ~0 ⇒ 它卡在“等拷贝”上</text>
+<text x="76" y="1028" font-size="11.5" fill="#5f6368" text-anchor="start">补零/脱困：某站 200 ms 无任何包 → 调度器要求它补零到当前槽末（受 488,281 帧上限约束）；调度器只对有包到达的站判活</text>
+<rect x="1076" y="908" width="484" height="150" rx="10" fill="#f1f3f4" stroke="#d93025" stroke-width="1.6" stroke-dasharray="5 4"/>
+<text x="1088" y="929" font-size="15" font-weight="600" fill="#d93025">控制面（虚线）</text>
+<text x="1088" y="948" font-size="12.5" fill="#202124">水位线 ← 各站 progress（原子量）</text>
+<text x="1088" y="964.5" font-size="12.5" fill="#202124">补零请求 → 收包线程 advance_to</text>
+<text x="1088" y="981.0" font-size="12.5" fill="#202124">释放 → ring 唤醒等待者（自适应等待）</text>
+<text x="1088" y="997.5" font-size="12.5" fill="#202124">停止：SIGINT / 补零超限 / StartupGap / 收包致命错</text>
+<rect x="14" y="1078" width="30" height="152" rx="8" fill="#f1f3f4" stroke="#dadce0"/>
+<text x="29" y="1154.0" font-size="14" font-weight="700" fill="#5f6368" text-anchor="middle" transform="rotate(-90 29 1154.0)">⑥ 输出</text>
+<rect x="60" y="1078" width="900" height="152" rx="10" fill="#fce8e6" stroke="#c5221f" stroke-width="1.6"/>
+<text x="72" y="1099" font-size="15" font-weight="600" fill="#c5221f">行拼装 + writer（在管道线程里同步执行）</text>
+<text x="72" y="1118" font-size="12.5" fill="#202124">每行 = 300 baseline × 4096 bin × complex64 = 9.83 MB</text>
+<text x="72" y="1134.5" font-size="12.5" fill="#202124">covering 下每卡的基线在全局编号里散开 → 库内先取到 scratch，再按全局基线号逐个放置</text>
+<text x="72" y="1151.0" font-size="12.5" fill="#202124">基线归属由 corr_device_baselines 可查；拼好后写盘：</text>
+<text x="72" y="1167.5" font-size="12.5" fill="#202124">  300 个 baseline_NNNN_jNN_kNN.bin（O_APPEND 语义但用 seek，可续写）</text>
+<text x="72" y="1184.0" font-size="12.5" fill="#202124">  rows_ms.bin / rows_ms.txt（每行首帧 final 的时刻，Unix ms）</text>
+<text x="72" y="1200.5" font-size="12.5" fill="#202124">  blocks.csv（每站每行：first_frame_id, n_cum, valid, zero_filled）</text>
+<text x="72" y="1217.0" font-size="12.5" fill="#202124">  metadata.yaml（几何 + config_hash，续写时校验）</text>
+<rect x="980" y="1078" width="580" height="152" rx="10" fill="#fce8e6" stroke="#c5221f" stroke-width="1.6"/>
+<text x="992" y="1099" font-size="15" font-weight="600" fill="#c5221f">输出速率与续写</text>
+<text x="992" y="1118" font-size="12.5" fill="#202124">1 s 积分：9.82 MB/s、300 文件写/s、fsync 300 次/行（fsync_every_rows=1）</text>
+<text x="992" y="1134.5" font-size="12.5" fill="#202124">10 ms 积分：937 MB/s、28,610 fsync/s ⇒ 必须先实现 storage.writers（见 HANDOFF 6.9）</text>
+<text x="992" y="1151.0" font-size="12.5" fill="#202124">/scratch：实测单线程缓冲写 837 MB/s；全局 sync 会卡数分钟，别用它计时</text>
+<text x="992" y="1167.5" font-size="12.5" fill="#202124">续写：config_hash 一致才允许；四个文件按行数取最小者对齐，可随时 Ctrl-C</text>
+<line x1="880" y1="1060" x2="880" y2="1076" stroke="#c5221f" stroke-width="1.8" marker-end="url(#ah)"/>
+<line x1="980" y1="1154" x2="1000" y2="1154" stroke="#c5221f" stroke-width="1.2" marker-end="url(#ah)"/>
+<rect x="60" y="1244" width="1500" height="48" rx="8" fill="#f8f9fa" stroke="#dadce0"/>
+<text x="76" y="1263" font-size="12.5" fill="#202124"><tspan font-weight="700">R（复制因子）= 图中“同一站的字节被搬几次”的倍数。</tspan>约束：R × 32 GB/s ≤ 4 × 每卡可达 H2D。实测 4 卡纯拷贝 81~97 GB/s（20.3/卡）、管线 60 GB/s（15/卡）；40 路在 R=2.10 时需 67 GB/s（每卡 16.8）。</text>
+<text x="76" y="1281" font-size="12.5" fill="#202124"><tspan font-weight="700">⇒ 差 10~15%：需要三条乘法杠杆之一或组合 —— ①R 从 2.58 压到 2.10　②每卡能力 15→20 GB/s　③每站字节减半（4 bit 打包）。</tspan></text>
+</svg>

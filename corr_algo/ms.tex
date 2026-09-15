@@ -1,0 +1,68 @@
+\documentclass[11pt,includemp,a4paper]{article}
+%\documentclass[11pt]{book}
+%\usepackage{pspicture}
+%\usepackage{pstricks}
+\usepackage{fancyhdr}
+%\usepackage{pict2e}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[UTF8]{ctex}
+\usepackage{fontspec}
+
+%usepackage{amsmath}
+
+\usepackage[ruled,vlined]{algorithm2e}
+
+\title{Title here}
+\author{}
+
+
+\begin{document}
+\begin{algorithm}[H]
+    \SetAlgoLined
+     可配置参数: 频点数$N_{\rm freq}$, 用于积分的帧数$N_{\rm cum}$, 参与采集的ADC数目$N_{\rm station}$\;
+     输入：来自ADC的数据通过缓冲区后形成的数据帧，每一帧的长度为$2N_{\rm freq}$，16bit带符号整数\;
+     全局变量 $\mathbf{corr}[N_{\rm baseline}][N_{\rm freq}]$, $N_{\rm baseline}=\frac{N_{\rm station}(N_{\rm station}+1)}{2}$\;
+     
+     \While {}{
+         $\mathbf{corr}\leftarrow \mathbf{0}$\;
+         $i\leftarrow0$\;
+        \For{ i $<N_{\rm cum}$ }{
+            $j\leftarrow1$\;
+            $l\leftarrow1$\;
+            \For{j$\leq N_{\rm station}$}{
+                $k\leftarrow j$\;
+                \For{k$\leq N_{\rm station}$}{
+                    $\mathbf{x}_1\leftarrow$ ADC$_j$ data//注：此处为一帧数据，长度$2N_{\rm freq}$，并非单个数据点\;
+                    $\mathbf{x}_2\leftarrow$ ADC$_k$ data//同上\;
+                    $\mathbf{corr}[l,:]\leftarrow \mathbf{corr}[l,:]+calcCorr(\mathbf{x}_1, \mathbf{x}_2)$;//calcCorr见算法\ref{algo:single_corr}\;
+                    $k\leftarrow k+1$\;
+                    $l\leftarrow l+1$;
+                }
+                $j\leftarrow j+1$\;
+            }
+            $i\leftarrow i+1$\;
+          }
+        将$\mathbf{corr}$存盘\;
+     }
+     输出$\mathbf{corr}$\;
+     \caption{连续不断采集并在线计算自相关和互相关}
+\end{algorithm}
+
+
+\begin{algorithm}[H]
+    \SetAlgoLined
+    \KwResult{计算两个数据帧的相关}
+     可配置参数: 频点数$N_{\rm freq}$\;
+     输入：数据帧 $\mathbf{x}_1$和$\mathbf{x}_2$，长度$2N_{\rm freq}$，数据类型 int16\;
+       $\mathbf{y}_1\leftarrow$float($\mathbf{x_1}$)\;
+       $\mathbf{y}_2\leftarrow$float($\mathbf{x_2}$)\;
+       $\mathbf{Y}_1\leftarrow$FFT($\mathbf{y}_1$);//$\mathbf{Y}_1$为单精度复数数组，长度$N_{\rm freq}$\;
+       $\mathbf{Y}_2\leftarrow$FFT($\mathbf{y}_2$);//$\mathbf{Y}_2$为单精度复数数组，长度$N_{\rm freq}$\;
+       $\mathbf{corr}\leftarrow Y_1\times conj(Y_2)$\;
+     输出$\mathbf{corr}$\;
+     \caption{\label{algo:single_corr} function calcCorr($\mathbf{x}_1$,$\mathbf{x}_2$)}
+\end{algorithm}
+
+\end{document}

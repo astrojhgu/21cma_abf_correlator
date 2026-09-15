@@ -1,0 +1,93 @@
+# 多卡功能测试配置 —— 与 correlator-test.yaml 同样的回放器测试网段
+# （239.1.200.x:200xx），但把 station 数提到 8 路，使 pair space 真的能被切成
+# 多片；gpu.devices 列出参与计算的卡。**回退到单卡就是把这一行改成 [0]**，
+# station 表不用动（stations[].gpu_id 只表示哪张卡收这一路，不限制谁参与计算）。
+#
+# 用法：
+#   corr-replay --config config/correlator-mgpu-test.yaml --rate 20000 \
+#       --duration 30 --pattern prng --sample-delay 1:2
+#   corr --config config/correlator-mgpu-test.yaml --duration 20
+#   python3 tools/compare_runs.py <单卡输出目录> <多卡输出目录>
+#
+
+version: 1
+
+run:
+  name: null
+  output_dir: /tmp/corr-mgpu
+  dry_run: false
+
+frontend:
+  data_shift_count: 5
+  sample_dtype: int8
+  sample_format: twos_complement
+
+receiver:
+  interface: ens2f0np0
+  interface_ip: 172.23.0.11
+  recv_buffer_bytes: 67108864
+  busy_poll_us: 50
+  recvmmsg_batch: 32
+  recv_timeout_ms: 5
+
+fft:
+  n_freq: 4096
+  # 回放器实际速率的 2×n_freq 倍：回放 20000 pps = 10000 帧/s，
+  # 故 10000 × 8192 = 81.92e6。这样 metadata 里的 bin_width 对得上真实回放。
+  #
+  # 注意：脱困判据**不**依赖这个值——它用的是"距上次收到包多久"的物理时间，
+  # 所以配置里的速率即使和实际不符也不会导致误判。这一点是有来历的：
+  # 早先版本用帧率推算"填满一个槽要多久"来定脱困窗口，结果回放速率只有
+  # 配置值的 1/5 时，健康的站在两个槽之间被连续误判为停发，凭空补零上万帧。
+  sample_rate_hz: 81920000
+  window: rectangular
+
+integration:
+  # 256 × 4 = 1024 帧。必须是 gpu.frames_per_slot 的整数倍。
+  n_cum: 1024
+  # 回放器速率低，超时也调短，否则一次 stall 测试要等 200 ms 才脱困。
+  block_timeout_ms: 200
+  # 回放测试用。要能装下我们想观察的中断：1.5 秒 × 10,000 帧/s = 15,000 帧，
+  # 留一倍余量取 40 行。想验证"超限即停"就用更长的 stall（见 README）。
+  zero_fill_limit_frames: 40960
+  start_frame_id: null
+
+gpu:
+  devices: [0, 1, 2, 3]
+  frames_per_slot: 256
+  chunk_frames: 256
+  block_slots: 8
+  rows_per_fetch: 1
+
+storage:
+  writers: 1
+  queue_bytes: 268435456
+  fsync_on_stop: true
+  # 每写多少行 fsync 一次 baseline 文件。
+  # 1 = 每行都落盘（最安全，每行每文件一次 fsync）：
+  #   1 秒积分 24 路 = 300 次/s，没问题；
+  #   100 ms 积分 = 3000 次/s，NFS 开始吃力；
+  #   10 ms 积分 = 28610 次/s，必然撑不住，短积分必须调大这个值。
+  # 调大的代价：崩溃最多丢这么多行；sidecar 仍在数据之后写，
+  # 所以丢的行是四个文件一起缺，不会出现半行。
+  fsync_every_rows: 1
+
+cpu:
+  recv_cpus: [0, 1, 2, 3, 4, 5, 6, 7]
+  pipeline_cpu: 8
+  writer_cpus: [9]
+  monitor_cpu: 10
+
+monitoring:
+  interval_ms: 1000
+  stats_csv: false
+
+stations:
+  - {name: T01, group_ip: 239.1.200.1, dest_port: 20001, interface: ens2f0np0, source_ip: 172.23.0.201, board: replay, order: 0, gpu_id: 0, enabled: true}
+  - {name: T02, group_ip: 239.1.200.2, dest_port: 20002, interface: ens2f0np0, source_ip: 172.23.0.202, board: replay, order: 1, gpu_id: 1, enabled: true}
+  - {name: T03, group_ip: 239.1.200.3, dest_port: 20003, interface: ens2f0np0, source_ip: 172.23.0.203, board: replay, order: 2, gpu_id: 2, enabled: true}
+  - {name: T04, group_ip: 239.1.200.4, dest_port: 20004, interface: ens2f0np0, source_ip: 172.23.0.204, board: replay, order: 3, gpu_id: 3, enabled: true}
+  - {name: T05, group_ip: 239.1.200.5, dest_port: 20005, interface: ens2f0np0, source_ip: 172.23.0.205, board: replay, order: 4, gpu_id: 0, enabled: true}
+  - {name: T06, group_ip: 239.1.200.6, dest_port: 20006, interface: ens2f0np0, source_ip: 172.23.0.206, board: replay, order: 5, gpu_id: 1, enabled: true}
+  - {name: T07, group_ip: 239.1.200.7, dest_port: 20007, interface: ens2f0np0, source_ip: 172.23.0.207, board: replay, order: 6, gpu_id: 2, enabled: true}
+  - {name: T08, group_ip: 239.1.200.8, dest_port: 20008, interface: ens2f0np0, source_ip: 172.23.0.208, board: replay, order: 7, gpu_id: 3, enabled: true}
