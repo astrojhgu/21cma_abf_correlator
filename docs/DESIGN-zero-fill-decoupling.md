@@ -98,7 +98,7 @@
 ```bash
 pkill -x corr-replay                       # 不是 -f：-f 会杀掉执行它的 shell
 python3 -c "import re;s=open('config/correlator-24-replay.yaml').read();\
-open('/tmp/cfg-stall.yaml','w').write(re.sub(r'zero_fill_limit_frames: \\d+','zero_fill_limit_frames: 50000000',s))"
+open('/tmp/cfg-stall.yaml','w').write(re.sub(r'zero_fill_limit_frames: \d+','zero_fill_limit_frames: 50000000',s))"
 nohup ./corr-rs/target/release/corr-replay --config /tmp/cfg-stall.yaml --pattern prng \
       --rate 50000 --stall 3:30 --stall-at 8 --duration 120 > /tmp/replay-stall.log 2>&1 &
 sleep 6
