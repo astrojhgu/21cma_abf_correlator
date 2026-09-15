@@ -503,7 +503,17 @@ corr::StagingLayout compute_layout(const corr_config &c) {
     const size_t frame_stride = static_cast<size_t>(2) * static_cast<size_t>(c.n_freq);
     s.frame_stride = frame_stride;
     s.slot_stride = frame_stride * static_cast<size_t>(c.frames_per_slot);
-    s.station_stride = s.slot_stride * static_cast<size_t>(c.block_slots);
+    // One bit per frame of a slot, rounded up to whole bytes, per slot. Appended
+    // to each station's samples so that a station's extent stays contiguous and
+    // the public struct can report the mask as an offset into it.
+    s.validity_bytes_per_slot =
+        (static_cast<size_t>(c.frames_per_slot) + 7u) / 8u;
+    const size_t samples_per_station =
+        s.slot_stride * static_cast<size_t>(c.block_slots);
+    const size_t mask_per_station =
+        s.validity_bytes_per_slot * static_cast<size_t>(c.block_slots);
+    s.validity_offset = samples_per_station;
+    s.station_stride = samples_per_station + mask_per_station;
     s.total_bytes = s.station_stride * static_cast<size_t>(c.n_station);
     return s;
 }
@@ -723,6 +733,8 @@ extern "C" corr_status corr_staging_info(void *h, int32_t station, corr_staging 
     out->frame_stride = ctx->layout.frame_stride;
     out->slot_stride = ctx->layout.slot_stride;
     out->total_bytes = ctx->layout.station_stride;
+    out->validity_offset = ctx->layout.validity_offset;
+    out->validity_bytes_per_slot = ctx->layout.validity_bytes_per_slot;
     return CORR_OK;
 }
 

@@ -61,6 +61,10 @@ struct StagingLayout {
     int8_t *base = nullptr;        /// start of station 0
     size_t frame_stride = 0;       /// bytes per frame  = 2*n_freq
     size_t slot_stride = 0;        /// bytes per slot   = frames_per_slot*frame_stride
+    /// Validity mask per the public ABI: one bit per frame of a slot, appended
+    /// after a station's samples so the station's extent stays contiguous.
+    size_t validity_offset = 0;      /// from a station's base, = samples only
+    size_t validity_bytes_per_slot = 0;
     size_t station_stride = 0;     /// bytes per station = block_slots*slot_stride
     size_t total_bytes = 0;        /// n_station * station_stride
 };

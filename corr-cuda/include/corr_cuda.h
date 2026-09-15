@@ -75,7 +75,7 @@ extern "C" {
 #endif
 
 /* Bump on any layout or semantic change of the structures below. */
-#define CORR_ABI_VERSION 5u
+#define CORR_ABI_VERSION 6u
 
 /*
  * How the pair space is divided over the devices.
@@ -247,7 +247,25 @@ typedef struct corr_staging {
     int8_t *base;          /* start of THIS station's region                 */
     size_t  frame_stride;  /* bytes per frame = 2*n_freq                     */
     size_t  slot_stride;   /* bytes per slot  = frames_per_slot*frame_stride */
-    size_t  total_bytes;   /* block_slots * slot_stride                      */
+    size_t  total_bytes;   /* this station's whole extent, samples + mask     */
+
+    /*
+     * Validity mask, one bit per frame of a slot, `validity_bytes_per_slot`
+     * bytes per slot starting `validity_offset` bytes into this station's region.
+     * Bit `f` of slot `s` is set when frame `f` of that slot is present.
+     *
+     * The region starts at all-zero, i.e. "nothing present". That default is
+     * deliberate: a consumer that reads a slot before the frame assembler has
+     * written its mask sees an entirely missing slot, which fails loudly in a
+     * phase test, instead of a slot that is silently claimed valid.
+     *
+     * Nothing reads it yet: the assembler still writes zeros into the staging and
+     * the GPU is still unaware of missing frames. See
+     * docs/DESIGN-zero-fill-decoupling.md for the change that gives this region
+     * its purpose, and for why it has to land in one piece.
+     */
+    size_t  validity_offset;
+    size_t  validity_bytes_per_slot;
 } corr_staging;
 
 /*

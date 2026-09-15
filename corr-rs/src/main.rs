@@ -322,7 +322,9 @@ fn check_abi(cfg: &Config, plan: &RunPlan) -> Result<()> {
     let staging = corr.staging_all()?;
     let expect_frame = 2 * plan.n_freq as usize;
     let expect_slot = expect_frame * plan.frames_per_slot as usize;
-    let expect_station = expect_slot * plan.block_slots as usize;
+    // Samples plus the validity mask the ABI now appends to each station.
+    let expect_mask_per_slot = (plan.frames_per_slot as usize + 7) / 8;
+    let expect_station = (expect_slot + expect_mask_per_slot) * plan.block_slots as usize;
     for (i, st) in staging.iter().enumerate() {
         if st.frame_stride != expect_frame {
             bail!(
@@ -338,6 +340,21 @@ fn check_abi(cfg: &Config, plan: &RunPlan) -> Result<()> {
         }
         // base is advanced to this station, so total_bytes is its extent, not
         // the size of the whole allocation.
+        if st.validity_offset != expect_slot * plan.block_slots as usize {
+            bail!(
+                "station {i}: validity_offset {} but the samples end at {}",
+                st.validity_offset,
+                expect_slot * plan.block_slots as usize
+            );
+        }
+        if st.validity_bytes_per_slot != expect_mask_per_slot {
+            bail!(
+                "station {i}: validity_bytes_per_slot {} but frames_per_slot={} needs {}",
+                st.validity_bytes_per_slot,
+                plan.frames_per_slot,
+                expect_mask_per_slot
+            );
+        }
         if st.total_bytes != expect_station {
             bail!(
                 "station {i}: total_bytes {} but station extent = {expect_station}",

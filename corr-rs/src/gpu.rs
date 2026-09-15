@@ -191,6 +191,8 @@ impl Correlator {
             frame_stride: 0,
             slot_stride: 0,
             total_bytes: 0,
+            validity_offset: 0,
+            validity_bytes_per_slot: 0,
         };
         // SAFETY: ctx is live and out is a valid pointer.
         let st = unsafe { ffi::corr_staging_info(self.ctx, station, &mut out) };

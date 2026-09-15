@@ -13,7 +13,7 @@ use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 
 /// Must match `CORR_ABI_VERSION` in the header.
-pub const CORR_ABI_VERSION: u32 = 5;
+pub const CORR_ABI_VERSION: u32 = 6;
 
 /// Must match `CORR_MAX_DEVICES` in the header: the length of the fixed device
 /// array inside `corr_config`.
@@ -142,6 +142,12 @@ pub struct corr_staging {
     pub frame_stride: usize,
     pub slot_stride: usize,
     pub total_bytes: usize,
+    /// Validity mask: one bit per frame of a slot, `validity_bytes_per_slot` bytes
+    /// per slot, starting this many bytes into the station's region. Bit f of slot
+    /// s is set when frame f of that slot is present. All-zero by default, so a
+    /// premature reader sees a wholly missing slot rather than a false valid one.
+    pub validity_offset: usize,
+    pub validity_bytes_per_slot: usize,
 }
 
 extern "C" {

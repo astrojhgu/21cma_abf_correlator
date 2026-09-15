@@ -965,7 +965,13 @@ impl Config {
         let block_period_s = n_cum as f64 / frame_rate_hz;
         let block_rate_hz = 1.0 / block_period_s;
 
-        let staging_bytes_per_slot = self.gpu.frames_per_slot as u64 * fft_len;
+        // One bit per frame of a slot for the validity mask, rounded up to whole
+        // bytes: the GPU side appends this to each station's samples (see
+        // `corr_staging` in corr_cuda.h), so the plan's staging figure has to
+        // include it or the two sides disagree at `--check`.
+        let mask_bytes_per_slot = (self.gpu.frames_per_slot as u64 + 7) / 8;
+        let staging_bytes_per_slot =
+            self.gpu.frames_per_slot as u64 * fft_len + mask_bytes_per_slot;
         let staging_bytes_per_station = staging_bytes_per_slot * self.gpu.block_slots as u64;
         let staging_total_bytes = staging_bytes_per_station * n_station as u64;
         let row_stack_bytes = n_baseline as u64 * n_freq * 8 * self.gpu.rows_per_fetch as u64;
