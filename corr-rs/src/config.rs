@@ -969,7 +969,7 @@ impl Config {
         // bytes: the GPU side appends this to each station's samples (see
         // `corr_staging` in corr_cuda.h), so the plan's staging figure has to
         // include it or the two sides disagree at `--check`.
-        let mask_bytes_per_slot = (self.gpu.frames_per_slot as u64 + 7) / 8;
+        let mask_bytes_per_slot = (self.gpu.frames_per_slot as u64).div_ceil(8);
         let staging_bytes_per_slot =
             self.gpu.frames_per_slot as u64 * fft_len + mask_bytes_per_slot;
         let staging_bytes_per_station = staging_bytes_per_slot * self.gpu.block_slots as u64;

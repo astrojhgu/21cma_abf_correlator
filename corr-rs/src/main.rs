@@ -323,7 +323,7 @@ fn check_abi(cfg: &Config, plan: &RunPlan) -> Result<()> {
     let expect_frame = 2 * plan.n_freq as usize;
     let expect_slot = expect_frame * plan.frames_per_slot as usize;
     // Samples plus the validity mask the ABI now appends to each station.
-    let expect_mask_per_slot = (plan.frames_per_slot as usize + 7) / 8;
+    let expect_mask_per_slot = (plan.frames_per_slot as usize).div_ceil(8);
     let expect_station = (expect_slot + expect_mask_per_slot) * plan.block_slots as usize;
     for (i, st) in staging.iter().enumerate() {
         if st.frame_stride != expect_frame {
