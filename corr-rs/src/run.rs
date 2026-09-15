@@ -575,7 +575,7 @@ pub fn run_receive(
         handles.push(std::thread::spawn(move || recv_thread(args)));
     }
 
-    let mut sched = RowScheduler::new(
+    let sched = RowScheduler::new(
         progress.clone(),
         RowSchedulerParams {
             frames_per_slot,
