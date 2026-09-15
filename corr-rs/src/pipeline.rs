@@ -15,7 +15,6 @@
 //!    lead is what the receive side has to read ahead into -- see
 //!    `docs/ARCHITECTURE.md` section 3.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,6 +25,7 @@ use crate::config::RunPlan;
 use crate::run::RunOptions;
 use crate::gpu::Correlator;
 use crate::run::flush_rows;
+use crate::stop::{RunStop, StopReason};
 use crate::sched::{Action, RowScheduler, StationProgress};
 use crate::writer::Writer;
 
@@ -44,7 +44,7 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) ring: &'a Arc<SlotRing>,
     pub(crate) writer: Option<Writer>,
     pub(crate) progress: &'a [Arc<StationProgress>],
-    pub(crate) stop: &'a AtomicBool,
+    pub(crate) stop: &'a Arc<RunStop>,
     pub(crate) n_station: usize,
     pub(crate) max_in_flight: usize,
     pub(crate) sched: RowScheduler,
@@ -52,7 +52,6 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) zf_mark: Vec<u64>,
     pub(crate) fetch_buf: Vec<u8>,
     pub(crate) pending_meta: Vec<(u64, i64)>,
-    pub(crate) zero_fill_stop: Option<String>,
     pub(crate) timeline: Vec<(u64, u64, u64)>,
     pub(crate) last_dbg: Instant,
     pub(crate) stall_dbg: Instant,
@@ -71,7 +70,7 @@ impl<'a> Pipeline<'a> {
     /// everything borrowed and reads the outcome back off this struct.
     pub(crate) fn run(&mut self) -> Result<()> {
         let t0 = Instant::now();
-        while !self.stop.load(Ordering::Relaxed) {
+        while !self.stop.is_stopped() {
             if let Some(d) = self.opts.duration {
                 if t0.elapsed() >= d {
                     break;
@@ -82,16 +81,14 @@ impl<'a> Pipeline<'a> {
             // look like observations, and rather than let the receive buffers grow to
             // hold data nobody will use.
             if let Some(ex) = self.sched.zero_fill_exceeded() {
-                let name = self.plan
-                    .enabled
-                    .get(ex.station)
-                    .map(|e| e.name.as_str())
-                    .unwrap_or("?");
-                self.zero_fill_stop = Some(format!(
-                    "station {name} (index {}) exceeded the zero-fill cap: {} frames \
-                     requested, limit {}",
-                    ex.station, ex.frames, ex.limit
-                ));
+                // The station's *name* is presentation; the reason carries the
+                // index and the numbers, and `StopReason::describe` is what turns
+                // it into the sentence the run report has always printed.
+                self.stop.stop(StopReason::ZeroFillCap {
+                    station: ex.station,
+                    fabricated: ex.frames,
+                    limit: ex.limit,
+                });
                 break;
             }
             match self.sched.step(Instant::now()) {

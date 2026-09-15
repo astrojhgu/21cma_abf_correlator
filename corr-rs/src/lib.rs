@@ -45,6 +45,7 @@ pub mod receiver;
 pub mod report;
 pub mod run;
 pub mod sched;
+pub mod stop;
 pub mod writer;
 
 pub use config::{Config, RunPlan};

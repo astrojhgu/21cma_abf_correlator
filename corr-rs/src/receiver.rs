@@ -10,8 +10,7 @@
 //! `docs/ARCHITECTURE.md` section 3). The deadlock that rule prevents cost a day.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use crate::assemble::{AssembleStats, SlotRing, StationAssembler};
@@ -19,6 +18,7 @@ use crate::config::{Config, RunPlan};
 use crate::net::{pin_to_cpu, MulticastSocket, PACKET_BYTES};
 use crate::run::StagingPtr;
 use crate::sched::StationProgress;
+use crate::stop::{RunStop, StopReason};
 
 /// Open one socket per enabled station, joining each group on the configured
 /// interface.
@@ -127,15 +127,9 @@ pub(crate) struct RecvThreadArgs {
     pub(crate) base: StagingPtr,
     pub(crate) ring: Arc<SlotRing>,
     pub(crate) prog: Arc<StationProgress>,
-    pub(crate) stop: Arc<AtomicBool>,
+    pub(crate) stop: Arc<RunStop>,
     /// Cap on the frames one station may fabricate as silence.
     pub(crate) zero_fill_limit_frames: u64,
-    /// Where a receive thread puts an error the whole run has to answer.
-    ///
-    /// A short packet is a datagram to skip; a staging geometry that never agreed
-    /// with the front end's counter is not, and silently skipping it would mean a
-    /// run that looks healthy and produces nothing.
-    pub(crate) fatal: Arc<Mutex<Option<String>>>,
     pub(crate) idx: usize,
     pub(crate) cpu: u32,
     pub(crate) packets_per_frame: u64,
@@ -183,7 +177,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
     let mut max_stall_ms = 0u64;
     let mut stalls_over_20ms = 0u64;
 
-    while !a.stop.load(Ordering::Relaxed) {
+    while !a.stop.is_stopped() {
         // Service the scheduler's stall recovery first: if this station has gone
         // quiet, its frames must be zero filled before the watermark can move
         // past them. It can fail -- the ring may be unwinding, or the station may
@@ -200,11 +194,16 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                     if !matches!(e, crate::assemble::AssembleError::Aborted) {
                         eprintln!("corr: station {}: {e}", a.idx);
                     }
-                    let mut slot = a.fatal.lock().expect("not poisoned");
-                    if slot.is_none() && !matches!(e, crate::assemble::AssembleError::Aborted) {
-                        *slot = Some(format!("station {}: {e}", a.idx));
+                    if !matches!(e, crate::assemble::AssembleError::Aborted) {
+                        a.stop.stop(StopReason::Fatal {
+                            station: a.idx,
+                            message: e.to_string(),
+                        });
                     }
-                    a.stop.store(true, Ordering::Relaxed);
+                    a.stop.stop(StopReason::Fatal {
+                        station: a.idx,
+                        message: "assemble aborted".to_string(),
+                    });
                     break;
                 }
             }
@@ -236,11 +235,10 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                             Err(e) if e.is_fatal() => {
                                 if !matches!(e, crate::assemble::AssembleError::Aborted) {
                                     eprintln!("corr: station {}: {e}", a.idx);
-                                    let mut slot = a.fatal.lock().expect("not poisoned");
-                                    if slot.is_none() {
-                                        *slot = Some(format!("station {}: {e}", a.idx));
-                                    }
-                                    a.stop.store(true, Ordering::Relaxed);
+                                    a.stop.stop(StopReason::Fatal {
+                                        station: a.idx,
+                                        message: e.to_string(),
+                                    });
                                 }
                                 fatal_here = true;
                                 break;

@@ -30,8 +30,8 @@
 //! startup, and [`crate::assemble::AssembleError::StartupGap`] for the refusal
 //! that replaces what used to be a silent hang.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -40,6 +40,7 @@ use crate::assemble::SlotRing;
 pub use crate::receiver::{open_sockets, packet_bytes, require_interface, sniff_first_counters};
 use crate::receiver::{recv_thread, RecvThreadArgs};
 use crate::pipeline::Pipeline;
+use crate::stop::RunStop;
 use crate::report::{DeviceReport, RunReport, StationAssembleReport};
 use crate::config::{Config, RunPlan};
 use crate::gpu::Correlator;
@@ -253,7 +254,7 @@ pub fn run_receive(
     first_counters: &[u64],
     opts: RunOptions,
     prepared: PreparedOutput,
-    stop: Arc<AtomicBool>,
+    stop: Arc<RunStop>,
 ) -> Result<RunReport> {
     let n_station = plan.n_station;
     if sockets.len() != n_station || first_counters.len() != n_station {
@@ -329,7 +330,6 @@ pub fn run_receive(
 
     let mut handles = Vec::with_capacity(n_station);
     // Where a receive thread records an error the whole run has to answer.
-    let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     for (idx, sock) in sockets.into_iter().enumerate() {
         let args = RecvThreadArgs {
             sock,
@@ -337,7 +337,6 @@ pub fn run_receive(
             ring: ring.clone(),
             prog: progress[idx].clone(),
             stop: stop.clone(),
-            fatal: fatal.clone(),
             zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
             idx,
             cpu: plan.enabled[idx].recv_cpu,
@@ -382,7 +381,6 @@ pub fn run_receive(
         zf_mark: progress.iter().map(|p| p.zero_filled_frames()).collect(),
         fetch_buf: Vec::new(),
         pending_meta: Vec::new(),
-        zero_fill_stop: None,
         timeline: Vec::new(),
         last_dbg: Instant::now(),
         stall_dbg: Instant::now(),
@@ -397,12 +395,11 @@ pub fn run_receive(
     pipeline.run()?;
     let elapsed = pipeline.elapsed;
 
-    stop.store(true, Ordering::Relaxed);
     // A receive thread may have stopped the run with an error it could not fix
     // (an impossible staging geometry, or a start frame the front end's counter
     // had already left behind). It set the stop flag, which is why the loop above
     // ended, so this is read rather than polled.
-    let fatal_stop: Option<String> = fatal.lock().expect("not poisoned").clone();
+    let fatal_stop: Option<String> = stop.fatal_message();
     // Release any receive thread still waiting for a slot. Without this the join
     // below waits for ever: the thread is spinning on a release the pipeline will
     // never issue, and never looks at the stop flag.
@@ -513,7 +510,7 @@ pub fn run_receive(
         recoveries_per_station: ss.recoveries_per_station,
         requested_per_station: ss.requested_per_station,
         stall_timeout: pipeline.sched.stall_timeout(),
-        stopped_zero_fill_exceeded: pipeline.zero_fill_stop.take(),
+        stopped_zero_fill_exceeded: stop.zero_fill_message(),
         stopped_fatal: fatal_stop,
         rows_written,
         output_dir: opts.output_dir.clone(),

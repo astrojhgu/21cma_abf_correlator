@@ -9,7 +9,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -18,6 +17,7 @@ use clap::Parser;
 use corr_rs::config::Config;
 use corr_rs::gpu::Correlator;
 use corr_rs::run::{self, RunOptions};
+use corr_rs::stop::{RunStop, StopReason};
 use corr_rs::{ffi, RunPlan};
 
 /// Set by the SIGINT/SIGTERM handler, read by the scheduler loop.
@@ -228,13 +228,16 @@ fn execute(
         println!("  [{i}] {:<6} counter {c}", plan.enabled[i].name);
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
+    // One object holds both the flag and the reason: the first reason wins, so a
+    // run that is interrupted reports the interruption rather than whatever the
+    // pipeline noticed a moment later.
+    let stop = RunStop::new();
     {
         // Bridge the signal flag into the shared stop flag the run watches.
         let stop = stop.clone();
         std::thread::spawn(move || loop {
             if STOP.load(Ordering::Relaxed) {
-                stop.store(true, Ordering::Relaxed);
+                stop.stop(StopReason::Signal);
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
