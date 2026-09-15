@@ -87,8 +87,15 @@ pub fn sniff_first_counters(
                 // The last packet of the batch is the station's latest counter;
                 // see the note above on why the first one is not good enough.
                 if let Some((c, _)) = sockets[i].packet(got - 1) {
+                    // Count the station, not the batch. Decrementing on every batch
+                    // let one busy station drive `remaining` to zero on its own, so
+                    // the loop stopped early and the code below unwrapped a station
+                    // that had never been heard from -- a panic during start-up,
+                    // reachable whenever one station comes up late.
+                    if latest[i].is_none() {
+                        remaining = remaining.saturating_sub(1);
+                    }
                     latest[i] = Some(c);
-                    remaining = remaining.saturating_sub(1);
                     progressed = true;
                 }
             }
@@ -100,7 +107,18 @@ pub fn sniff_first_counters(
             std::thread::sleep(Duration::from_millis(1));
         }
     }
-    Ok(latest.into_iter().map(|c| c.unwrap()).collect())
+    latest
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            c.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "station index {i} sent nothing during priming; either it is not \
+                     transmitting yet or its group is not reaching this host"
+                )
+            })
+        })
+        .collect()
 }
 
 /// Statistics a receive thread publishes when it exits.
