@@ -5,7 +5,7 @@ draw the upper triangle.
 The test this is built for: drive the correlator with `corr-replay --delay-stride 1`,
 so station `i`'s sample stream is delayed by exactly `i` samples relative to a
 common broadband source. A delay of `d` samples multiplies the spectrum by
-`exp(-2*pi*i*k*d/fft_len)`, so the cross-power `Y_j * conj(Y_k)` has a phase that is
+`exp(-2*pi*i*k*d/nch)`, so the cross-power `Y_j * conj(Y_k)` has a phase that is
 a *straight line* in channel `k`, with slope `-2*pi*(d_j - d_k)/fft_len`. Nothing
 about the instrument can imitate that: the packet-to-frame alignment, the FFT bin
 order, the conjugation and the multi-card partial-sum all break it, and they break
@@ -49,6 +49,8 @@ from pathlib import Path
 
 import matplotlib
 
+from corr_common import delay_from_slope, delay_per_channel_rad, fft_len, wrap_deg
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -76,11 +78,11 @@ def estimate(s: np.ndarray) -> tuple[float, int, float]:
 
     The channel axis is the retained half of an R2C transform, so the FFT length is
     `2 * nch`, not `nch`: a delay of `d` samples multiplies bin `k` by
-    `exp(-2*pi*i*k*d/fft_len)`. Using `nch` reports exactly half the delay, which
+    `exp(-2*pi*i*k*d/nch)`. Using `nch` reports exactly half the delay, which
     looks like a plausible number -- worth stating here rather than buried.
     """
     n = s.size
-    fft_len = 2 * n
+    n_fft = fft_len(n)
     mag = np.abs(s)
     strong = mag > 0.1 * np.median(mag[mag > 0]) if np.any(mag > 0) else np.zeros(n, bool)
     k = np.arange(n)
@@ -95,20 +97,15 @@ def estimate(s: np.ndarray) -> tuple[float, int, float]:
         resid = float(np.sqrt(np.average((ph - np.polyval(fit, kk)) ** 2, weights=w)))
     # Rebuild the full Hermitian spectrum (R2C drops the Nyquist bin) so the
     # correlation peak lands on whole samples of the real sample rate.
-    full = np.zeros(fft_len, dtype=np.complex128)
+    full = np.zeros(n_fft, dtype=np.complex128)
     full[:n] = s
     full[n + 1 :] = np.conj(s[1:][::-1])
     ac = np.fft.ifft(full)
     lag = int(np.argmax(np.abs(ac)))
-    if lag > fft_len // 2:
-        lag -= fft_len
-    delay = -slope * fft_len / (2 * np.pi) if np.isfinite(slope) else float("nan")
+    if lag > n_fft // 2:
+        lag -= n_fft
+    delay = delay_from_slope(slope, n) if np.isfinite(slope) else float("nan")
     return delay, lag, resid
-
-
-def wrap_deg(v):
-    """Fold degrees into [-180, 180)."""
-    return (np.asarray(v) + 180.0) % 360.0 - 180.0
 
 
 def main() -> int:
@@ -143,7 +140,7 @@ def main() -> int:
         return 2
     nst = max(max(j, k) for j, k in bl) + 1
     nch = 8192
-    fft_len = 2 * nch
+    n_fft = fft_len(nch)
     win = min(a.phase_window, nch)
     print(f"{d.name}: {len(bl)} baselines, {nst} stations, {nch} channels")
 
@@ -185,7 +182,7 @@ def main() -> int:
         mag = np.abs(s)
         strong = mag > 0.1 * np.median(mag[mag > 0])
         ph = np.unwrap(np.angle(s))
-        pred = -2 * np.pi * want * x / fft_len
+        pred = delay_per_channel_rad(want, nch) * x
         k0 = int(np.argmax(strong))
         pred += ph[k0] - pred[k0]
         overlay_err.append(float(np.max(np.abs(ph[strong] - pred[strong]))))
