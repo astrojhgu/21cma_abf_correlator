@@ -778,6 +778,9 @@ pub fn set_progress(p: &AtomicU64, v: u64) {
 #[cfg(test)]
 mod send_probe {
     use super::*;
+    // Only the tests need this: the receive path itself no longer names the
+    // assembler, which is the point of `receiver.rs`.
+    use crate::assemble::StationAssembler;
     fn assert_send<T: Send>() {}
     #[test]
     fn the_receive_thread_payload_types_are_send() {

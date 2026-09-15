@@ -661,6 +661,28 @@ impl StationAssembler {
         self.alive = Some(alive);
     }
 
+    /// Publish the station's progress to the scheduler.
+    ///
+    /// Every path that moves `progress` forward must go through this, and it must
+    /// happen *before* anything that can block. The scheduler's permission to
+    /// release the staging slot this thread is about to wait for is derived from
+    /// the published value, so a publication that happens after the wait is a
+    /// publication that never happens: the two threads wait for each other for
+    /// ever, and the symptom is a run that submits two slots, produces no rows and
+    /// reports no error at all. That is why this is a method rather than three
+    /// copies of two lines (HANDOFF 6.13.1, docs/ARCHITECTURE.md 3.1).
+    fn publish(&self) {
+        if let Some(p) = &self.alive {
+            p.set(self.progress);
+        }
+    }
+
+    /// Move `progress` forward to `frame` and publish it.
+    fn advance_to(&mut self, frame: u64) {
+        self.progress = frame;
+        self.publish();
+    }
+
     /// First frame id that is not yet final.
     pub fn progress(&self) -> u64 {
         self.progress
@@ -778,18 +800,9 @@ impl StationAssembler {
                 }
             }
             self.finalize_range(self.progress, frame_id)?;
-            self.progress = frame_id;
-            // Publish *before* the slot wait below. This thread is about to block
-            // on the ring, and the scheduler's permission to release that slot is
-            // derived from this station's published progress: if the value that
-            // makes the release legal is still sitting in this thread's head, the
-            // two wait for each other for ever. Measured: a run that submitted two
-            // slots and then stalled with the ring full, every station parked at
-            // 753 frames of a 768-frame window while the assembler already knew
-            // 768 -- the missing 15 frames were zero filled and unannounced.
-            if let Some(p) = &self.alive {
-                p.set(self.progress);
-            }
+            // Published here, before the slot wait below can block: see
+            // `publish` for why the order matters more than the value.
+            self.advance_to(frame_id);
         }
 
         // Make sure the physical slot is not still being read by the GPU.
@@ -845,9 +858,7 @@ impl StationAssembler {
             // every thread blocked in wait_free with the ring holding exactly the
             // allocation it needed freed.
             if self.progress % self.frames_per_slot == 0 {
-                if let Some(p) = &self.alive {
-                    p.set(self.progress);
-                }
+                self.publish();
             }
         }
         Ok(())
@@ -894,9 +905,7 @@ impl StationAssembler {
             // slot this step is about to overwrite is derived from this station's
             // progress, so a progress that is not published is a progress the
             // pipeline cannot see.
-            if let Some(p) = &self.alive {
-                p.set(self.progress);
-            }
+            self.publish();
             self.ensure_writable(slot_seq)?;
 
             for f in frame..step_end {
@@ -911,7 +920,8 @@ impl StationAssembler {
                 }
                 self.stats.finalized_frames += 1;
             }
-            self.progress = step_end;
+            // Publish the step *before* the next step waits for its slot.
+            self.advance_to(step_end);
             frame = step_end;
 
             if self.zero_fill_limit > 0 && self.stats.zero_filled_frames > self.zero_fill_limit {
@@ -935,7 +945,7 @@ impl StationAssembler {
             return Ok(());
         }
         self.finalize_range(self.progress, frame_id)?;
-        self.progress = frame_id;
+        self.advance_to(frame_id);
         self.finalized_to = Some(frame_id);
         Ok(())
     }
@@ -1045,6 +1055,31 @@ mod tests {
                 self.ring.release(sq);
             }
         }
+    }
+
+    #[test]
+    fn advancing_progress_always_publishes() {
+        // The scheduler releases a staging slot only when the published progress
+        // says the station is done with it, so an unpublished advance is a
+        // deadlock. This asserts the property directly rather than trusting that
+        // every call site remembers.
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let ring = Arc::new(SlotRing::primed(3, 0));
+        let mut a = StationAssembler::new(2, 4, 8, 32, ring, std::ptr::null_mut(), 0);
+        let prog = Arc::new(StationProgress::new(0));
+        a.set_liveness(prog.clone());
+        assert_eq!(prog.get(), 0, "nothing published before anything happened");
+
+        a.advance_to(5);
+        assert_eq!(a.progress(), 5);
+        assert_eq!(prog.get(), 5, "advance_to must publish the new progress");
+
+        // And a slot boundary reached by the ordinary packet path publishes too.
+        a.advance_to(8);
+        assert_eq!(prog.get(), 8);
+        assert!(a.progress() % 4 == 0, "the frame involved is a slot boundary here");
     }
 
     #[test]
