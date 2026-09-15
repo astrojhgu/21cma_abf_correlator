@@ -111,7 +111,7 @@ tools/phase_triangle.py /scratch/xxx/<run>/ --mosaic phase   # 相位正确性�
 |---|---|
 | 40 路 | 三道硬墙：源只有 24 路；入口 200G < 259 Gbit/s；40 收包线程 > 32 核（需 epoll 多 socket） |
 | 负载相关的残余丢包 | 网卡 RX 环 1024/8192、IRQ 掩码 0-31、`netdev_max_backlog=5000`、无 `CAP_NET_ADMIN` ⇒ 都要管理员 |
-| `run.rs::run_receive` 仍偏长 | 已拆出 `report.rs`（1303→1057 行）；下一步把"收包线程/启动"与"调度循环+GPU 提交"分成两个模块 |
-| 补零与读包争同一线程 | 正反馈：落后 → 补零 → 更落后。方向是把补零移到 GPU 侧（有效性掩码） |
+| ~~`run.rs::run_receive` 仍偏长~~ | 已完成：`receiver.rs` + `pipeline.rs` + `report.rs` 拆出，`run.rs` 1303 → 639 行 |
+| 补零与读包争同一线程 | 正反馈：落后 → 补零 → 更落后。**设计已写好**：`docs/DESIGN-zero-fill-decoupling.md`（触点、判据、风险齐全，未实现）|
 | writer 仍在 pipeline 线程里 | 短积分/高频吐数时需要独立 writer 线程 |
 | 仓库没有版本控制 | 建议 `git init` + 以当前状态为基线提交 |
