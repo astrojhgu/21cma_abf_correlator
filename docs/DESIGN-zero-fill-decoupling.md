@@ -79,3 +79,33 @@
 - `writer` 移出 pipeline 线程（短积分/高频吐数时才需要）
 - `2·nch` 换算在工具里只留一处（已在三处独立出现过）
 - 40 路的三道墙：源只有 24 路、入口 200G < 259 Gbit/s、40 收包线程 > 32 核（需 epoll 多 socket）
+
+## 7. 分步执行（每步都可单独提交、单独验证）
+
+不要一次改完再验：第 4 步（汇编器不再写零）与第 5 步（kernel 读掩码）必须**同一步**落地，
+否则中间状态会产出全零数据 ✗。其余步骤都可以独立提交。
+
+| 步 | 内容 | 验证命令与判据 |
+|---|---|---|
+| **0** | 记录基线（今天就能做）| 用第 4 节的 stall 场景跑一次，保存 `blocks.csv`、`rows_trend.py` 的三段趋势、以及报告里"等 staging 槽"的时间。**这就是修复要改善的对照** |
+| 1 | ABI 加 `validity_offset` / `validity_bytes_per_slot` / `validity_total_bytes`；staging 分配加上掩码区并 `memset 0xFF`（全有效）；Rust 侧镜像 + 编译期断言 | `corr --check` 通过、`abi_smoke` 通过、`--print-plan` 里 staging 大小含掩码区 |
+| 2 | 汇编器**在继续补零的同时**写掩码；加一个测试断言"掩码标记的缺失帧 == 实际被补零的帧" | `cargo test`；行为未变（golden 测试逐字节一致）|
+| 3 | kernel 读掩码把无效帧清零；汇编器**停止**补零 | 第 4 节判据 1（`blocks.csv` 逐行一致）+ 判据 3（相位 276/276）|
+| 4 | 去掉第 7 项的开关（或反过来，用它做回退）| 判据 2、4（正反馈消失、压力对照）|
+
+**第 0 步的 stall 场景**（注意 `--stall-at` 必须让该站先被预排空看到，否则只会触发预排空检查）：
+
+```bash
+pkill -x corr-replay                       # 不是 -f：-f 会杀掉执行它的 shell
+python3 -c "import re;s=open('config/correlator-24-replay.yaml').read();\
+open('/tmp/cfg-stall.yaml','w').write(re.sub(r'zero_fill_limit_frames: \\d+','zero_fill_limit_frames: 50000000',s))"
+nohup ./corr-rs/target/release/corr-replay --config /tmp/cfg-stall.yaml --pattern prng \
+      --rate 50000 --stall 3:30 --stall-at 8 --duration 120 > /tmp/replay-stall.log 2>&1 &
+sleep 6
+./corr-rs/target/release/corr --config /tmp/cfg-stall.yaml --duration 60 --output-dir /scratch/feedback-before
+python3 tools/rows_trend.py  /scratch/feedback-before/*/ --step 20
+grep -E "receive threads|per second" /tmp/feedback-before-run.log
+```
+
+判据（修复后应当同时成立）：补零率不高于基线、`blocks.csv` 逐行一致、
+**缺口的 `progress` 越过不再逐槽爬行**、报告里"等 staging 槽"的时间显著下降。
