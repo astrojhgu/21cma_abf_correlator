@@ -40,6 +40,7 @@ pub mod ffi;
 pub mod frame;
 pub mod gpu;
 pub mod net;
+pub mod pipeline;
 pub mod receiver;
 pub mod report;
 pub mod run;
