@@ -25,6 +25,10 @@ pub enum StopReason {
     /// A station exceeded the zero-fill cap, so the rows it was in are no longer
     /// describing the sky.
     ZeroFillCap {
+        /// The station's configured name: what an operator recognises, and what
+        /// the message printed before this type existed. The index alone is a
+        /// regression in wording, which is how it was nearly shipped.
+        name: String,
         station: usize,
         fabricated: u64,
         limit: u64,
@@ -40,13 +44,14 @@ impl StopReason {
             StopReason::Signal => "interrupted".to_string(),
             StopReason::Duration => "duration elapsed".to_string(),
             StopReason::ZeroFillCap {
+                name,
                 station,
                 fabricated,
                 limit,
             } => format!(
-                "station {station} fabricated {fabricated} frames of silence, past the limit \
-                 of {limit}; the rows written so far record how many frames each one is \
-                 missing, in blocks.csv"
+                "station {name} (index {station}) exceeded the zero-fill cap: {fabricated} \
+                 frames requested, limit {limit}. The rows written so far record how many \
+                 frames each one is missing, in blocks.csv"
             ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
         }
@@ -126,12 +131,15 @@ mod tests {
     fn the_report_wording_matches_the_reason() {
         let stop = RunStop::new();
         stop.stop(StopReason::ZeroFillCap {
+            name: "W17".into(),
             station: 7,
             fabricated: 100,
             limit: 50,
         });
         let msg = stop.zero_fill_message().expect("a zero-fill stop");
-        assert!(msg.contains("station 7") && msg.contains("100") && msg.contains("50"));
+        // The name is what an operator keys on; the index is the fallback.
+        assert!(msg.contains("W17") && msg.contains("index 7"));
+        assert!(msg.contains("100") && msg.contains("50"));
         assert!(stop.fatal_message().is_none());
     }
 }

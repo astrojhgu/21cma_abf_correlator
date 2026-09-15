@@ -80,11 +80,23 @@ impl<'a> Pipeline<'a> {
             // not coming back. Stop rather than keep writing rows of silence that
             // look like observations, and rather than let the receive buffers grow to
             // hold data nobody will use.
+            // The *second* line of defence. A station's own receive thread caps
+            // its fabricated frames first (AssembleError::ZeroFillCapExceeded, which
+            // arrives here as a fatal reason), so this fires only when that thread is
+            // not honouring the requests at all -- a dead or wedged station. Kept
+            // for that case, and it is the one reason in RunStop that a live run has
+            // not exercised.
             if let Some(ex) = self.sched.zero_fill_exceeded() {
                 // The station's *name* is presentation; the reason carries the
                 // index and the numbers, and `StopReason::describe` is what turns
                 // it into the sentence the run report has always printed.
                 self.stop.stop(StopReason::ZeroFillCap {
+                    name: self
+                        .plan
+                        .enabled
+                        .get(ex.station)
+                        .map(|e| e.name.clone())
+                        .unwrap_or_else(|| format!("index {}", ex.station)),
                     station: ex.station,
                     fabricated: ex.frames,
                     limit: ex.limit,
