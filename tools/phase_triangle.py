@@ -21,8 +21,9 @@ Two estimates per baseline, because they fail differently:
 
 Panels are drawn in one of two ways, and both have been wrong once already:
 
-  * `--mosaic phase` (data *and* model): the measured phase (blue) and the delay's
-    straight line (red). The channel window must be narrow enough that the steepest
+  * `--mosaic phase` (data *and* model): the measured phase (blue, solid) and the
+    delay's straight line (red, dashed). Dashed because when the phase is right the
+    two coincide everywhere, and a solid model line would simply cover the data. The channel window must be narrow enough that the steepest
     delay does not wrap -- at 8192 channels a 23-sample delay spans 72 rad and wraps
     eleven times, which at 80 px per panel is indistinguishable from two diverging
     lines. Both curves are referenced to their own value at the first strong
@@ -129,6 +130,16 @@ def main() -> int:
     )
     ap.add_argument("--max-ch", type=int, default=1400, help="channels drawn per residual panel")
     ap.add_argument("--zoom", default=None, help="one baseline large, as J,K")
+    ap.add_argument(
+        "--panel-inches",
+        type=float,
+        default=0.62,
+        help="side of one panel. The default fits a 24-station triangle on a screen "
+        "but leaves each panel about 80 px, where the measured curve (thin, blue) "
+        "disappears under the model line (wide, semi-transparent red) because they "
+        "coincide. Raise this to see that there are two curves.",
+    )
+    ap.add_argument("--dpi", type=int, default=130, help="output resolution")
     a = ap.parse_args()
 
     d = Path(a.run_dir)
@@ -240,8 +251,9 @@ def main() -> int:
 
     rows = sorted({j for j, _ in bl})
     cols = sorted({k for _, k in bl})
-    fig, axes = plt.subplots(len(rows), len(cols),
-                             figsize=(0.62 * len(cols), 0.62 * len(rows)), dpi=130)
+    fig, axes = plt.subplots(
+        len(rows), len(cols),
+        figsize=(a.panel_inches * len(cols), a.panel_inches * len(rows)), dpi=a.dpi)
     for j in rows:
         for k in cols:
             ax = axes[j][k]
@@ -254,8 +266,14 @@ def main() -> int:
             ok = lag == want
             if a.mosaic == "phase":
                 ax.set_ylim(*phase_ylim)
-                ax.plot(np.arange(win)[strongw], phw_deg[strongw], lw=0.6, color="#1f4e79")
-                ax.plot(np.arange(win), predw_deg, lw=1.0, color="#c00000", alpha=0.6)
+                # Model first and dashed, measured curve on top and solid. Drawn
+                # the other way round the model hides the data wherever the two
+                # agree -- which is everywhere when the phase is right, so the
+                # figure would show one curve and say nothing about the other.
+                ax.plot(np.arange(win), predw_deg, lw=1.1, color="#c00000",
+                        alpha=0.85, ls=(0, (3.0, 1.6)))
+                ax.plot(np.arange(win)[strongw], phw_deg[strongw], lw=0.7,
+                        color="#1f4e79")
             else:
                 ax.set_ylim(-3e-3, 3e-3)
                 ax.axhline(0.0, color="#c00000", lw=0.5, alpha=0.8)
