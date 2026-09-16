@@ -56,6 +56,14 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
   overlay 0.00027 rad（`tools/phase_triangle.py`）。图：根目录 `phase_check.png`、
   `phase_triangle.png`（残差版）、`phase_triangle_lines.png`（两线版：每格虚线是模型、
   实线是数据，384 通道窗口）。`phase_triangle_lines.png` 是 `--delay-stride 1` 基线（站 i 延迟 i 个采样点，i=0…23）：rate 20000、60 s、**0 丢包 0 补零**，276/276、lag 误差 0 样本、overlay 0.00034 rad。复现命令见 `tools/README.md`，原始日志在 `/scratch/zb/`。
+* **相位检测的规范命令是 `tools/phase_test.sh`**（参数钉死：`--rate 50000 --duration 25 --delay-stride 1`，
+  分析用 `phase_triangle.py --stride 1 --mosaic phase`，**窗口取默认 1536**）。2026-09-16 在 ABI 7 上
+  按默认跑：**276/276、max |lag error| 0 样本、slope 误差 0.0000、overlay 0.00031 rad、残差 0.0000/0.0001**，
+  全 24 站 `gaps=0 lost=0 zero_filled=0`、逐行 5/5 行整零，load 9.1/16.8/22.1 —— 与 A 的基准逐位相同。
+  图：`phase_triangle_pinned.png`（脚本原样输出）与 `phase_triangle_pinned_zoom.png`（同一次运行、
+  同一窗口，只是面板放大到 1.05 in/150 dpi 以便阅读）。**两线版图的"斜率看着不同"只来自
+  `--phase-window`**：每通道 0.021973°（fft_len = 2·nch = 16384），一格里铺 1536 个通道还是 384 个，
+  决定它看着有多陡、画几圈；拟合值不受窗口影响。
 * 结构：`run.rs` 639 行（编排）+ `receiver.rs` / `pipeline.rs` / `report.rs` / `stop.rs`。
   **三条不变量已结构化**：进度发布唯一入口、`block_slots - ring_lead ≥ 1` 由校验强制、
   停止原因唯一且首个胜出（见 `docs/ARCHITECTURE.md` §3）。
