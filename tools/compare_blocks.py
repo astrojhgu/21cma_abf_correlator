@@ -27,9 +27,12 @@ import argparse
 import os
 import sys
 
+import corr_common
 
-def load(run_dir):
-    path = os.path.join(run_dir, "blocks.csv")
+
+def load(run_dir, prefix=None):
+    """rows of one file set, keyed by (first_frame_id, station)."""
+    path = corr_common.pick_set(run_dir, prefix)["blocks"]
     rows = {}
     with open(path) as fh:
         for line in fh:
@@ -49,9 +52,10 @@ def main():
     ap.add_argument("a")
     ap.add_argument("b")
     ap.add_argument("--show", type=int, default=8)
+    ap.add_argument("--prefix", default=None, help="file set to read in both runs")
     args = ap.parse_args()
 
-    a, b = load(args.a), load(args.b)
+    a, b = load(args.a, args.prefix), load(args.b, args.prefix)
     common = sorted(set(a) & set(b))
     print(f"rows: {len(a)} in A, {len(b)} in B, {len(common)} in common")
     if not common:

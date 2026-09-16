@@ -61,6 +61,8 @@ pub struct RunOptions {
     pub output_dir: Option<std::path::PathBuf>,
     /// Use the GPU. `false` runs the receive and scheduling path alone.
     pub enable_gpu: bool,
+    /// Which file set to open when `storage.daily_files` is on.
+    pub set_policy: crate::writer::SetPolicy,
 }
 
 impl Default for RunOptions {
@@ -70,6 +72,7 @@ impl Default for RunOptions {
             wait_for_first_packet: Duration::from_secs(10),
             output_dir: None,
             enable_gpu: false,
+            set_policy: crate::writer::SetPolicy::Auto,
         }
     }
 }
@@ -165,8 +168,38 @@ pub fn prepare_output(cfg: &Config, plan: &RunPlan, opts: &RunOptions) -> Result
     if let Some(dir) = &opts.output_dir {
         let hash = crate::config::config_hash(cfg);
         let (w, state) =
-            Writer::open(dir, plan, cfg, &hash, cfg.storage.fsync_every_rows)
+            Writer::open_with(dir, plan, cfg, &hash, cfg.storage.fsync_every_rows, &opts.set_policy)
             .with_context(|| format!("opening the output directory {}", dir.display()))?;
+        if cfg.storage.daily_files {
+            // Say which set this process will write, and what it will be called:
+            // the prefix is not known until the first row arrives, so a run that
+            // is expected to append to today's set should be seen to do so.
+            let fmt = &cfg.storage.file_prefix_format;
+            let today = crate::config::local_day_at(crate::sched::system_ms());
+            let now_local =
+                crate::config::local_stamp_at(crate::sched::system_ms(), "%Y-%m-%d %H:%M:%S");
+            let now_utc = crate::config::utc_stamp();
+            println!(
+                "daily files: {} (local time {now_local}, UTC {now_utc}, TZ={:?})",
+                fmt,
+                crate::config::local_tz_name()
+            );
+            if w.set_prefix().is_empty() {
+                println!(
+                    "set        : none yet for local day {today}; the first row names it \
+                     ({} of its own start time)",
+                    fmt
+                );
+            } else {
+                println!(
+                    "set        : {} (local day {}, {}, resumed), {} rows already there",
+                    w.set_prefix(),
+                    w.set_day().unwrap_or(&today),
+                    w.set_kind().as_str(),
+                    state.rows_written
+                );
+            }
+        }
         if !state.is_fresh() {
             println!(
                 "resuming {} at row {} (next frame {}), truncated {} partial rows",
@@ -412,7 +445,10 @@ pub fn run_receive(
     // (an impossible staging geometry, or a start frame the front end's counter
     // had already left behind). It set the stop flag, which is why the loop above
     // ended, so this is read rather than polled.
-    let fatal_stop: Option<String> = stop.fatal_message();
+    // A rollover failure is a fatal stop too: the run cannot keep the new day's
+    // rows anywhere honest. It travels in the same report field so the report has
+    // one place that says why the run ended.
+    let fatal_stop: Option<String> = stop.fatal_message().or_else(|| stop.rollover_message());
     // Release any receive thread still waiting for a slot. Without this the join
     // below waits for ever: the thread is spinning on a release the pipeline will
     // never issue, and never looks at the stop flag.

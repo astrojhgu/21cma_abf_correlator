@@ -25,6 +25,8 @@ import re
 import sys
 from pathlib import Path
 
+import corr_common
+
 
 def load_blocks(path: Path):
     """(row, station, valid, zero_filled), tolerating a half-written last line."""
@@ -40,8 +42,12 @@ def load_blocks(path: Path):
     return out
 
 
-def summarise(d: Path):
-    blocks = d / "blocks.csv"
+def summarise(d: Path, prefix=None):
+    """One file set of `d` (a local day), or None when there is nothing to read."""
+    try:
+        blocks = Path(corr_common.pick_set(str(d), prefix)["blocks"])
+    except SystemExit:
+        return None
     if not blocks.is_file():
         return None
     recs = load_blocks(blocks)
@@ -76,6 +82,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+")
     ap.add_argument("--load", action="append", default=[], help="file(s) with 'load=NN'")
+    ap.add_argument(
+        "--prefix",
+        default=None,
+        help="which file set (local day) to read in each run; default is the newest",
+    )
     ap.add_argument("--seconds-per-row", type=float, default=1.00139008)
     a = ap.parse_args()
 
@@ -93,7 +104,7 @@ def main() -> int:
         d = Path(r)
         if not d.is_dir():
             d = d.parent
-        info = summarise(d)
+        info = summarise(d, a.prefix)
         if info is None:
             print(f"{str(d):34} (no blocks.csv)")
             continue

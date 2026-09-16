@@ -67,6 +67,18 @@ struct Cli {
     #[arg(long)]
     output_dir: Option<PathBuf>,
 
+    /// Start a second file set for today even though one already exists.
+    ///
+    /// Only needed when the configuration changed on a day that already has a set:
+    /// appending would mix two geometries into one file set, so the default is to
+    /// refuse and say so. See docs/DESIGN-daily-files.md.
+    #[arg(long)]
+    allow_second_set: bool,
+
+    /// Append to this file set prefix instead of today's, whatever day it holds.
+    #[arg(long, value_name = "PREFIX")]
+    set: Option<String>,
+
     /// Override run.name.
     #[arg(long)]
     run_name: Option<String>,
@@ -146,7 +158,16 @@ fn run() -> Result<ExitCode> {
     } else {
         Mode::Produce
     };
-    execute(&cfg, &plan, cli.duration, mode)
+    // Which file set to open. Only meaningful when `storage.daily_files` is on;
+    // the writer says so itself when it matters.
+    let set_policy = if let Some(p) = cli.set.clone() {
+        corr_rs::writer::SetPolicy::Explicit(p)
+    } else if cli.allow_second_set {
+        corr_rs::writer::SetPolicy::NewSet
+    } else {
+        corr_rs::writer::SetPolicy::Auto
+    };
+    execute(&cfg, &plan, cli.duration, mode, set_policy)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +184,7 @@ fn execute(
     plan: &RunPlan,
     duration: Option<f64>,
     mode: Mode,
+    set_policy: corr_rs::writer::SetPolicy,
 ) -> Result<ExitCode> {
     install_signal_handlers();
     run::require_interface(cfg)?;
@@ -183,6 +205,7 @@ fn execute(
         wait_for_first_packet: wait,
         output_dir,
         enable_gpu: mode == Mode::Produce,
+        set_policy,
     };
 
     // Everything slow happens before a single group is joined. With the sockets

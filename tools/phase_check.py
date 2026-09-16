@@ -22,6 +22,8 @@ usage: phase_check.py OUT.png [RUN_DIR ...]
 import os
 import sys
 
+import corr_common
+
 import numpy as np
 import matplotlib
 
@@ -41,8 +43,10 @@ N_FFT = 8192          # 2 * n_freq
 N_FREQ = 4096         # retained bins
 
 
-def load_baseline(run_dir, index, j, k):
-    name = f"baseline_{index:04d}_j{j:02d}_k{k:02d}.bin"
+def load_baseline(run_dir, index, j, k, prefix=None):
+    """One baseline file of one file set (a local day)."""
+    pfx = corr_common.pick_set(run_dir, prefix)["prefix"]
+    name = f"{pfx}baseline_{index:04d}_j{j:02d}_k{k:02d}.bin"
     path = os.path.join(run_dir, name)
     a = np.fromfile(path, dtype=np.complex64)
     if a.size % N_FREQ:
@@ -50,8 +54,8 @@ def load_baseline(run_dir, index, j, k):
     return a.reshape(-1, N_FREQ)
 
 
-def read_sample_rate(run_dir):
-    with open(os.path.join(run_dir, "metadata.yaml")) as f:
+def read_sample_rate(run_dir, prefix=None):
+    with open(corr_common.pick_set(run_dir, prefix)["metadata"]) as f:
         for line in f:
             if line.startswith("sample_rate_hz:"):
                 return float(line.split(":", 1)[1])
@@ -68,7 +72,10 @@ def fit_slope(phase, bins):
 
 def main():
     out = sys.argv[1]
-    runs = sys.argv[2:] or ["/tmp/corr-phase/delay0", "/tmp/corr-phase/delay1"]
+    runs = [a for a in sys.argv[2:] if a != "--newest-set"]
+    # A run directory now holds one file set per local day; read the newest unless
+    # the caller passed a run directory that *is* a set (no blocks.csv inside).
+    runs = runs or ["/tmp/corr-phase/delay0", "/tmp/corr-phase/delay1"]
 
     fig, axes = plt.subplots(3, 1, figsize=(11, 12), constrained_layout=True)
     ax_phase, ax_mag, ax_res = axes

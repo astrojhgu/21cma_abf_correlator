@@ -48,6 +48,8 @@ import re
 import sys
 from pathlib import Path
 
+import corr_common
+
 import matplotlib
 
 from corr_common import delay_from_slope, delay_per_channel_rad, fft_len, wrap_deg
@@ -57,9 +59,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def baselines(run_dir: Path) -> dict[tuple[int, int], Path]:
+def baselines(run_dir: Path, prefix: str | None = None) -> dict[tuple[int, int], Path]:
+    """Every baseline of one file set.
+
+    A run directory holds one set per local day, so the set has to be chosen: the
+    newest by default, or the one named by `--prefix`. Pointing this at a
+    directory that *is* a set (no blocks.csv inside) reads it whole.
+    """
+    pfx = prefix or ""
+    if any(run_dir.glob("*blocks.csv")):
+        pfx = corr_common.pick_set(str(run_dir), prefix)["prefix"]
     out = {}
-    for p in sorted(run_dir.glob("baseline_*_j*_k*.bin")):
+    for p in sorted(run_dir.glob(f"{pfx}baseline_*_j*_k*.bin")):
         m = re.search(r"_j(\d+)_k(\d+)\.bin$", p.name)
         if m:
             out[(int(m.group(1)), int(m.group(2)))] = p
@@ -131,6 +142,11 @@ def main() -> int:
     ap.add_argument("--max-ch", type=int, default=1400, help="channels drawn per residual panel")
     ap.add_argument("--zoom", default=None, help="one baseline large, as J,K")
     ap.add_argument(
+        "--prefix",
+        default=None,
+        help="which file set (local day) to read; default is the newest in the run directory",
+    )
+    ap.add_argument(
         "--panel-inches",
         type=float,
         default=0.62,
@@ -145,9 +161,9 @@ def main() -> int:
     d = Path(a.run_dir)
     if not d.is_dir():
         d = d.parent
-    bl = baselines(d)
+    bl = baselines(d, a.prefix)
     if not bl:
-        print(f"no baseline_*_j*_k*.bin in {d}", file=sys.stderr)
+        print(f"no baseline_*_j*_k*.bin in {d} (set prefix {a.prefix!r})", file=sys.stderr)
         return 2
     nst = max(max(j, k) for j, k in bl) + 1
     nch = 8192

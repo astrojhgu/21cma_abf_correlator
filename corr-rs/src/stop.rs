@@ -35,6 +35,11 @@ pub enum StopReason {
     },
     /// A receive thread hit an error it could not fix.
     Fatal { station: usize, message: String },
+    /// The output file set for a new local day could not be opened. The run stops
+    /// rather than keeping the day's rows in the previous day's files: a set whose
+    /// name says one day and whose rows are another is silent wrong data for
+    /// anyone reading by day (docs/DESIGN-daily-files.md §3).
+    RolloverFailed { prefix: String, detail: String },
 }
 
 impl StopReason {
@@ -54,6 +59,11 @@ impl StopReason {
                  frames each one is missing, in blocks.csv"
             ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
+            StopReason::RolloverFailed { prefix, detail } => format!(
+                "the output file set for the new local day ({prefix}) could not be opened: \
+                 {detail}. The rows of the new day are not in any file: nothing was written \
+                 into the previous day's set after the boundary"
+            ),
         }
     }
 }
@@ -104,6 +114,19 @@ impl RunStop {
     pub fn zero_fill_message(&self) -> Option<String> {
         match self.reason() {
             Some(r @ StopReason::ZeroFillCap { .. }) => Some(r.describe()),
+            _ => None,
+        }
+    }
+
+    /// A file set that could not be opened for the new local day.
+    ///
+    /// Reported through the same "STOPPED:" line as the other fatals, because a
+    /// reader of the report needs one place to look for why the run ended; what
+    /// distinguishes it is the sentence, and that nothing of the new day is in any
+    /// file (docs/DESIGN-daily-files.md §3).
+    pub fn rollover_message(&self) -> Option<String> {
+        match self.reason() {
+            Some(r @ StopReason::RolloverFailed { .. }) => Some(r.describe()),
             _ => None,
         }
     }

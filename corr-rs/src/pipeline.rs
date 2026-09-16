@@ -164,7 +164,12 @@ impl<'a> Pipeline<'a> {
                             corr.row_end(frames).context("closing the row on the GPU")?;
                             self.pending_meta.push((row, open_ms));
                             if corr.rows_pending()? >= self.plan.rows_per_fetch as i32 {
-                                let rows_out = flush_rows(
+                                // A file set that cannot be opened for the new
+                                // local day stops the run *with a reason the report
+                                // carries*, like the zero-fill cap: propagating it
+                                // as a bare error would end the run without the
+                                // artifact that says why.
+                                let rows_out = match flush_rows(
                                     corr,
                                     self.plan,
                                     self.progress,
@@ -172,7 +177,21 @@ impl<'a> Pipeline<'a> {
                                     &mut self.pending_meta,
                                     &mut self.fetch_buf,
                                     self.writer.as_mut(),
-                                )?;
+                                ) {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        if let Some(rf) =
+                                            e.downcast_ref::<crate::writer::RolloverFailed>()
+                                        {
+                                            self.stop.stop(StopReason::RolloverFailed {
+                                                prefix: rf.prefix.clone(),
+                                                detail: rf.detail.clone(),
+                                            });
+                                            break;
+                                        }
+                                        return Err(e);
+                                    }
+                                };
                                 let _ = rows_out;
                                 self.sched.note_row_fetched(self.plan.rows_per_fetch);
                             }

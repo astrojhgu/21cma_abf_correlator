@@ -1,15 +1,22 @@
-//! Output: one raw spectrum file per baseline, plus sidecar files.
+//! Output: one raw spectrum file per baseline, plus sidecar files, in **sets**.
 //!
-//! Layout of a run directory:
+//! Layout of a run directory (the prefix is empty when `storage.daily_files` is
+//! off, which is the old behaviour):
 //!
 //! ```text
-//!   baseline_0000_j00_k00.bin   complex64[ntime][n_freq], one row per integration
+//!   <prefix>baseline_0000_j00_k00.bin   complex64[ntime][n_freq], one row per integration
 //!   ...
-//!   rows_ms.bin                 int64 little-endian Unix milliseconds, one per row
-//!   rows_ms.txt                 "<row_index> <ms>" per line
-//!   blocks.csv                  row_index, frame range, per-station valid frames
-//!   metadata.yaml               everything needed to read the raw files
+//!   <prefix>rows_ms.bin                 int64 little-endian Unix milliseconds, one per row
+//!   <prefix>rows_ms.txt                 "<row_index> <ms>" per line
+//!   <prefix>blocks.csv                  row_index, station, frame range, per-station valid frames
+//!   <prefix>metadata.yaml               everything needed to read the raw files
 //! ```
+//!
+//! A **set** is the four sidecars plus one file per baseline -- 304 files for the
+//! 24-station geometry -- sharing one prefix. The prefix names the *local* day and
+//! the *local* time of the set's first row, so a file set holds the day it says it
+//! holds, and the boundary between two days is a boundary between two sets
+//! (docs/DESIGN-daily-files.md).
 //!
 //! Three rules make the output safe to resume from:
 //!
@@ -29,17 +36,20 @@
 //!    the minimum over all the files, so a crash anywhere yields a consistent
 //!    prefix rather than a guess.
 //!
-//! The row index is the file's whole state: `ntime` is `rows_written`, and a
-//! reader that wants frame ids or timestamps joins against `blocks.csv` and
+//! The row index is the set's whole state: `ntime` is `rows_written`, and a reader
+//! that wants frame ids or timestamps joins against `blocks.csv` and
 //! `rows_ms.bin` by row index.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{Config, RunPlan};
+use crate::config::{
+    local_day_at, local_stamp_at, local_tz_name, local_utc_offset_s, Config, RunPlan,
+};
 
 /// Bytes in one row of one baseline's file.
 pub fn baseline_row_bytes(n_freq: u32) -> usize {
@@ -48,9 +58,92 @@ pub fn baseline_row_bytes(n_freq: u32) -> usize {
 
 /// Name of one baseline's raw file. Zero padded so that a directory listing is
 /// in baseline order, and carrying (j, k) so a file can be identified without
-/// reading metadata.yaml.
+/// reading metadata.yaml. The set prefix is prepended by the writer.
 pub fn baseline_file_name(index: usize, j: usize, k: usize) -> String {
     format!("baseline_{index:04}_j{j:02}_k{k:02}.bin")
+}
+
+/// How a set came to exist, recorded in its metadata so a reader can tell a
+/// day's first set from a second one on the same day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetKind {
+    /// The run's first set, on a day that had none.
+    Start,
+    /// The set opened when the local day changed under a running process.
+    Rollover,
+    /// An existing set that a restarted process appended to.
+    Resume,
+    /// A second set on a day that already had one (`--allow-second-set`).
+    SecondSet,
+}
+
+impl SetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SetKind::Start => "start",
+            SetKind::Rollover => "rollover",
+            SetKind::Resume => "resume",
+            SetKind::SecondSet => "second_set",
+        }
+    }
+}
+
+/// Which set a starting process should open.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SetPolicy {
+    /// Append to the set that already belongs to today, if there is one.
+    #[default]
+    Auto,
+    /// Ignore today's set and start a new one (the explicit opt-in to two sets on
+    /// one day, which the default refuses because the alternative is mixing two
+    /// geometries into one file).
+    NewSet,
+    /// Append to the named set, whatever day it belongs to.
+    Explicit(String),
+}
+
+/// The output set for a new day could not be opened.
+///
+/// A type rather than a bare message so the pipeline can stop the run *with a
+/// reason the report carries*, instead of dying with an error and no report --
+/// the same treatment the zero-fill cap gets, and for the same reason: a run that
+/// ends has to say why in the artifact it leaves behind.
+#[derive(Debug)]
+pub struct RolloverFailed {
+    pub prefix: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RolloverFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not open the output file set for prefix {:?} after 3 attempts: {}",
+            self.prefix, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RolloverFailed {}
+
+/// The open files of one set. No `Debug`: `File` has none, and printing a set's
+/// handles would say nothing a reader wants anyway.
+struct SetFiles {
+    baselines: Vec<File>,
+    ms_bin: File,
+    ms_txt: BufWriter<File>,
+    blocks: BufWriter<File>,
+}
+
+/// One set found in the directory, from its metadata and file lengths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundSet {
+    pub prefix: String,
+    /// Local day the set belongs to, from its metadata.
+    pub day: String,
+    pub kind: String,
+    pub rows_written: u64,
+    pub next_frame_id: Option<u64>,
 }
 
 /// What a resumed run found on disk.
@@ -87,10 +180,33 @@ pub struct RowBlock {
     pub valid_frames_per_station: Vec<u64>,
 }
 
-/// Writes one run's output.
-#[derive(Debug)]
+/// Writes one run's output, one file set at a time.
 pub struct Writer {
     dir: PathBuf,
+    /// Prefix of the set being written, without which every file name is formed.
+    /// Empty until the first set exists, and empty for ever when daily files are
+    /// off.
+    prefix: String,
+    /// Whether rows are grouped into per-day sets at all.
+    daily: bool,
+    /// Kept so a new set can be opened mid-run: the geometry to size the files
+    /// and the config to describe them.
+    plan: RunPlan,
+    cfg: Config,
+    config_hash: String,
+    /// Local day of the current set. `None` until a set exists: the first set's
+    /// name has to come from its first row's timestamp, so it cannot be created
+    /// before that row is in hand.
+    set_day: Option<String>,
+    set_kind: SetKind,
+    set_first_row: Option<(u64, u64)>,
+    set_continuation_of: Option<String>,
+    rows_at_open: u64,
+    /// Rows written into the current set (the run's own total is `rows_written`).
+    rows_in_set: u64,
+    /// A backwards wall-clock step is reported once, not once per row.
+    backward_warned: bool,
+
     n_baseline: usize,
     /// Bytes of one baseline's row: the unit every raw file is made of. Each
     /// baseline file grows by exactly this much per integration row.
@@ -100,21 +216,29 @@ pub struct Writer {
     /// `corr_rows_fetch` hands over and what `write_row` expects.
     row_bytes: usize,
 
-    baselines: Vec<File>,
-    ms_bin: File,
-    ms_txt: BufWriter<File>,
-    blocks: BufWriter<File>,
+    /// `None` when no set is open yet (daily files, before the first row).
+    files: Option<SetFiles>,
 
     rows_written: u64,
     fsync_every: u64,
 }
 
+/// The state an operator needs in a log line, without the open file handles
+/// (`File` has no `Debug`, and printing a set's handles would say nothing useful).
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writer")
+            .field("dir", &self.dir)
+            .field("set_prefix", &self.prefix)
+            .field("set_day", &self.set_day)
+            .field("set_open", &self.files.is_some())
+            .field("rows_written", &self.rows_written)
+            .finish()
+    }
+}
+
 impl Writer {
-    /// Create or resume a run directory.
-    ///
-    /// `cfg` is written to metadata.yaml and hashed into it; on resume the hash
-    /// must match, because the geometry being different would silently misread
-    /// every existing row.
+    /// Create or resume a run directory, appending to today's set if there is one.
     pub fn open(
         dir: &Path,
         plan: &RunPlan,
@@ -122,8 +246,133 @@ impl Writer {
         config_hash: &str,
         fsync_every: u64,
     ) -> Result<(Self, ResumeState)> {
+        Self::open_with(dir, plan, cfg, config_hash, fsync_every, &SetPolicy::Auto)
+    }
+
+    /// As [`Writer::open`], with an explicit policy for which set to use.
+    ///
+    /// `cfg` is written to each set's metadata.yaml and hashed into it; on resume
+    /// the hash must match, because the geometry being different would silently
+    /// misread every existing row.
+    pub fn open_with(
+        dir: &Path,
+        plan: &RunPlan,
+        cfg: &Config,
+        config_hash: &str,
+        fsync_every: u64,
+        policy: &SetPolicy,
+    ) -> Result<(Self, ResumeState)> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating the run directory {}", dir.display()))?;
+
+        let daily = cfg.storage.daily_files;
+        let empty = ResumeState {
+            rows_written: 0,
+            next_frame_id: None,
+            truncated_rows: 0,
+        };
+        if !daily {
+            // The historical layout: one nameless set, created now, exactly as
+            // before this feature existed.
+            let (w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, "", None)?;
+            return Ok((w, st));
+        }
+
+        let today = local_day_at(crate::sched::system_ms());
+        let found = discover_sets(dir, plan)?;
+        if std::env::var_os("CORR_SET_DEBUG").is_some() {
+            eprintln!("writer: daily sets in {}: {found:?}", dir.display());
+        }
+
+        // Which set to append to?
+        let chosen: Option<FoundSet> = match policy {
+            SetPolicy::Explicit(prefix) => {
+                let hit = found.iter().find(|s| s.prefix == *prefix).cloned();
+                match hit {
+                    Some(s) => Some(s),
+                    None => bail!(
+                        "no file set with prefix {prefix:?} in {}; the sets there are {:?}",
+                        dir.display(),
+                        found.iter().map(|s| s.prefix.as_str()).collect::<Vec<_>>()
+                    ),
+                }
+            }
+            SetPolicy::NewSet => None,
+            SetPolicy::Auto => found
+                .iter()
+                .filter(|s| s.day == today)
+                .min_by(|a, b| a.prefix.cmp(&b.prefix))
+                .cloned(),
+        };
+
+        let Some(set) = chosen else {
+            // No set to append to: the first row will name one. The writer is a
+            // valid object with no files yet, which is the state `write_row`
+            // resolves.
+            let second = found.iter().any(|s| s.day == today);
+            return Ok((
+                Writer {
+                    dir: dir.to_path_buf(),
+                    prefix: String::new(),
+                    daily: true,
+                    plan: plan.clone(),
+                    cfg: cfg.clone(),
+                    config_hash: config_hash.to_string(),
+                    set_day: None,
+                    set_kind: if second { SetKind::SecondSet } else { SetKind::Start },
+                    set_first_row: None,
+                    set_continuation_of: None,
+                    rows_at_open: 0,
+                    rows_in_set: 0,
+                    backward_warned: false,
+                    n_baseline: plan.n_baseline,
+                    per_baseline_row: baseline_row_bytes(plan.n_freq),
+                    n_station: plan.n_station,
+                    row_bytes: baseline_row_bytes(plan.n_freq) * plan.n_baseline,
+                    files: None,
+                    rows_written: 0,
+                    fsync_every: fsync_every.max(1),
+                },
+                empty,
+            ));
+        };
+
+        // Appending to an existing set: the config hash has to agree, or the two
+        // geometries would be mixed into one file set. The message names the way
+        // out, because the alternative is an operator guessing.
+        let (mut w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, &set.prefix, Some(&set))
+            .map_err(|e| {
+                if matches!(policy, SetPolicy::Auto) {
+                    e.context(format!(
+                        "appending to today's set {}: if the configuration changed on purpose, \
+                         either pass --set <prefix> to choose a set explicitly or \
+                         --allow-second-set to start another set for today",
+                        set.prefix
+                    ))
+                } else {
+                    e
+                }
+            })?;
+        w.set_day = Some(set.day.clone());
+        w.set_kind = SetKind::Resume;
+        w.rows_at_open = st.rows_written;
+        Ok((w, st))
+    }
+
+    /// Open one set, with `prefix` already chosen (empty means the legacy layout).
+    ///
+    /// `found` is the discovered metadata of that set when it already exists;
+    /// `None` means "this set is being created now".
+    fn open_set(
+        dir: &Path,
+        plan: &RunPlan,
+        cfg: &Config,
+        config_hash: &str,
+        fsync_every: u64,
+        prefix: &str,
+        found: Option<&FoundSet>,
+    ) -> Result<(Self, ResumeState)> {
+        let name = |n: &str| dir.join(format!("{prefix}{n}"));
 
         let n_baseline = plan.n_baseline;
         let per_baseline_row = baseline_row_bytes(plan.n_freq);
@@ -137,7 +386,7 @@ impl Writer {
         let mut complete = u64::MAX;
         let mut sizes: Vec<u64> = Vec::with_capacity(n_baseline);
         for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = dir.join(baseline_file_name(idx, *j, *k));
+            let p = name(&baseline_file_name(idx, *j, *k));
             let len = match std::fs::metadata(&p) {
                 Ok(m) => m.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -151,10 +400,10 @@ impl Writer {
         }
         let complete = if complete == u64::MAX { 0 } else { complete };
 
-        let ms_len = file_len(&dir.join("rows_ms.bin"))?;
+        let ms_len = file_len(&name("rows_ms.bin"))?;
         let ms_rows = ms_len / 8;
         // blocks.csv has one line per station per row.
-        let blocks_rows = count_csv_rows(&dir.join("blocks.csv"))? / plan.n_station.max(1) as u64;
+        let blocks_rows = count_csv_rows(&name("blocks.csv"))? / plan.n_station.max(1) as u64;
         // The shortest file wins: a crash can only ever leave one of them short,
         // and taking the minimum means we re-write a row rather than claim one
         // that is not fully there.
@@ -163,7 +412,7 @@ impl Writer {
 
         // --- truncate everything back to that prefix ---
         for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = dir.join(baseline_file_name(idx, *j, *k));
+            let p = name(&baseline_file_name(idx, *j, *k));
             let want = rows_written * baseline_bytes as u64;
             if sizes.get(idx).copied().unwrap_or(0) != want {
                 let f = OpenOptions::new()
@@ -176,21 +425,21 @@ impl Writer {
                     .with_context(|| format!("truncating {} to {want} bytes", p.display()))?;
             }
         }
-        truncate_file(&dir.join("rows_ms.bin"), rows_written * 8)?;
+        truncate_file(&name("rows_ms.bin"), rows_written * 8)?;
         // blocks.csv carries one line per station per row.
-        truncate_csv(&dir.join("blocks.csv"), rows_written * plan.n_station as u64)?;
+        truncate_csv(&name("blocks.csv"), rows_written * plan.n_station as u64)?;
         // rows_ms.txt is a derived view of rows_ms.bin, so it is rebuilt rather
         // than truncated: two files that are supposed to agree are easier to keep
         // in step by regenerating one from the other than by truncating both.
-        rebuild_ms_text(&dir.join("rows_ms.bin"), &dir.join("rows_ms.txt"), rows_written)?;
+        rebuild_ms_text(&name("rows_ms.bin"), &name("rows_ms.txt"), rows_written)?;
 
         // --- the previous row's frame range, for resuming the grid ---
-        let next_frame_id = read_last_block_first_frame(&dir.join("blocks.csv"), plan.n_cum)?;
+        let next_frame_id = read_last_block_first_frame(&name("blocks.csv"), plan.n_cum)?;
 
         // --- open everything for appending ---
         let mut baselines = Vec::with_capacity(n_baseline);
         for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = dir.join(baseline_file_name(idx, *j, *k));
+            let p = name(&baseline_file_name(idx, *j, *k));
             let mut f = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -208,21 +457,40 @@ impl Writer {
         // truncation. Opening without seeking leaves the position at zero, so a
         // resumed run silently overwrites its own sidecars from the start --
         // measured: 98 rows of spectrum with 49 timestamps and 49 block records.
-        let mut ms_bin = open_rw(&dir.join("rows_ms.bin"))?;
+        let mut ms_bin = open_rw(&name("rows_ms.bin"))?;
         ms_bin.seek(SeekFrom::Start(rows_written * 8))?;
-        let ms_txt_path = dir.join("rows_ms.txt");
-        let mut ms_txt_file = open_rw(&ms_txt_path)?;
+        let mut ms_txt_file = open_rw(&name("rows_ms.txt"))?;
         ms_txt_file.seek(SeekFrom::End(0))?;
         let ms_txt = BufWriter::new(ms_txt_file);
-        let mut blocks_file = open_rw(&dir.join("blocks.csv"))?;
+        let mut blocks_file = open_rw(&name("blocks.csv"))?;
         blocks_file.seek(SeekFrom::End(0))?;
         let blocks = BufWriter::new(blocks_file);
 
-        // metadata.yaml is written once, at the start. Resume checks it rather
-        // than rewriting it.
-        let meta_path = dir.join("metadata.yaml");
-        if rows_written == 0 || !meta_path.exists() {
-            write_metadata(&meta_path, plan, cfg, config_hash)?;
+        // A set's metadata.yaml is written once, when the set is created; opening
+        // a set that already has rows checks it rather than rewriting it, because
+        // rewriting geometry that existing rows were produced with is how a reader
+        // gets misled. Missing metadata is the one case that is written rather
+        // than checked: a crash between creating the files and writing metadata
+        // leaves a set nobody has described yet, and the geometry in hand is the
+        // only description available.
+        let meta_path = name("metadata.yaml");
+        let created_now = rows_written == 0 || !meta_path.exists();
+        if created_now {
+            let day = found
+                .map(|s| s.day.clone())
+                .unwrap_or_else(|| local_day_at(crate::sched::system_ms()));
+            write_metadata(
+                &meta_path,
+                plan,
+                cfg,
+                config_hash,
+                prefix,
+                &day,
+                SetKind::Start,
+                None,
+                None,
+                rows_written,
+            )?;
         } else {
             check_metadata(&meta_path, config_hash)?;
         }
@@ -235,19 +503,232 @@ impl Writer {
         Ok((
             Writer {
                 dir: dir.to_path_buf(),
+                prefix: prefix.to_string(),
+                daily: cfg.storage.daily_files,
+                plan: plan.clone(),
+                cfg: cfg.clone(),
+                config_hash: config_hash.to_string(),
+                set_day: Some(if created_now {
+                    found
+                        .map(|s| s.day.clone())
+                        .unwrap_or_else(|| local_day_at(crate::sched::system_ms()))
+                } else {
+                    found.map(|s| s.day.clone()).unwrap_or_default()
+                }),
+                set_kind: if created_now { SetKind::Start } else { SetKind::Resume },
+                set_first_row: None,
+                set_continuation_of: None,
+                rows_at_open: rows_written,
+                rows_in_set: rows_written,
+                backward_warned: false,
                 n_baseline,
-                n_station: plan.n_station,
                 per_baseline_row,
+                n_station: plan.n_station,
                 row_bytes,
-                baselines,
-                ms_bin,
-                ms_txt,
-                blocks,
+                files: Some(SetFiles {
+                    baselines,
+                    ms_bin,
+                    ms_txt,
+                    blocks,
+                }),
                 rows_written,
                 fsync_every: fsync_every.max(1),
             },
             state,
         ))
+    }
+
+    /// Open a new set whose prefix is the local time of `row_ms`, retrying a few
+    /// times and then failing as a [`RolloverFailed`].
+    ///
+    /// Retried because a transient metadata failure (ENOSPC while another writer
+    /// finishes, a busy NFS-style backend) is worth three attempts; *not* retried
+    /// indefinitely, and never fallen back on by writing into the previous set,
+    /// because a file set whose name says one day and whose rows are another is
+    /// worse than a stopped run.
+    fn create_set(
+        &mut self,
+        day: &str,
+        row_ms: i64,
+        blocks: &RowBlock,
+        kind: SetKind,
+        continuation: Option<String>,
+    ) -> Result<()> {
+        let prefix = local_stamp_at(row_ms, &self.cfg.storage.file_prefix_format);
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 1..=3 {
+            match self.try_create_set(&prefix, day, kind, continuation.clone(), blocks) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "writer: opening file set {prefix} for local day {day} failed \
+                         (attempt {attempt}/3): {e}"
+                    );
+                    last = Some(e);
+                    if attempt < 3 {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        Err(anyhow::Error::new(RolloverFailed {
+            prefix,
+            detail: format!("{:#}", last.expect("three attempts set it")),
+        }))
+    }
+
+    fn try_create_set(
+        &mut self,
+        prefix: &str,
+        day: &str,
+        kind: SetKind,
+        continuation: Option<String>,
+        blocks: &RowBlock,
+    ) -> Result<()> {
+        let name = |n: &str| self.dir.join(format!("{prefix}{n}"));
+        // A prefix that already holds rows belongs to a set somebody else is
+        // writing (or wrote); reusing it would interleave two processes' rows.
+        // An empty one is a half-created set from a failed attempt: reuse it.
+        let probe = name(&baseline_file_name(0, 0, 0));
+        if let Ok(m) = std::fs::metadata(&probe) {
+            if m.len() > 0 {
+                bail!(
+                    "{} already holds {} bytes: the prefix {prefix} is in use",
+                    probe.display(),
+                    m.len()
+                );
+            }
+        }
+
+        let mut baselines = Vec::with_capacity(self.n_baseline);
+        for (idx, (j, k)) in self.plan.baseline_pairs().iter().enumerate() {
+            let p = name(&baseline_file_name(idx, *j, *k));
+            let f = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+                .with_context(|| format!("creating {}", p.display()))?;
+            baselines.push(f);
+        }
+        let ms_bin = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(name("rows_ms.bin"))
+            .with_context(|| format!("creating {}", name("rows_ms.bin").display()))?;
+        let ms_txt = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(name("rows_ms.txt"))
+                .with_context(|| format!("creating {}", name("rows_ms.txt").display()))?,
+        );
+        let blocks_file = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(name("blocks.csv"))
+                .with_context(|| format!("creating {}", name("blocks.csv").display()))?,
+        );
+
+        write_metadata(
+            &name("metadata.yaml"),
+            &self.plan,
+            &self.cfg,
+            &self.config_hash,
+            prefix,
+            day,
+            kind,
+            continuation.as_deref(),
+            Some((blocks.row_index, blocks.first_frame_id)),
+            0,
+        )?;
+
+        self.prefix = prefix.to_string();
+        self.set_day = Some(day.to_string());
+        self.set_kind = kind;
+        self.set_continuation_of = continuation;
+        self.set_first_row = Some((blocks.row_index, blocks.first_frame_id));
+        self.rows_at_open = 0;
+        self.rows_in_set = 0;
+        self.files = Some(SetFiles {
+            baselines,
+            ms_bin,
+            ms_txt,
+            blocks: blocks_file,
+        });
+        Ok(())
+    }
+
+    /// Flush and fsync the current set, and let go of its files.
+    ///
+    /// Called at the day boundary and at the end of the run. The boundary case is
+    /// why this is not optional: whatever `fsync_every_rows` says, a set that is
+    /// about to be closed is one whose rows have to be on the platter.
+    fn close_set(&mut self) -> Result<String> {
+        self.finish()?;
+        let closed = self.prefix.clone();
+        self.files = None;
+        Ok(closed)
+    }
+
+    /// Make sure the row about to be written has a set, opening or rolling one as
+    /// the row's own local day requires.
+    ///
+    /// The decision is a pure function of (current set's day, this row's day) --
+    /// see [`decide`] -- so it is unit-testable without a timezone, and the
+    /// timezone itself is read per row rather than cached, which is what makes a
+    /// daylight-saving day come out right.
+    fn ensure_set_for(&mut self, row_ms: i64, blocks: &RowBlock) -> Result<()> {
+        if !self.daily {
+            if self.files.is_none() {
+                bail!("no output set is open and daily files are off; this is a writer bug");
+            }
+            return Ok(());
+        }
+        let day = local_day_at(row_ms);
+        match decide(self.set_day.as_deref(), &day) {
+            Decision::Open => {
+                // `set_kind` was decided when the writer was built: a day that
+                // already had a set but was not appended to (a changed
+                // configuration, `--allow-second-set`) opens a second one.
+                self.create_set(&day, row_ms, blocks, self.set_kind, None)
+            }
+            Decision::Keep => Ok(()),
+            Decision::Roll => {
+                let from = self.close_set()?;
+                self.create_set(&day, row_ms, blocks, SetKind::Rollover, Some(from))
+            }
+            Decision::WarnBackwards => {
+                if !self.backward_warned {
+                    self.backward_warned = true;
+                    eprintln!(
+                        "writer: the local day went backwards ({} -> {day}) with the wall clock; \
+                         keeping the current set {} and not opening another, because the row \
+                         index is monotonic and a set is never reopened once left",
+                        self.set_day.as_deref().unwrap_or("?"),
+                        self.prefix
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The set currently being written: prefix and local day.
+    pub fn set_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    pub fn set_day(&self) -> Option<&str> {
+        self.set_day.as_deref()
+    }
+
+    pub fn set_kind(&self) -> SetKind {
+        self.set_kind
     }
 
     pub fn dir(&self) -> &Path {
@@ -258,7 +739,8 @@ impl Writer {
         self.rows_written
     }
 
-    /// Append one integration row.
+    /// Append one integration row, opening or rolling the file set first if this
+    /// row belongs to a different local day than the set being written.
     ///
     /// `spectrum` is `n_baseline * n_freq` complex64, baseline major -- the whole
     /// row across every baseline, which is exactly what `corr_rows_fetch` returns
@@ -286,13 +768,19 @@ impl Writer {
             );
         }
 
+        self.ensure_set_for(row_ms, blocks)?;
+
+        let files = self
+            .files
+            .as_mut()
+            .expect("ensure_set_for leaves an open set");
         debug_assert_eq!(
-            self.baselines.len(),
+            files.baselines.len(),
             self.n_baseline,
             "one file per baseline, checked because a mismatch would shuffle spectra \
              between baselines silently"
         );
-        for (idx, f) in self.baselines.iter_mut().enumerate() {
+        for (idx, f) in files.baselines.iter_mut().enumerate() {
             let start = idx * self.per_baseline_row;
             // One write per baseline, of exactly one row. Not write_all in a loop:
             // a partially applied row is what we are trying to avoid.
@@ -302,22 +790,23 @@ impl Writer {
 
         if self.rows_written % self.fsync_every == 0 {
             // Flush the data before the sidecars claim it exists.
-            for f in self.baselines.iter_mut() {
+            for f in files.baselines.iter_mut() {
                 f.flush()?;
             }
-            for f in self.baselines.iter() {
+            for f in files.baselines.iter() {
                 f.sync_data()?;
             }
         }
 
-        self.ms_bin
+        files
+            .ms_bin
             .write_all(&row_ms.to_le_bytes())
             .context("writing rows_ms.bin")?;
-        writeln!(self.ms_txt, "{} {}", self.rows_written, row_ms).context("writing rows_ms.txt")?;
+        writeln!(files.ms_txt, "{} {}", self.rows_written, row_ms).context("writing rows_ms.txt")?;
 
         for (station, valid) in blocks.valid_frames_per_station.iter().enumerate() {
             writeln!(
-                self.blocks,
+                files.blocks,
                 "{},{},{},{},{},{}",
                 blocks.row_index,
                 station,
@@ -330,24 +819,120 @@ impl Writer {
         }
 
         self.rows_written += 1;
+        self.rows_in_set += 1;
         Ok(())
     }
 
-    /// Flush and fsync everything. Called on a clean stop.
+    /// Flush and fsync everything in the current set. Called on a clean stop.
     pub fn finish(&mut self) -> Result<()> {
-        for f in self.baselines.iter_mut() {
+        let Some(files) = self.files.as_mut() else {
+            return Ok(()); // never had a set: nothing was written
+        };
+        for f in files.baselines.iter_mut() {
             f.flush()?;
         }
-        for f in self.baselines.iter() {
+        for f in files.baselines.iter() {
             f.sync_all()?;
         }
-        self.ms_bin.sync_all()?;
-        self.ms_txt.flush()?;
-        self.ms_txt.get_ref().sync_all()?;
-        self.blocks.flush()?;
-        self.blocks.get_ref().sync_all()?;
+        files.ms_bin.sync_all()?;
+        files.ms_txt.flush()?;
+        files.ms_txt.get_ref().sync_all()?;
+        files.blocks.flush()?;
+        files.blocks.get_ref().sync_all()?;
         Ok(())
     }
+}
+
+/// What to do with a row, given the day the current set belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// No set yet: this row's day names the first one.
+    Open,
+    /// Same day: write into the set that is open.
+    Keep,
+    /// A later day: close this set and open one for the new day.
+    Roll,
+    /// An *earlier* day than the set being written. The wall clock moved
+    /// backwards (NTP step, timezone change). Keep writing, do not reopen a set
+    /// that has been left: `row_index` is monotonic and a reader would have to
+    /// merge two files to see one day's rows in order.
+    WarnBackwards,
+}
+
+/// Decide what a row's local day means for the set being written.
+///
+/// Pure, and the only place the rule lives: dates in `YYYYmmdd` compare as
+/// strings because the format is fixed-width and most significant first.
+pub fn decide(current_day: Option<&str>, row_day: &str) -> Decision {
+    match current_day {
+        None => Decision::Open,
+        Some(cur) if row_day == cur => Decision::Keep,
+        Some(cur) if row_day > cur => Decision::Roll,
+        Some(_) => Decision::WarnBackwards,
+    }
+}
+
+/// Every set already present in `dir`, from their metadata and file lengths.
+///
+/// A set is recognised by the presence of baseline 0 under a prefix, and its day
+/// comes from that set's own metadata rather than from parsing the prefix: the
+/// prefix format is configurable, so parsing it would be a second, drifting
+/// definition of what the name means.
+pub fn discover_sets(dir: &Path, plan: &RunPlan) -> Result<Vec<FoundSet>> {
+    let (j0, k0) = plan.baseline_pairs().first().copied().unwrap_or((0, 0));
+    let suffix = baseline_file_name(0, j0, k0);
+    let per_baseline_row = baseline_row_bytes(plan.n_freq) as u64;
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(prefix) = name.strip_suffix(&suffix).filter(|p| !p.is_empty()) else {
+            continue; // the legacy unprefixed layout, or another file
+        };
+        let prefix = prefix.to_string();
+        let meta = dir.join(format!("{prefix}metadata.yaml"));
+        let day = read_metadata_field(&meta, "set_day").unwrap_or_default();
+        let kind = read_metadata_field(&meta, "set_kind").unwrap_or_default();
+        // Complete rows: the shortest of the set's own files, as on resume.
+        let mut rows = u64::MAX;
+        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
+            let p = dir.join(format!("{prefix}{}", baseline_file_name(idx, *j, *k)));
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            rows = rows.min(len / per_baseline_row.max(1));
+        }
+        let ms_rows = file_len(&dir.join(format!("{prefix}rows_ms.bin")))? / 8;
+        let block_rows =
+            count_csv_rows(&dir.join(format!("{prefix}blocks.csv")))? / plan.n_station.max(1) as u64;
+        if rows == u64::MAX {
+            rows = 0;
+        }
+        out.push(FoundSet {
+            next_frame_id: read_last_block_first_frame(
+                &dir.join(format!("{prefix}blocks.csv")),
+                plan.n_cum,
+            )?,
+            prefix,
+            day,
+            kind,
+            rows_written: rows.min(ms_rows).min(block_rows),
+        });
+    }
+    out.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+    Ok(out)
+}
+
+/// One `key: value` line out of a metadata file, if the file and the key exist.
+pub fn read_metadata_field(path: &Path, key: &str) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let want = format!("{key}:");
+    s.lines()
+        .find_map(|l| l.strip_prefix(&want))
+        .map(|v| v.trim().to_string())
 }
 
 /// Rewrite `ms.txt` so that it lists exactly the first `rows` timestamps of
@@ -458,11 +1043,29 @@ fn read_last_block_first_frame(p: &Path, n_cum: u32) -> Result<Option<u64>> {
     Ok(Some(first + n_cum as u64))
 }
 
-fn write_metadata(p: &Path, plan: &RunPlan, cfg: &Config, hash: &str) -> Result<()> {
+/// Write one set's `metadata.yaml`.
+///
+/// Everything a reader needs, in the one file that belongs to that set: the
+/// configuration and geometry the rows were produced with, and the set's own
+/// identity -- which local day it holds, which global row it starts at, and how
+/// it came to exist (docs/DESIGN-daily-files.md §4).
+#[allow(clippy::too_many_arguments)] // one call site per set creation; a struct would not help
+fn write_metadata(
+    p: &Path,
+    plan: &RunPlan,
+    cfg: &Config,
+    hash: &str,
+    prefix: &str,
+    day: &str,
+    kind: SetKind,
+    continuation_of: Option<&str>,
+    first_row: Option<(u64, u64)>,
+    rows_at_open: u64,
+) -> Result<()> {
     use std::fmt::Write as _;
     let mut s = String::new();
-    let _ = writeln!(s, "# Written once at the start of a run. A resumed run checks the");
-    let _ = writeln!(s, "# config_hash rather than rewriting geometry that the existing");
+    let _ = writeln!(s, "# Written once, when this file set is created. A resumed run checks");
+    let _ = writeln!(s, "# the config_hash rather than rewriting geometry that the existing");
     let _ = writeln!(s, "# rows were produced with.");
     let _ = writeln!(s, "config_version: {}", cfg.version);
     let _ = writeln!(s, "config_hash: {hash}");
@@ -489,6 +1092,33 @@ fn write_metadata(p: &Path, plan: &RunPlan, cfg: &Config, hash: &str) -> Result<
     let _ = writeln!(s, "frames_per_slot: {}", plan.frames_per_slot);
     let _ = writeln!(s, "rows_per_fetch: {}", plan.rows_per_fetch);
     let _ = writeln!(s, "baseline_row_bytes: {}", baseline_row_bytes(plan.n_freq));
+
+    // --- this set's identity ---
+    let _ = writeln!(s, "# --- the file set this metadata belongs to ---");
+    let _ = writeln!(s, "set_prefix: {prefix}");
+    let _ = writeln!(s, "set_day: {day}");
+    let _ = writeln!(s, "set_kind: {}", kind.as_str());
+    if let Some(prev) = continuation_of {
+        let _ = writeln!(s, "set_continuation_of: {prev}");
+    }
+    match first_row {
+        Some((row_index, first_frame_id)) => {
+            let _ = writeln!(s, "first_row_index: {row_index}");
+            let _ = writeln!(s, "first_frame_id: {first_frame_id}");
+        }
+        None => {
+            let _ = writeln!(s, "first_row_index: 0");
+            let _ = writeln!(s, "first_frame_id: 0");
+        }
+    }
+    let _ = writeln!(s, "rows_at_open: {rows_at_open}");
+    let _ = writeln!(s, "local_timezone: {}", local_tz_name());
+    let _ = writeln!(
+        s,
+        "local_utc_offset_s: {}",
+        local_utc_offset_s(crate::sched::system_ms())
+    );
+
     let _ = writeln!(s, "stations:");
     for st in &plan.enabled {
         let _ = writeln!(
@@ -505,10 +1135,11 @@ fn write_metadata(p: &Path, plan: &RunPlan, cfg: &Config, hash: &str) -> Result<
     for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
         let _ = writeln!(
             s,
-            "  - {{index: {}, j: {}, k: {}, file: {}}}",
+            "  - {{index: {}, j: {}, k: {}, file: {}{}}}",
             idx,
             j,
             k,
+            prefix,
             baseline_file_name(idx, *j, *k)
         );
     }
@@ -540,6 +1171,19 @@ mod tests {
     use crate::config::Config;
 
     fn test_plan_and_cfg() -> (Config, RunPlan) {
+        let (mut cfg, _) = shipped();
+        // These tests pin the *legacy* layout -- no prefix, one set for ever --
+        // which is still a supported mode (`storage.daily_files: false`). The
+        // daily sets have their own tests below, and an end-to-end one in
+        // tools/daily_rollover_test.sh where a timezone can be set for the
+        // process instead of globally.
+        cfg.storage.daily_files = false;
+        let plan = cfg.compile().unwrap();
+        (cfg, plan)
+    }
+
+    /// The shipped test configuration, without touching the daily-files switch.
+    fn shipped() -> (Config, RunPlan) {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -547,6 +1191,51 @@ mod tests {
         let cfg = Config::from_yaml_file(&path).unwrap();
         let plan = cfg.compile().unwrap();
         (cfg, plan)
+    }
+
+    /// The same, with daily file sets on.
+    fn test_plan_and_cfg_daily() -> (Config, RunPlan) {
+        let (mut cfg, _) = shipped();
+        cfg.storage.daily_files = true;
+        let plan = cfg.compile().unwrap();
+        (cfg, plan)
+    }
+
+    /// Every set in `dir`, by prefix, with its (rows_ms.bin length, blocks rows).
+    ///
+    /// `rows_ms.bin` is an unbuffered file, so its length is exact at any moment.
+    /// `blocks.csv` goes through a `BufWriter` and is only flushed when the set is
+    /// closed or the fsync cadence comes round, so for a set still being written
+    /// the second number lags by up to a buffer -- which is why the assertions
+    /// below take it after `finish()`.
+    fn sets_on_disk(dir: &Path, plan: &RunPlan) -> Vec<(String, u64, u64)> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            let Some(prefix) = name.strip_suffix("rows_ms.bin") else {
+                continue;
+            };
+            let prefix = prefix.to_string();
+            let ms = std::fs::metadata(dir.join(format!("{prefix}rows_ms.bin")))
+                .map(|m| m.len())
+                .unwrap_or(0)
+                / 8;
+            let blocks = std::fs::read_to_string(dir.join(format!("{prefix}blocks.csv")))
+                .map(|s| s.lines().count() as u64)
+                .unwrap_or(0)
+                / plan.n_station.max(1) as u64;
+            out.push((prefix, ms, blocks));
+        }
+        out.sort();
+        out
+    }
+
+    fn baseline_paths(dir: &Path, plan: &RunPlan, prefix: &str) -> Vec<PathBuf> {
+        plan.baseline_pairs()
+            .iter()
+            .enumerate()
+            .map(|(i, (j, k))| dir.join(format!("{prefix}{}", baseline_file_name(i, *j, *k))))
+            .collect()
     }
 
     struct TempDir(PathBuf);
@@ -597,6 +1286,208 @@ mod tests {
             n_cum: plan.n_cum,
             valid_frames_per_station: vec![valid; plan.n_station],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // daily file sets
+    // -----------------------------------------------------------------------
+
+    /// A wall-clock instant on the current local day, kept well away from local
+    /// midnight so that "two rows on one day" cannot race the day boundary.
+    fn midday_now() -> i64 {
+        let mut t = crate::sched::system_ms();
+        let hour: u32 = local_stamp_at(t, "%H").parse().unwrap_or(12);
+        if hour >= 23 || hour == 0 {
+            t -= 3 * 3600 * 1000;
+        }
+        t
+    }
+
+    #[test]
+    fn the_day_rule_is_open_keep_roll_or_warn() {
+        // No set yet: this row's day names the first one.
+        assert_eq!(decide(None, "20260916"), Decision::Open);
+        assert_eq!(decide(Some("20260916"), "20260916"), Decision::Keep);
+        // A later day rolls. Fixed-width YYYYmmdd compares as a string, which is
+        // the whole reason the format is that shape -- checked across a month and
+        // a year boundary, where a naive comparison goes wrong.
+        assert_eq!(decide(Some("20260916"), "20260917"), Decision::Roll);
+        assert_eq!(decide(Some("20260930"), "20261001"), Decision::Roll);
+        assert_eq!(decide(Some("20261231"), "20270101"), Decision::Roll);
+        // An earlier day never reopens a set: the clock went backwards.
+        assert_eq!(decide(Some("20260917"), "20260916"), Decision::WarnBackwards);
+        assert_eq!(decide(Some("20270101"), "20261231"), Decision::WarnBackwards);
+    }
+
+    #[test]
+    fn the_first_rows_local_day_names_the_set_and_a_new_day_opens_another() {
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-roll");
+        let (mut w, st) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        assert_eq!(st.rows_written, 0);
+        // The name has to come from the first row's timestamp, so no set can exist
+        // before that row is in hand.
+        assert!(w.set_prefix().is_empty(), "no set before the first row");
+        assert!(sets_on_disk(d.path(), &plan).is_empty());
+
+        let t0 = midday_now();
+        w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+        let p1 = w.set_prefix().to_string();
+        let fmt = cfg.storage.file_prefix_format.clone();
+        assert_eq!(p1, local_stamp_at(t0, &fmt), "prefix is the first row's local time");
+        let meta1 = d.path().join(format!("{p1}metadata.yaml"));
+        assert_eq!(read_metadata_field(&meta1, "set_day").as_deref(), Some(local_day_at(t0).as_str()));
+        assert_eq!(read_metadata_field(&meta1, "set_kind").as_deref(), Some("start"));
+        assert_eq!(read_metadata_field(&meta1, "set_prefix").as_deref(), Some(p1.as_str()));
+        assert_eq!(read_metadata_field(&meta1, "first_row_index").as_deref(), Some("0"));
+        assert_eq!(read_metadata_field(&meta1, "first_frame_id").as_deref(), Some("0"));
+        // Every baseline file of the set exists with exactly one row in it.
+        for p in baseline_paths(d.path(), &plan, &p1) {
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().len(),
+                baseline_row_bytes(plan.n_freq) as u64,
+                "{} should hold one row",
+                p.display()
+            );
+        }
+
+        // A second row on the same local day stays in the same set.
+        w.write_row(&make_row(&plan, 1), t0 + 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
+            .unwrap();
+        assert_eq!(w.set_prefix(), p1);
+        assert_eq!(sets_on_disk(d.path(), &plan).len(), 1);
+
+        // A row on the next local day opens a second set, and closes the first.
+        let t1 = t0 + 24 * 3600 * 1000 + 60_000;
+        if local_day_at(t1) == local_day_at(t0) {
+            // Only reachable with a pathological timezone; nothing to assert.
+            return;
+        }
+        w.write_row(&make_row(&plan, 2), t1, &blocks_for(&plan, 2, plan.n_cum as u64))
+            .unwrap();
+        let p2 = w.set_prefix().to_string();
+        assert_ne!(p1, p2);
+        assert_eq!(p2, local_stamp_at(t1, &fmt));
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 2, "{sets:?}");
+        let s1 = sets.iter().find(|(p, _, _)| *p == p1).unwrap();
+        let s2 = sets.iter().find(|(p, _, _)| *p == p2).unwrap();
+        assert_eq!((s1.1, s1.2), (2, 2), "the closed set keeps its two rows");
+        assert_eq!(s2.1, 1, "the new set starts at row one");
+        w.finish().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        let s2 = sets.iter().find(|(p, _, _)| *p == p2).unwrap();
+        assert_eq!((s2.1, s2.2), (1, 1), "and its sidecars agree once flushed");
+
+        let meta2 = d.path().join(format!("{p2}metadata.yaml"));
+        assert_eq!(read_metadata_field(&meta2, "set_kind").as_deref(), Some("rollover"));
+        assert_eq!(
+            read_metadata_field(&meta2, "set_continuation_of").as_deref(),
+            Some(p1.as_str())
+        );
+        assert_eq!(read_metadata_field(&meta2, "first_row_index").as_deref(), Some("2"));
+        assert_eq!(
+            read_metadata_field(&meta2, "first_frame_id").as_deref(),
+            Some((2 * plan.n_cum as u64).to_string().as_str())
+        );
+        // row_index must not restart per set: it is the global grid.
+        let b2 = std::fs::read_to_string(d.path().join(format!("{p2}blocks.csv"))).unwrap();
+        assert!(b2.starts_with("2,0,"), "row_index continues across sets: {b2:?}");
+        // ... and the first row of the new set is on the new local day.
+        assert_eq!(local_day_at(t1), local_day_at(t0 + 24 * 3600 * 1000 + 60_000));
+    }
+
+    #[test]
+    fn a_restart_appends_to_the_days_set_instead_of_opening_a_second() {
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-resume");
+        let t0 = midday_now();
+        let p1;
+        {
+            let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+            w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+                .unwrap();
+            w.write_row(&make_row(&plan, 1), t0 + 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
+                .unwrap();
+            p1 = w.set_prefix().to_string();
+            w.finish().unwrap();
+        }
+        // A new process on the same day finds that set and appends.
+        let (mut w2, st2) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        assert_eq!(st2.rows_written, 2);
+        assert_eq!(w2.set_prefix(), p1, "same prefix, not a second set");
+        assert_eq!(w2.set_kind(), SetKind::Resume);
+        assert_eq!(st2.next_frame_id, Some(2 * plan.n_cum as u64));
+        w2.write_row(&make_row(&plan, 2), t0 + 2000, &blocks_for(&plan, 2, plan.n_cum as u64))
+            .unwrap();
+        assert_eq!(sets_on_disk(d.path(), &plan).len(), 1, "still one set");
+        w2.finish().unwrap();
+        let s = sets_on_disk(d.path(), &plan);
+        assert_eq!((s[0].1, s[0].2), (3, 3), "the row was appended, not written over");
+        // Appending must not rewrite the set's origin.
+        let meta = d.path().join(format!("{p1}metadata.yaml"));
+        assert_eq!(read_metadata_field(&meta, "set_kind").as_deref(), Some("start"));
+        assert_eq!(read_metadata_field(&meta, "first_row_index").as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn a_changed_configuration_is_refused_and_the_way_out_is_named() {
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-hash");
+        let t0 = midday_now();
+        let p1;
+        {
+            let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+            w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+                .unwrap();
+            p1 = w.set_prefix().to_string();
+        }
+        // Same day, different geometry: appending would mix two geometries into
+        // one set, so it is refused -- with the two ways out in the message.
+        let err = Writer::open(d.path(), &plan, &cfg, "hash-b", 1).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--allow-second-set"), "{msg}");
+        assert!(msg.contains("--set"), "{msg}");
+        assert!(msg.contains(&p1), "the message names the set it refused: {msg}");
+
+        // --allow-second-set opens a second set for the same day.
+        let (mut w2, st2) =
+            Writer::open_with(d.path(), &plan, &cfg, "hash-b", 1, &SetPolicy::NewSet).unwrap();
+        assert_eq!(st2.rows_written, 0);
+        w2.write_row(&make_row(&plan, 0), t0 + 1000, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+        assert_ne!(w2.set_prefix(), p1);
+        let meta2 = d.path().join(format!("{}metadata.yaml", w2.set_prefix()));
+        assert_eq!(read_metadata_field(&meta2, "set_kind").as_deref(), Some("second_set"));
+        assert_eq!(sets_on_disk(d.path(), &plan).len(), 2);
+
+        // --set <prefix> appends to the named set instead.
+        let (w3, st3) =
+            Writer::open_with(d.path(), &plan, &cfg, "hash-a", 1, &SetPolicy::Explicit(p1.clone()))
+                .unwrap();
+        assert_eq!(st3.rows_written, 1);
+        assert_eq!(w3.set_prefix(), p1);
+    }
+
+    #[test]
+    fn a_wall_clock_that_goes_backwards_keeps_writing_the_current_set() {
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-backwards");
+        let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        let t0 = midday_now();
+        w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+        let p1 = w.set_prefix().to_string();
+        // A row stamped a day earlier (NTP step, timezone change) must not reopen
+        // a set that has been left.
+        w.write_row(&make_row(&plan, 1), t0 - 24 * 3600 * 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
+            .unwrap();
+        assert_eq!(w.set_prefix(), p1);
+        w.finish().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1);
+        assert_eq!((sets[0].1, sets[0].2), (2, 2));
     }
 
     #[test]

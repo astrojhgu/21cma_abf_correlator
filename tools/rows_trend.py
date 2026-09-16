@@ -24,6 +24,8 @@ import csv
 import sys
 from pathlib import Path
 
+import corr_common
+
 
 def read(path: Path) -> list[tuple[int, int, int, int]]:
     """(row, station, valid, zero_filled) from a blocks.csv."""
@@ -45,16 +47,22 @@ def read(path: Path) -> list[tuple[int, int, int, int]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("run_dir", help="directory containing blocks.csv")
+    ap.add_argument("run_dir", help="run directory, or the file set inside it")
     ap.add_argument("--step", type=int, default=1, help="print every Nth row")
     ap.add_argument("--worst", type=int, default=5, help="worst rows to list")
+    ap.add_argument(
+        "--prefix",
+        default=None,
+        help="which file set to read (a local day's prefix); default is the newest",
+    )
     a = ap.parse_args()
 
     d = Path(a.run_dir)
-    blocks = d / "blocks.csv"
+    blocks = Path(corr_common.pick_set(str(d), a.prefix)["blocks"])
     if not blocks.is_file():
         print(f"no blocks.csv in {d}", file=sys.stderr)
         return 2
+    print(f"set {blocks.name[: -len('blocks.csv')]!r} of {d}")
     recs = read(blocks)
     if not recs:
         print("blocks.csv has no data rows", file=sys.stderr)

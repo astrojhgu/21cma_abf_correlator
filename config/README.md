@@ -11,13 +11,20 @@
 | `correlator-40-replay.yaml` | 40 路功能测试（回放）| 40 | 4096 | 需要 `auto_layout` 共享核警告；40 线程 > 32 核 |
 | `correlator-test.yaml` / `correlator-mgpu-test.yaml` | 早期小规模测试 | 2 / 8 | 4096 | 保留作最小复现 |
 
-四条约定（都是踩出来的，别再改回去）：
+五条约定（都是踩出来的，别再改回去）：
 
 1. **绑核用策略，不手写核号**：`cpu.avoid_nic_interfaces: [ens2f0np0]` + `cpu.auto_layout: true`。
    手写列表在换机器时会**静默**出错（症状只是长跑里几个百分点的补零）。
 2. **`recv_buffer_bytes` 与 `gpu.ring_lead` 必须配对**：socket 能积压的量 ≤ 环允许领先的量，
    否则积压只能涨不能消（见 `docs/ARCHITECTURE.md` §3.2）。
-3. **`recv_buffer_bytes` 要按档案定，不能跨档案抄**。nch=16384 档最初照抄了 nf8192 档的
+3. **输出按本地日期分文件集，默认对所有档案生效**（`storage.daily_files: true`，前缀
+   `storage.file_prefix_format: "%Y%m%d_%H%M%S"`）：跨本地零点自动换一套
+   `<前缀>baseline_*.bin` / `blocks.csv` / `rows_ms.*` / `metadata.yaml`，名字取该套第一条
+   行的本地时刻。要续写当日那套，两次进程必须给同一个 `run.name`（默认按时间戳命名，
+   每次都是新目录）。设计、代价与两条被接受的风险见 `docs/DESIGN-daily-files.md`；
+   端到端判据 `tools/daily_rollover_test.sh`。要退回老的无前缀布局：
+   `storage.daily_files: false`。
+4. **`recv_buffer_bytes` 要按档案定，不能跨档案抄**。nch=16384 档最初照抄了 nf8192 档的
    32 MiB（实得 64 MiB ≈ 84 ms），同一台机器、同样 300 s：每站丢 25.1 万个包（0.43%）、
    补零 0.4269%；改成 256 MiB（实得 512 MiB ≈ 640 ms）后丢 10.9 万个（0.077%）、补零
    **0.1050%**。4 倍的差别全在收包侧。反过来推不成立：把 nch=16384 的槽改小

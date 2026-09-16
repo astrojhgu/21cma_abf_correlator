@@ -64,6 +64,18 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
   同一窗口，只是面板放大到 1.05 in/150 dpi 以便阅读）。**两线版图的"斜率看着不同"只来自
   `--phase-window`**：每通道 0.021973°（fft_len = 2·nch = 16384），一格里铺 1536 个通道还是 384 个，
   决定它看着有多陡、画几圈；拟合值不受窗口影响。
+* **每日文件（2026-09-17）**：输出按**本地日期**分套 —— `<prefix>baseline_*.bin` /
+  `<prefix>rows_ms.*` / `<prefix>blocks.csv` / `<prefix>metadata.yaml`，`<prefix>` =
+  该套第一条行的本地 `%Y%m%d_%H%M%S`。跨本地零点自动关旧套、开新套；`row_index` 继续全局、
+  按行的**起始时刻**归属、当天重启追加当日那套。开关 `storage.daily_files`（默认**开**，
+  对所有运行生效）+ `storage.file_prefix_format`；当日改了配置时默认拒绝启动，用
+  `--allow-second-set` / `--set <prefix>` 显式继续。设计与实测见
+  `docs/DESIGN-daily-files.md`；端到端判据 12 条全过（`tools/daily_rollover_test.sh`：
+  TZ 把本地零点挪进窗口，20 kpps 与 50 kpps 各一次 —— 前者跨零点 **0 帧补零**，
+  后者紧随边界的一行掉 6.3%，切套的文件工作 ~0.5 s）。
+* 判读工具现在认前缀：`rows_trend.py` / `longrun_report.py` / `compare_blocks.py` /
+  `compare_runs.py` / `phase_check.py` / `phase_triangle.py` 都可加 `--prefix`，
+  默认取**最后一套**；不带前缀的老目录照旧能读（`tools/corr_common.py` 里的 `find_sets`）。
 * 结构：`run.rs` 639 行（编排）+ `receiver.rs` / `pipeline.rs` / `report.rs` / `stop.rs`。
   **三条不变量已结构化**：进度发布唯一入口、`block_slots - ring_lead ≥ 1` 由校验强制、
   停止原因唯一且首个胜出（见 `docs/ARCHITECTURE.md` §3）。
@@ -124,6 +136,7 @@ load 16–21 与 24–27 之间差一个量级，比较必须在同一窗口内�
 | `docs/DESIGN-zero-fill-decoupling.md` | 补零解耦的设计 + **§7 分步计划与验收命令** |
 | `config/README.md` | 7 个配置档案各自用途 + 三条"别再改回去"的约定 |
 | `tools/README.md` | 判读/体检工具清单 + 三条使用纪律 |
+| `docs/DESIGN-daily-files.md` | 按本地日期分文件集的行为、切套代价与两条被接受的风险 |
 | `HANDOFF.md` | 历史日志（很长，过程与实测记录） |
 
 ## 5. 明确没做完 / 没验证的

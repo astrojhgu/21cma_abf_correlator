@@ -10,6 +10,7 @@
 | `counter_probe_120s.log` | 2026-09-14 那次 120 s 长跑的原始输出（4 路，零丢包零漂移） |
 | `phase_check.py` | 从相关机落盘的 baseline 文件拟合**相位随频率的斜率**，反推站间采样延迟 |
 | `stress_integration.sh` | 用不同积分时间（1 s / 100 ms / 10 ms）压写盘路径，观察 fsync 与吞吐 |
+| `daily_rollover_test.sh` | 每日文件集的端到端判据：用 POSIX TZ 把本地零点挪进测试窗口，跑 2–4 分钟真跨零点，检查 12 条（套名自洽、行数之和、row_index/帧网格连续、时间单调、归属、切套代价与逐行补零）|
 | `ab_zerofill.sh` | 补零解耦的 A/B 单腿：同一份确定性回放（`--start-counter` 固定、`--gap-len/--gap-at` 造缺口、回放先起）打进指定二进制，存下 `blocks.csv`、运行报告与前后 load |
 | `compare_blocks.py` | 两条腿的 `blocks.csv` 逐行比对（按 `first_frame_id`+station 匹配），打印共有行数、逐行是否相同、以及排除启动首行后的缺失率 |
 
@@ -50,6 +51,25 @@ tools/stress_integration.sh 9728 10 10 25 D-100ms
 10 ms 即使存储免费也只有 86 行/s，嫌疑是"writer 在管线线程里同步跑"）。
 脚本会把每行计数、`rows_ms.bin`/`blocks.csv` 一致性、以及落后百分比打出来，
 跑完自动删掉输出目录（10 ms 档一次 20 s 就是 11 GB）。
+
+## daily_rollover_test
+
+按本地日期分文件集（`docs/DESIGN-daily-files.md`）唯一的验证方式：不能让日历等你，所以
+用 POSIX TZ 字符串把**本地零点挪进测试窗口**：
+
+```sh
+tools/daily_rollover_test.sh 20000 150 1     # 20 kpps、跑 150 s、1 分钟后到本地零点
+```
+
+TZ 字符串形如 `CORR+11:26:34`（POSIX 的符号与直觉相反：`+` 表示西经/UTC-），脚本自己算出
+偏移，使"现在"正好是本地 23:59。跑完逐条打印 12 项判据（全过才算通过）。**不要用文件 mtime
+与墙钟相减**：本机 `/scratch` 报出的 mtime 比墙钟慢约 13 分钟，混用会凭空造出 13 分钟的
+"停顿"；脚本改成用**自己的时钟**记录"什么时候看见变化"。
+
+实测（24 站）：20 kpps 下切套 0 帧补零；50 kpps（管线贴极限）下紧随边界的一行掉 6.3%；
+两种速率下 304 个文件的建立都是 ~0.5 s。
+
+判读工具现在都支持带前缀的文件集：`--prefix <YYYYmmdd_HHMMSS>`，默认取最后一套。
 
 ## ab_zerofill + compare_blocks
 

@@ -22,10 +22,12 @@ import glob
 import os
 import sys
 
+import corr_common
+
 import numpy as np
 
 
-def read_blocks(run_dir):
+def read_blocks(run_dir, prefix=None):
     """first_frame_id -> file row offset, from blocks.csv.
 
     The `row` column of blocks.csv is the *global* row index (first_frame_id /
@@ -35,7 +37,7 @@ def read_blocks(run_dir):
     offset for it.
     """
     first_seen = []
-    path = os.path.join(run_dir, "blocks.csv")
+    path = corr_common.pick_set(run_dir, prefix)["blocks"]
     if not os.path.exists(path):
         sys.exit(f"{run_dir}: no blocks.csv")
     with open(path) as fh:
@@ -50,9 +52,9 @@ def read_blocks(run_dir):
     return {ff: off for off, ff in enumerate(first_seen)}
 
 
-def load_metadata(run_dir):
+def load_metadata(run_dir, prefix=None):
     meta = {}
-    with open(os.path.join(run_dir, "metadata.yaml")) as fh:
+    with open(corr_common.pick_set(run_dir, prefix)["metadata"]) as fh:
         for line in fh:
             if ":" in line and not line.startswith("#"):
                 k, v = line.split(":", 1)
@@ -65,7 +67,10 @@ def read_row(run_dir, row, n_baseline, n_freq):
     out = np.empty((n_baseline, n_freq), dtype=np.complex64)
     row_bytes = n_freq * 8
     for b in range(n_baseline):
-        path = glob.glob(os.path.join(run_dir, f"baseline_{b:04d}_*.bin"))
+        # The set's prefix goes in front of every file, so the glob carries it.
+        path = glob.glob(
+            os.path.join(run_dir, f"{corr_common.pick_set(run_dir, prefix)['prefix']}baseline_{b:04d}_*.bin")
+        )
         if not path:
             sys.exit(f"{run_dir}: no file for baseline {b}")
         with open(path[0], "rb") as fh:
@@ -81,20 +86,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir_a")
     ap.add_argument("dir_b")
+    ap.add_argument(
+        "--prefix",
+        default=None,
+        help="which file set (local day) to compare in both runs; default is the newest",
+    )
     ap.add_argument("--tolerance", type=float, default=0.0,
                     help="relative RMS tolerance; 0 means require bit equality")
     ap.add_argument("--max-rows", type=int, default=5,
                     help="how many shared rows to compare")
     args = ap.parse_args()
 
-    meta_a, meta_b = load_metadata(args.dir_a), load_metadata(args.dir_b)
+    meta_a = load_metadata(args.dir_a, args.prefix)
+    meta_b = load_metadata(args.dir_b, args.prefix)
     for key in ("n_baseline", "n_freq", "n_cum"):
         if meta_a.get(key) != meta_b.get(key):
             sys.exit(f"runs differ in {key}: {meta_a.get(key)} vs {meta_b.get(key)}")
     n_baseline = int(meta_a["n_baseline"])
     n_freq = int(meta_a["n_freq"])
 
-    blocks_a, blocks_b = read_blocks(args.dir_a), read_blocks(args.dir_b)
+    blocks_a = read_blocks(args.dir_a, args.prefix)
+    blocks_b = read_blocks(args.dir_b, args.prefix)
     shared = sorted(set(blocks_a) & set(blocks_b))
     if not shared:
         sys.exit(f"no shared rows: A covers {len(blocks_a)} rows "

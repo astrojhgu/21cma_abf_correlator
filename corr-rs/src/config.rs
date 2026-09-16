@@ -203,6 +203,33 @@ pub struct StorageCfg {
     /// the sidecars are still written after the data, so a lost row is missing
     /// from all four files rather than half written.
     pub fsync_every_rows: u64,
+    /// Write each local day's rows into their own set of files, named with the
+    /// local day and the local time of that set's first row.
+    ///
+    /// On by default, for every run: a file should hold the day it says it holds,
+    /// and that should not depend on how the run was invoked. Turn it off to get
+    /// the old unprefixed names back (used by short tests and by anything that
+    /// globs `baseline_*.bin`).
+    ///
+    /// Details, and the two risks this accepts (a ~0.5 s stall at the boundary,
+    /// and no completeness marker for a day whose process died): see
+    /// docs/DESIGN-daily-files.md.
+    #[serde(default = "default_daily_files")]
+    pub daily_files: bool,
+    /// strftime format for a file set's prefix. Must contain at least one `%`
+    /// directive and must not contain a path separator -- both are validated,
+    /// because a format that produces the same name every day would collide at
+    /// the first boundary.
+    #[serde(default = "default_file_prefix_format")]
+    pub file_prefix_format: String,
+}
+
+fn default_daily_files() -> bool {
+    true
+}
+
+fn default_file_prefix_format() -> String {
+    DEFAULT_FILE_PREFIX_FORMAT.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -502,24 +529,82 @@ impl RunPlan {
 // Loading and compiling
 // ---------------------------------------------------------------------------
 
-/// Current UTC time as `YYYYmmdd_HHMMSS`, for the default run name.
+/// Default strftime format for a daily file set's prefix, and for the run
+/// directory name: the local day, then the local time of the set's first row.
+pub const DEFAULT_FILE_PREFIX_FORMAT: &str = "%Y%m%d_%H%M%S";
+
+/// Current UTC time as `YYYYmmdd_HHMMSS`.
 ///
 /// Goes through libc rather than pulling in a date crate: the host side has no
 /// other use for calendar arithmetic, and a UTC stamp computed from
 /// `gmtime_r` cannot be affected by the machine's timezone the way a
-/// hand-rolled formatter could.
+/// hand-rolled formatter could. It is now only used for *reporting* the UTC
+/// time next to the local one; everything that names a file is local
+/// (see [`local_stamp_at`] and docs/DESIGN-daily-files.md).
 pub fn utc_stamp() -> String {
-    use std::ffi::CStr;
-    // SAFETY: all four calls take valid pointers to properly sized objects;
-    // gmtime_r and strftime write only into the provided storage.
+    stamp_at(crate::sched::system_ms(), "%Y%m%d_%H%M%S", true)
+}
+
+/// Format a wall-clock instant in the machine's local time zone.
+///
+/// `localtime_r`, not `gmtime_r`: a daily file set is named for the *local* day
+/// (docs/DESIGN-daily-files.md §1), and "local" is whatever `TZ` and
+/// `/etc/localtime` say at the moment of the call -- so a timezone change takes
+/// effect on the next row rather than needing a restart. Being a call rather than
+/// a cached offset is also what makes a daylight-saving day (23 or 25 hours) come
+/// out right.
+pub fn local_stamp_at(ms: i64, format: &str) -> String {
+    stamp_at(ms, format, false)
+}
+
+/// The local calendar day of `ms`, as `YYYYmmdd`.
+///
+/// The day key that decides which set a row belongs to. Comparing these strings
+/// compares days, because the format is fixed-width and big-endian.
+pub fn local_day_at(ms: i64) -> String {
+    stamp_at(ms, "%Y%m%d", false)
+}
+
+/// The `TZ` environment variable as the process sees it, for metadata. Empty when
+/// unset, which means libc fell back to `/etc/localtime`.
+pub fn local_tz_name() -> String {
+    std::env::var("TZ").unwrap_or_default()
+}
+
+/// Seconds east of UTC that local time was at `ms`. Recorded per set so a reader
+/// can tell what the local stamp in the file names meant without guessing.
+pub fn local_utc_offset_s(ms: i64) -> i64 {
+    // SAFETY: localtime_r writes only into the provided tm.
     unsafe {
-        let now = libc::time(std::ptr::null_mut());
+        let secs = ms.div_euclid(1000) as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        if libc::gmtime_r(&now, &mut tm).is_null() {
+        if libc::localtime_r(&secs, &mut tm).is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+}
+
+/// Shared body of the two stamps above. `utc` selects `gmtime_r`.
+fn stamp_at(ms: i64, format: &str, utc: bool) -> String {
+    use std::ffi::CStr;
+    // SAFETY: both conversions take a valid time_t pointer and a properly sized
+    // tm; strftime writes only into the provided buffer, and the buffer is long
+    // enough that strftime returning 0 means "format failed", not "too long".
+    unsafe {
+        let secs = ms.div_euclid(1000) as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        let ok = if utc {
+            !libc::gmtime_r(&secs, &mut tm).is_null()
+        } else {
+            !libc::localtime_r(&secs, &mut tm).is_null()
+        };
+        if !ok {
             return "unknown_time".to_string();
         }
-        let mut buf = [0 as libc::c_char; 32];
-        let fmt = b"%Y%m%d_%H%M%S\0";
+        let mut buf = [0 as libc::c_char; 128];
+        let mut fmt: Vec<u8> = format.as_bytes().to_vec();
+        fmt.push(0);
         let n = libc::strftime(
             buf.as_mut_ptr(),
             buf.len(),
@@ -536,12 +621,19 @@ pub fn utc_stamp() -> String {
 impl Config {
     /// Fill in a timestamped run name if the configuration left it empty.
     ///
+    /// Local time, like the file-set prefixes inside it: a directory named in UTC
+    /// containing files named in local time is exactly the kind of two-time-base
+    /// mix-up that makes the daily data hard to reconcile later.
+    ///
     /// Separate from [`Config::compile`] so that compiling stays pure, and
     /// separate from validation so that `--check` on an unmodified file does not
     /// silently invent a name.
     pub fn resolve_run_name(&mut self) {
         if self.run.name.as_deref().map_or(true, str::is_empty) {
-            self.run.name = Some(format!("corr_{}", utc_stamp()));
+            self.run.name = Some(format!(
+                "corr_{}",
+                local_stamp_at(crate::sched::system_ms(), DEFAULT_FILE_PREFIX_FORMAT)
+            ));
         }
     }
 
@@ -722,6 +814,33 @@ impl Config {
         }
         if self.storage.fsync_every_rows == 0 {
             bail!("storage.fsync_every_rows must be >= 1");
+        }
+        // Only checked when the feature is on: a junk format in a config that has
+        // daily files switched off is not a reason to refuse the run.
+        if self.storage.daily_files {
+            let fmt = &self.storage.file_prefix_format;
+            if fmt.is_empty() {
+                bail!("storage.file_prefix_format is empty; the file sets would have no name");
+            }
+            if fmt.contains('/') {
+                bail!(
+                    "storage.file_prefix_format={fmt:?} contains a path separator; the prefix \
+                     goes in front of a file name, not in front of a path"
+                );
+            }
+            if !fmt.contains('%') {
+                bail!(
+                    "storage.file_prefix_format={fmt:?} has no strftime directive, so every \
+                     day would name its files the same and the second day would collide with \
+                     the first"
+                );
+            }
+            // strftime returns 0 for a format it cannot produce; catching that here
+            // means a bad format refuses to start rather than failing at midnight.
+            let probe = local_stamp_at(0, fmt);
+            if probe == "unknown_time" || probe.is_empty() {
+                bail!("storage.file_prefix_format={fmt:?} does not format to anything");
+            }
         }
 
         // --- stations ----------------------------------------------------
