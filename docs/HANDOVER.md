@@ -42,6 +42,16 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
 * 实跑证据：**24 路满速率、4 卡 `time_slice`（R=1）**，每卡 H2D 4.80 GB/s（满需求）；
   5 分钟跑 **299/300 行准点**，补零率 **0.0013% – 0.0376%**（随负载 16 → 24 变化，见 §3）；
   相位–频率检验 **276/276** 基线精确复现注入延迟（`tools/phase_triangle.py`）。
+* **2026-09-16 复测（ABI 7，补零解耦落地后，真实前端 24 路）**：`config/correlator-24.yaml`，
+  4 卡 `time_slice`，300 s 跑 **299 行**（1.0014 s 节拍，与上面那条旧记录一致）；每卡 H2D
+  **4.79 GB/s**（需求 4.80，聚合 **19.2 GB/s**），SM 利用率 ~40% —— 墙是主机链路不是算力；
+  进程 **11.7 核 / 32 核**（另跑 90 s 采样所得）。补零 **0.0105%**（5 min，load 均值 21.4、
+  峰 28.6）与 **0.0033%**（90 s，load 均值 17.9），**230/299 行整行零缺失**，三段
+  35.0k/18.1k/20.6k 无上升趋势；0 次 stall 恢复、无停止原因、输出 2.8 GB（=9.8 MB/s）。
+  相位-频率：τ=0/1/2 三档拟合 **0.0000/1.0000/2.0000** 样本、最大残差 ≤1e-4 rad
+  （`tools/phase_check.py`）；24 站 delay-stride 三角形 **276/276**、lag 误差 0 样本、
+  overlay 0.00027 rad（`tools/phase_triangle.py`）。图：根目录 `phase_check.png`、
+  `phase_triangle.png`。复现命令见 `tools/README.md`，原始日志在 `/scratch/zb/`。
 * 结构：`run.rs` 639 行（编排）+ `receiver.rs` / `pipeline.rs` / `report.rs` / `stop.rs`。
   **三条不变量已结构化**：进度发布唯一入口、`block_slots - ring_lead ≥ 1` 由校验强制、
   停止原因唯一且首个胜出（见 `docs/ARCHITECTURE.md` §3）。
