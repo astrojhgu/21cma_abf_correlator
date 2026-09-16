@@ -52,7 +52,7 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
   （`tools/phase_check.py`）；24 站 delay-stride 三角形 **276/276**、lag 误差 0 样本、
   overlay 0.00027 rad（`tools/phase_triangle.py`）。图：根目录 `phase_check.png`、
   `phase_triangle.png`（残差版）、`phase_triangle_lines.png`（两线版：每格虚线是模型、
-  实线是数据，384 通道窗口）。复现命令见 `tools/README.md`，原始日志在 `/scratch/zb/`。
+  实线是数据，384 通道窗口）。`phase_triangle_lines.png` 是 `--delay-stride 1` 基线（站 i 延迟 i 个采样点，i=0…23）：rate 20000、60 s、**0 丢包 0 补零**，276/276、lag 误差 0 样本、overlay 0.00034 rad。复现命令见 `tools/README.md`，原始日志在 `/scratch/zb/`。
 * 结构：`run.rs` 639 行（编排）+ `receiver.rs` / `pipeline.rs` / `report.rs` / `stop.rs`。
   **三条不变量已结构化**：进度发布唯一入口、`block_slots - ring_lead ≥ 1` 由校验强制、
   停止原因唯一且首个胜出（见 `docs/ARCHITECTURE.md` §3）。
