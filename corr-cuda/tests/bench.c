@@ -83,12 +83,17 @@ int main(int argc, char **argv) {
     if (corr_create(&cfg, &ctx) != CORR_OK) die("corr_create");
 
     /* Fill the staging once with a deterministic non-trivial pattern. The
-     * content does not change the cost of the pipeline, only the geometry does. */
+     * content does not change the cost of the pipeline, only the geometry does.
+     * The validity mask is set all-valid: a patterned mask would have the device
+     * zeroing frames, and this program measures throughput, not correctness -- it
+     * should not be paying for silence nobody asked for. */
     for (int g = 0; g < n_station; ++g) {
         corr_staging s;
         if (corr_staging_info(ctx, g, &s) != CORR_OK) die("corr_staging_info");
-        for (size_t i = 0; i < s.total_bytes; ++i)
+        for (size_t i = 0; i < s.validity_offset; ++i)
             s.base[i] = (int8_t)((i * 31 + (size_t)g * 7) % 9 - 4);
+        memset(s.base + s.validity_offset, 0xFF,
+               s.total_bytes - s.validity_offset);
     }
 
     const size_t fetch_bytes =

@@ -544,7 +544,9 @@ pub fn run_receive(
 ///
 /// `pending_meta` and `zf_mark` are the per-row bookkeeping the GPU does not
 /// have: which row index and wall clock each fetched row belongs to, and how many
-/// frames each station had to zero fill since the previous row.
+/// frames each station declared missing since the previous row (those are the
+/// frames that contributed silence, which is what the `zero_filled` column has
+/// always meant).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_rows(
     corr: &Correlator,

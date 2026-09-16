@@ -15,6 +15,19 @@
  *   * the autocorrelation of a real signal has a negligible imaginary part,
  *     which is what a wrong conjugation or a transposed sample layout breaks.
  *
+ * It runs that pipeline three times, over the same input:
+ *
+ *   FRAMES_ALL_VALID    every frame real                  -> compared with numpy
+ *   FRAMES_HOST_ZEROED  the missing frames zeroed by the host, mask all valid
+ *   FRAMES_MASK_MARKED  the missing frames left as garbage, mask bits clear
+ *
+ * The last two must agree *byte for byte*. They are the old and the new way of
+ * producing silence for a frame that did not arrive (docs/DESIGN-zero-fill-
+ * decoupling.md), and if the device-side zeroing is wrong in any way -- a wrong
+ * bit order, a frame offset off by one, a stale mask -- one of them differs. The
+ * garbage fill on the third run is deliberate: a device that ignored the mask
+ * would correlate it and fail loudly rather than quietly agree.
+ *
  * usage: golden DATADIR
  */
 
@@ -73,6 +86,145 @@ static void *xread(const char *dir, const char *name, size_t expect_bytes) {
 static void die(const char *what) {
     fprintf(stderr, "golden: %s: %s\n", what, corr_last_error());
     exit(1);
+}
+
+/* ---------------------------------------------------------------------------
+ * The three preparations of a staging slot
+ * ------------------------------------------------------------------------- */
+
+/* Which frames are declared missing in the equivalence case. Every seventh
+ * frame, with the phase moved by the row so the set is not the same frames of
+ * every row. The identity of the set does not matter -- what is compared is two
+ * ways of producing silence for the same set -- but it should span several
+ * staging slots, land in the partial last slot of a row, and differ between the
+ * rows that share one device fetch. */
+#define MISSING_EVERY 7
+#define MISSING_PHASE 3
+
+static int frame_is_missing(int row, int frame_in_row) {
+    return ((row * 3 + frame_in_row) % MISSING_EVERY) == MISSING_PHASE;
+}
+
+typedef enum {
+    /* Every frame is real: the case the numpy reference describes. */
+    FRAMES_ALL_VALID,
+    /* The old behaviour: the host writes the zeros for a frame that did not
+     * arrive and marks every frame valid. */
+    FRAMES_HOST_ZEROED,
+    /* The new behaviour: the host leaves the missing frame alone and clears its
+     * mask bit, and the device zeroes it. The staging is filled with a pattern
+     * first, so a device that ignores the mask cannot pass by accident. */
+    FRAMES_MASK_MARKED,
+} frame_mode;
+
+/* Drive the public ABI the way the scheduler does -- create, fill, submit each
+ * slot, release it before its next use, close the rows, fetch them in one
+ * transfer -- and write `rows` rows into `out`. Returns 0 on success. */
+static int drive(const corr_config *cfg, const int8_t *input, int n_station, int n_cum,
+                 int rows, frame_mode mode, float *out, size_t out_bytes) {
+    void *ctx = NULL;
+    if (corr_create(cfg, &ctx) != CORR_OK) die("corr_create");
+
+    int rc = 0;
+    int submits = 0;
+
+    /* `submits` counts slot handovers across the whole run, not within a row:
+     * the staging ring is global, so a slot must be released before its next use
+     * no matter which row that use belongs to. Resetting the counter per row is
+     * the bug this comment exists to prevent -- it leaves the first block_slots
+     * submissions unreleased for ever, and the ring then refuses the second row.
+     */
+    for (int r = 0; r < rows && rc == 0; ++r) {
+        for (int f0 = 0; f0 < n_cum; f0 += cfg->frames_per_slot) {
+            const int ft = n_cum - f0 < cfg->frames_per_slot ? n_cum - f0
+                                                            : cfg->frames_per_slot;
+            const int slot = submits % cfg->block_slots;
+
+            /* Released *before* the slot is filled, which is the order that
+             * matters now: corr_row_slot_free clears the slot's validity mask as
+             * it hands the slot back, and the fill below then sets a bit for each
+             * frame it actually wrote. Filling first would have the release wipe
+             * the bits again -- and the device would see a wholly missing slot. */
+            if (submits >= cfg->block_slots) {
+                if (corr_row_slot_free(ctx, submits) != CORR_OK) die("corr_row_slot_free");
+            }
+
+            for (int g = 0; g < n_station; ++g) {
+                corr_staging st;
+                if (corr_staging_info(ctx, g, &st) != CORR_OK)
+                    die("corr_staging_info");
+                unsigned char *mask = (unsigned char *)st.base + st.validity_offset +
+                                      (size_t)slot * st.validity_bytes_per_slot;
+                for (int f = 0; f < ft; ++f) {
+                    int8_t *dst = st.base + (size_t)slot * st.slot_stride +
+                                  (size_t)f * st.frame_stride;
+                    const int missing = frame_is_missing(r, f0 + f);
+                    if (mode != FRAMES_ALL_VALID && missing) {
+                        if (mode == FRAMES_HOST_ZEROED)
+                            memset(dst, 0, st.frame_stride);
+                        else
+                            memset(dst, 0x5A, st.frame_stride); /* what the mask must discard */
+                    } else {
+                        const int8_t *src =
+                            input + (((size_t)r * n_station + g) * n_cum + f0 + f) *
+                                        st.frame_stride;
+                        memcpy(dst, src, st.frame_stride);
+                    }
+                    if (!(mode == FRAMES_MASK_MARKED && missing))
+                        mask[f >> 3] |= (unsigned char)(1u << (f & 7));
+                }
+            }
+
+            if (corr_row_accumulate(ctx, submits, ft) != CORR_OK)
+                die("corr_row_accumulate");
+            ++submits;
+        }
+
+        /* n_cum frames, not the sum of the slots: the frozen decision is to
+         * divide by the frame count the row was supposed to contain. */
+        if (corr_row_end(ctx, (uint64_t)n_cum) != CORR_OK) die("corr_row_end");
+    }
+
+    /* Release whichever slots are still held, so nothing is left in flight.
+     * That is the last min(block_slots, submits) handovers. */
+    {
+        const int first_held = submits > cfg->block_slots ? submits - cfg->block_slots : 0;
+        for (int sIdx = submits - 1; sIdx >= first_held; --sIdx) {
+            if (corr_row_slot_free(ctx, sIdx) != CORR_OK)
+                die("corr_row_slot_free(final)");
+        }
+    }
+
+    if (corr_rows_wait(ctx) != CORR_OK) die("corr_rows_wait");
+
+    int32_t pending = -1;
+    if (corr_rows_pending(ctx, &pending) != CORR_OK) die("corr_rows_pending");
+    if (pending != rows) {
+        fprintf(stderr, "golden: expected %d pending rows, got %d\n", rows, pending);
+        rc = 1;
+    }
+
+    int32_t fetched = -1;
+    if (rc == 0 && corr_rows_fetch(ctx, out, out_bytes, &fetched) != CORR_OK)
+        die("corr_rows_fetch");
+    if (rc == 0 && fetched != rows) {
+        fprintf(stderr, "golden: fetched %d rows, expected %d\n", fetched, rows);
+        rc = 1;
+    }
+
+    corr_destroy(ctx);
+    return rc;
+}
+
+/* Relative RMS of `got` against `expect`. */
+static double rel_rms(const float *got, const float *expect, size_t n_floats) {
+    double num = 0.0, den = 0.0;
+    for (size_t i = 0; i < n_floats; ++i) {
+        const double d = (double)got[i] - (double)expect[i];
+        num += d * d;
+        den += (double)expect[i] * (double)expect[i];
+    }
+    return den > 0.0 ? sqrt(num / den) : (num > 0.0 ? INFINITY : 0.0);
 }
 
 int main(int argc, char **argv) {
@@ -141,90 +293,27 @@ int main(int argc, char **argv) {
     cfg.block_slots = 3;
     cfg.rows_per_fetch = rows;
 
-    void *ctx = NULL;
-    if (corr_create(&cfg, &ctx) != CORR_OK) die("corr_create");
-
     const size_t frame_stride = (size_t)2 * n_freq;
     const int8_t *input =
         (const int8_t *)xread(dir, "in.bin",
                               (size_t)rows * n_station * n_cum * frame_stride);
 
-    /* --- drive the rows exactly as the scheduler will ---
-     *
-     * `submits` counts slot handovers across the whole run, not within a row:
-     * the staging ring is global, so a slot must be released before its next use
-     * no matter which row that use belongs to. Resetting the counter per row is
-     * the bug this comment exists to prevent -- it leaves the first block_slots
-     * submissions unreleased for ever, and the ring then refuses the second row.
-     */
-    int submits = 0;
-    for (int r = 0; r < rows; ++r) {
-        for (int f0 = 0; f0 < n_cum; f0 += frames_per_slot) {
-            const int ft = n_cum - f0 < frames_per_slot ? n_cum - f0 : frames_per_slot;
-            const int slot = submits % cfg.block_slots;
-
-            if (submits >= cfg.block_slots) {
-                if (corr_row_slot_free(ctx, submits) != CORR_OK) die("corr_row_slot_free");
-            }
-
-            for (int g = 0; g < n_station; ++g) {
-                corr_staging st;
-                if (corr_staging_info(ctx, g, &st) != CORR_OK)
-                    die("corr_staging_info");
-                for (int f = 0; f < ft; ++f) {
-                    const int8_t *src =
-                        input + (((size_t)r * n_station + g) * n_cum + f0 + f) *
-                                    frame_stride;
-                    memcpy(st.base + (size_t)slot * st.slot_stride +
-                               (size_t)f * st.frame_stride,
-                           src, frame_stride);
-                }
-            }
-
-            if (corr_row_accumulate(ctx, submits, ft) != CORR_OK) die("corr_row_accumulate");
-            ++submits;
-        }
-
-        /* n_cum frames, not the sum of the slots: the frozen decision is to
-         * divide by the frame count the row was supposed to contain. */
-        if (corr_row_end(ctx, (uint64_t)n_cum) != CORR_OK) die("corr_row_end");
-    }
-
-    /* Release whichever slots are still held, so nothing is left in flight.
-     * That is the last min(block_slots, submits) handovers. */
-    {
-        const int first_held = submits > cfg.block_slots ? submits - cfg.block_slots : 0;
-        for (int sIdx = submits - 1; sIdx >= first_held; --sIdx) {
-            if (corr_row_slot_free(ctx, sIdx) != CORR_OK)
-                die("corr_row_slot_free(final)");
-        }
-    }
-
-    if (corr_rows_wait(ctx) != CORR_OK) die("corr_rows_wait");
-
-    int32_t pending = -1;
-    if (corr_rows_pending(ctx, &pending) != CORR_OK) die("corr_rows_pending");
-    if (pending != rows) {
-        fprintf(stderr, "golden: expected %d pending rows, got %d\n", rows, pending);
-        return 1;
-    }
-
     const size_t row_bytes = (size_t)n_baseline * n_freq * sizeof(float) * 2;
-    float *got = (float *)xmalloc(row_bytes * (size_t)rows);
-    int32_t fetched = -1;
-    if (corr_rows_fetch(ctx, got, row_bytes * (size_t)rows, &fetched) != CORR_OK)
-        die("corr_rows_fetch");
-    if (fetched != rows) {
-        fprintf(stderr, "golden: fetched %d rows, expected %d\n", fetched, rows);
-        return 1;
-    }
+    const size_t all_bytes = row_bytes * (size_t)rows;
+    float *got = (float *)xmalloc(all_bytes);
+    float *zeroed = (float *)xmalloc(all_bytes);
+    float *masked = (float *)xmalloc(all_bytes);
 
-    const float *expect = (const float *)xread(dir, "expect.bin", row_bytes * (size_t)rows);
+    /* --- 1. every frame real: the pipeline must still agree with numpy --- */
+    if (drive(&cfg, input, n_station, n_cum, rows, FRAMES_ALL_VALID, got, all_bytes))
+        return 1;
+
+    const float *expect = (const float *)xread(dir, "expect.bin", all_bytes);
 
     /* --- compare --- */
     double num = 0.0, den = 0.0, worst = 0.0;
     size_t worst_i = 0;
-    for (size_t i = 0; i < row_bytes * (size_t)rows / sizeof(float); ++i) {
+    for (size_t i = 0; i < all_bytes / sizeof(float); ++i) {
         const double d = (double)got[i] - (double)expect[i];
         num += d * d;
         den += (double)expect[i] * (double)expect[i];
@@ -233,11 +322,11 @@ int main(int argc, char **argv) {
             worst_i = i;
         }
     }
-    const double rel_rms = den > 0.0 ? sqrt(num / den) : (num > 0.0 ? INFINITY : 0.0);
+    const double rms = den > 0.0 ? sqrt(num / den) : (num > 0.0 ? INFINITY : 0.0);
     const size_t elem = worst_i / 2;
     const size_t per_row = (size_t)n_baseline * n_freq;
 
-    printf("golden: relative RMS error = %.3e (tolerance %.1e)\n", rel_rms,
+    printf("golden: relative RMS error = %.3e (tolerance %.1e)\n", rms,
            kRelRmsTolerance);
     printf("golden: worst element |delta| = %.6g at row %d baseline %d bin %d "
            "(got %.6g, expected %.6g)\n",
@@ -259,10 +348,52 @@ int main(int argc, char **argv) {
     printf("golden: autocorrelation max |Re| = %.6g, max |Im| = %.3g\n", max_abs,
            max_imag);
 
-    corr_destroy(ctx);
-    free((void *)input);
-    free((void *)expect);
-    free(got);
+    /* --- 2. the old and the new way of zeroing a missing frame ---
+     *
+     * Same input, same missing frames. One run has the host write the zeros and
+     * mark every frame valid; the other leaves the frame as a garbage pattern and
+     * clears its bit, so the device has to zero it. Anything other than a
+     * byte-for-byte match is a bug in the mask path, and this is the only test
+     * that can see one: the numpy comparison above never has a missing frame. */
+    if (drive(&cfg, input, n_station, n_cum, rows, FRAMES_HOST_ZEROED, zeroed,
+              all_bytes))
+        return 1;
+    if (drive(&cfg, input, n_station, n_cum, rows, FRAMES_MASK_MARKED, masked,
+              all_bytes))
+        return 1;
+
+    const double rms_host = rel_rms(zeroed, got, all_bytes / sizeof(float));
+    printf("golden: 1 frame in %d declared missing | host-zeroed vs mask-marked "
+           "RMS = %.3e | either vs all-valid RMS = %.3e\n",
+           MISSING_EVERY, rel_rms(zeroed, masked, all_bytes / sizeof(float)),
+           rms_host);
+
+    size_t first_diff = 0;
+    int differs = 0;
+    for (size_t i = 0; i < all_bytes; ++i) {
+        if (((const unsigned char *)zeroed)[i] != ((const unsigned char *)masked)[i]) {
+            first_diff = i;
+            differs = 1;
+            break;
+        }
+    }
+    if (differs) {
+        fprintf(stderr,
+                "golden: FAILED, zeroing a missing frame on the device does not "
+                "reproduce zeroing it on the host: first differing byte %zu "
+                "(%.6g against %.6g)\n",
+                first_diff, (double)zeroed[first_diff / 4],
+                (double)masked[first_diff / 4]);
+        return 1;
+    }
+    if (!(rms_host > 1e-6)) {
+        fprintf(stderr,
+                "golden: FAILED, declaring one frame in %d missing changed nothing "
+                "(RMS %.3e against the all-valid run); the mask cannot have been "
+                "read at all\n",
+                MISSING_EVERY, rms_host);
+        return 1;
+    }
 
     if (max_abs > 0.0 && max_imag > 1e-3 * max_abs) {
         fprintf(stderr,
@@ -270,11 +401,17 @@ int main(int argc, char **argv) {
                 "conjugation or the sample layout is wrong\n");
         return 1;
     }
-    if (!(rel_rms < kRelRmsTolerance)) {
-        fprintf(stderr, "golden: FAILED, relative RMS %.3e exceeds %.1e\n", rel_rms,
+    if (!(rms < kRelRmsTolerance)) {
+        fprintf(stderr, "golden: FAILED, relative RMS %.3e exceeds %.1e\n", rms,
                 kRelRmsTolerance);
         return 1;
     }
     printf("golden: OK\n");
+
+    free((void *)input);
+    free((void *)expect);
+    free(got);
+    free(zeroed);
+    free(masked);
     return 0;
 }

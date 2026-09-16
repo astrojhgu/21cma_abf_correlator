@@ -225,6 +225,13 @@ static void run(const Params *p, int n_devices, const int *devices, int split_mo
             for (int g = 0; g < p->n_station; ++g) {
                 corr_staging st;
                 if (corr_staging_info(ctx, g, &st) != CORR_OK) die("corr_staging_info");
+                /* Every frame of this slot is real, and the validity mask is what
+                 * says so: a clear bit would have the device zero the frame, and
+                 * this test compares spectra with numpy. The release above emptied
+                 * the mask, so the bits go in after the samples, as the receive
+                 * thread does it. */
+                unsigned char *mask = (unsigned char *)st.base + st.validity_offset +
+                                      (size_t)slot * st.validity_bytes_per_slot;
                 for (int f = 0; f < ft; ++f) {
                     const int8_t *src =
                         input + (((size_t)r * p->n_station + g) * p->n_cum + f0 + f) *
@@ -232,6 +239,7 @@ static void run(const Params *p, int n_devices, const int *devices, int split_mo
                     memcpy(st.base + (size_t)slot * st.slot_stride +
                                (size_t)f * st.frame_stride,
                            src, frame_stride);
+                    mask[f >> 3] |= (unsigned char)(1u << (f & 7));
                 }
             }
             if (corr_row_accumulate(ctx, submits, ft) != CORR_OK) die("corr_row_accumulate");

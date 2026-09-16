@@ -4,11 +4,20 @@
 //
 //   pinned int8 staging
 //     --cudaMemcpy2DAsync-->      d_int8   [station][frame][sample]
+//     --cudaMemcpy2DAsync-->      d_mask   [station][bit per frame of the slot]
+//     --zero_invalid_frames-->    d_int8   frames the mask calls missing := 0
 //     --int8_to_float-------->    d_real   [station][frame][sample]  float32
 //     --cufftExecR2C (batched)--> d_y      [station][frame][n_freq+1] complex64
 //     --corr_kernel---------->    acc[row] [baseline][n_freq]        += ...
 //
 // Three decisions here come from measurement, not taste:
+//
+//  * Missing frames are zeroed HERE, not on the receive thread. The host used to
+//    write the zeros, and at nch=8192 that is ~5 GB/s of memset on the same thread
+//    that has to keep reading its socket -- the amplification loop
+//    docs/DESIGN-zero-fill-decoupling.md exists to break. What the host sends
+//    instead is one bit per frame, and the zeroing costs nothing when nothing is
+//    missing.
 //
 //  * int8 -> float32 happens on the DEVICE. 15 stations is 12.0 GB/s of int8;
 //    converting on the host first would mean 48.1 GB/s over PCIe, and the link
@@ -108,6 +117,10 @@ constexpr int kDeviceBuffers = 3;
 constexpr int kConvertThreads = 256;
 constexpr int kScaleThreads = 256;
 
+/// Threads per block in the frame-zeroing kernel. One block covers
+/// kZeroThreads*16 bytes of a frame, so a 8192-sample frame takes two blocks.
+constexpr int kZeroThreads = 256;
+
 inline int ceil_div(long long a, long long b) { return (int)((a + b - 1) / b); }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +136,41 @@ __global__ void int8_to_float_kernel(const int8_t *__restrict__ in,
         // metadata and never enters this conversion.
         out[i] = (float)in[i];
     }
+}
+
+/// Zero every frame of the chunk whose validity bit is clear.
+///
+/// The host no longer fills missing frames with zeros -- the receive thread only
+/// says which frames arrived (see docs/DESIGN-zero-fill-decoupling.md). This is
+/// where the silence is actually written, which is what lets a station that fell
+/// behind keep reading its socket instead of writing gigabytes of zeros into the
+/// staging it is also trying to keep up with.
+///
+/// Grid : (blocks over one frame's samples, frames in this chunk, stations)
+/// Block: threads striding over the frame's samples.
+///
+/// One block per frame rather than an elementwise test: a frame is either wholly
+/// there or wholly zero, so the mask is read once per frame instead of once per
+/// sample, and the common case (nothing missing) costs one early return per
+/// block. A frame is `fft_len` *int8* samples -- `fft_len` is an element count, not
+/// a byte count, and the two happen to agree here only because a sample is one
+/// byte -- and n_freq is a multiple of 2048, so fft_len is a multiple of 4096 and
+/// the frame is a whole number of int4 stores.
+__global__ void zero_invalid_frames_kernel(int8_t *__restrict__ d_int8,
+                                           const unsigned char *__restrict__ d_mask,
+                                           int mask_bytes_per_slot, int f0,
+                                           int fft_len, long long w) {
+    const int f = f0 + (int)blockIdx.y;
+    const int st = (int)blockIdx.z;
+    const unsigned char *m = d_mask + (size_t)st * (size_t)mask_bytes_per_slot;
+    if (m[f >> 3] & (1u << (f & 7))) return; // present: leave the samples alone
+
+    int4 *p = reinterpret_cast<int4 *>(d_int8 + (size_t)st * (size_t)w +
+                                       (size_t)blockIdx.y * (size_t)fft_len);
+    const int n4 = fft_len / (int)sizeof(int4);
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4;
+         i += (int)gridDim.x * (int)blockDim.x)
+        p[i] = make_int4(0, 0, 0, 0);
 }
 
 /// acc[row][ch] *= s, used to divide a completed integration row by its frame
@@ -226,6 +274,12 @@ struct DeviceBuf {
     int8_t *d_int8 = nullptr;  // [station][frame][sample] for one chunk
     float *d_real = nullptr;   // same shape, float32
     float2 *d_y = nullptr;     // [station][frame][n_freq+1] complex64
+    /// Validity mask of the chunk's frames, [station][validity_bytes_per_slot],
+    /// straight from the staging: one bit per frame of the *slot*, so the bit for
+    /// the frame at chunk offset `fi` is `f0 + fi`. Per device buffer rather than
+    /// per slot because it is overwritten by the next chunk's copy that uses this
+    /// buffer, and the copy already waits for this buffer's earlier kernels.
+    unsigned char *d_mask = nullptr;
 };
 
 struct GpuState {
@@ -313,6 +367,7 @@ void free_all(GpuState *g) {
         cudaFree(b.d_int8);
         cudaFree(b.d_real);
         cudaFree(b.d_y);
+        cudaFree(b.d_mask);
     }
     cudaFree(g->d_acc);
     cudaFree(g->d_pairs);
@@ -330,7 +385,8 @@ corr_status prime_event(cudaEvent_t e, cudaStream_t s) {
 // create / destroy
 // ---------------------------------------------------------------------------
 
-corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl, GpuState **out) {
+corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl,
+                       const StagingLayout &layout, GpuState **out) {
     if (out == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_create: out is NULL");
     *out = nullptr;
     if (pl.device < 0) return gpu_fail(CORR_ERR_ARG, "gpu_create: no device in placement");
@@ -393,6 +449,19 @@ corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl, GpuState 
 
     const size_t chunk_bytes = (size_t)cfg.chunk_frames * (size_t)g->fft_len;
     const size_t chunk_samples = (size_t)g->n_station_local * chunk_bytes;
+    // One bit per frame of the slot per resident station. The staging's own mask
+    // is per *station*, of which this device may hold a subset, but the bits are
+    // copied per station either way, so the buffer is sized like the sample
+    // buffers: one row per resident station.
+    const size_t chunk_mask_bytes =
+        (size_t)g->n_station_local * layout.validity_bytes_per_slot;
+
+    if (layout.validity_bytes_per_slot == 0) {
+        free_all(g);
+        return gpu_fail(CORR_ERR_ARG,
+                        "gpu_create: the staging layout has no validity mask; the "
+                        "GPU would have to guess which frames are missing");
+    }
 
     for (DeviceBuf &b : g->dbuf) {
         if ((st = cuda_check(cudaMalloc(reinterpret_cast<void **>(&b.d_int8),
@@ -404,7 +473,10 @@ corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl, GpuState 
             (st = cuda_check(cudaMalloc(reinterpret_cast<void **>(&b.d_y),
                                         (size_t)g->n_station_local * cfg.chunk_frames *
                                             (size_t)g->bins * sizeof(float2)),
-                             "cudaMalloc(Y)")) != CORR_OK) {
+                             "cudaMalloc(Y)")) != CORR_OK ||
+            (st = cuda_check(cudaMalloc(reinterpret_cast<void **>(&b.d_mask),
+                                        chunk_mask_bytes),
+                             "cudaMalloc(mask)")) != CORR_OK) {
             free_all(g);
             return st;
         }
@@ -630,6 +702,41 @@ corr_status gpu_accumulate(GpuState *g, const StagingLayout &layout, int32_t slo
             }
         }
 
+        // The validity mask rides with the samples, as a second small strided
+        // copy on the same stream: one bit per frame of the slot per station, so
+        // 32 bytes per station at frames_per_slot=256 -- 768 bytes for 24
+        // stations against 6 MB of samples. It is issued before copy_done is
+        // recorded, so every kernel that waits for this chunk's samples has
+        // waited for this mask too.
+        {
+            const unsigned char *mask_base =
+                reinterpret_cast<const unsigned char *>(layout.base) +
+                layout.validity_offset +
+                (size_t)slot * layout.validity_bytes_per_slot;
+            const size_t mb = layout.validity_bytes_per_slot;
+            g->bytes_h2d += (uint64_t)(mb * (size_t)n_station);
+            if (g->resident_is_identity) {
+                if ((st = cuda_check(
+                         cudaMemcpy2DAsync(b.d_mask, mb, mask_base,
+                                           layout.station_stride, mb,
+                                           (size_t)n_station, cudaMemcpyHostToDevice,
+                                           g->copy_stream),
+                         "cudaMemcpy2DAsync(H2D, mask)")) != CORR_OK)
+                    return st;
+            } else {
+                for (int i = 0; i < n_station; ++i) {
+                    const unsigned char *src =
+                        mask_base +
+                        (size_t)g->resident[(size_t)i] * layout.station_stride;
+                    if ((st = cuda_check(
+                             cudaMemcpyAsync(b.d_mask + (size_t)i * mb, src, mb,
+                                             cudaMemcpyHostToDevice, g->copy_stream),
+                             "cudaMemcpyAsync(H2D, mask per station)")) != CORR_OK)
+                        return st;
+                }
+            }
+        }
+
         if ((st = cuda_check(cudaEventRecord(g->copy_done[(size_t)d], g->copy_stream),
                              "cudaEventRecord(copy_done)")) != CORR_OK)
             return st;
@@ -640,6 +747,21 @@ corr_status gpu_accumulate(GpuState *g, const StagingLayout &layout, int32_t slo
                  cudaStreamWaitEvent(g->compute_stream, g->copy_done[(size_t)d]),
                  "cudaStreamWaitEvent(copy_done)")) != CORR_OK)
             return st;
+
+        // Silence for the frames that never arrived, written on the device before
+        // the conversion reads them. This runs on the compute stream, so it costs
+        // one launch when nothing is missing and a frame's worth of stores when
+        // something is.
+        {
+            const dim3 grid(std::max(1, ceil_div((long long)g->fft_len / 16,
+                                                  (long long)kZeroThreads)),
+                            (unsigned)ft, (unsigned)n_station);
+            zero_invalid_frames_kernel<<<grid, kZeroThreads, 0, g->compute_stream>>>(
+                b.d_int8, b.d_mask, (int)layout.validity_bytes_per_slot, f0,
+                g->fft_len, (long long)w);
+            if ((st = cuda_check(cudaGetLastError(), "zero_invalid_frames_kernel")) != CORR_OK)
+                return st;
+        }
 
         {
             const int blocks = std::max(1, ceil_div((long long)elems, kConvertThreads));

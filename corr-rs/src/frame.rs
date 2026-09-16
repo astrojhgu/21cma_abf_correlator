@@ -158,7 +158,7 @@ impl CounterTracker {
 ///
 /// `P` is small (1, 2, 4 or 8), so the state of one frame fits in a byte and the
 /// whole block needs one byte per frame. A frame is complete only when every one
-/// of its packets has been seen; anything else must be zero filled, because a
+/// of its packets has been seen; anything else contributes silence, because a
 /// half-filled frame is not a valid FFT input.
 #[derive(Debug, Clone)]
 pub struct FrameArrival {
@@ -246,10 +246,11 @@ impl FrameArrival {
         self.complete
     }
 
-    /// Frames that must be zero filled: everything that did not receive all of
-    /// its packets, whether it saw none or only some.
+    /// Frames that did not receive all of their packets, whether they saw none
+    /// or only some: the set the assembler declares missing, and therefore the
+    /// set the device zeroes.
     ///
-    /// Returned in ascending order so the caller can zero contiguous runs.
+    /// Returned in ascending order so the caller can walk contiguous runs.
     pub fn incomplete_frames(&self) -> Vec<usize> {
         self.bits
             .iter()

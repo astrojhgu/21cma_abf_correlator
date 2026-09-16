@@ -15,7 +15,7 @@
 //!   entry and exit alone.
 //! * `SO_RCVTIMEO` is deliberately short. A receive thread must not block for
 //!   ever: when a station goes quiet it has to notice and honour the scheduler's
-//!   request to zero fill up to the next slot boundary.
+//!   request to declare the missing frames up to the next slot boundary.
 //!
 //! `IP_ADD_MEMBERSHIP` binds the group to `receiver.interface_ip`, not to
 //! `INADDR_ANY`: with several interfaces on the host, joining on the wrong one

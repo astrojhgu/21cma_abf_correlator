@@ -140,6 +140,20 @@ static void test_config_rejection(void) {
           status_name(s));
 }
 
+/* Mark every frame of `slot` valid in every station, which is what a receive
+ * thread that received everything writes. Without it the device zeroes the whole
+ * slot (a clear bit means "this frame did not arrive"), and any check of the
+ * samples would pass for the wrong reason. */
+static void mark_all_valid(void *ctx, const corr_config *c, int32_t slot) {
+    for (int32_t g = 0; g < c->n_station; ++g) {
+        corr_staging st;
+        if (corr_staging_info(ctx, g, &st) != CORR_OK) return;
+        unsigned char *mask = (unsigned char *)st.base + st.validity_offset +
+                              (size_t)slot * st.validity_bytes_per_slot;
+        memset(mask, 0xFF, st.validity_bytes_per_slot);
+    }
+}
+
 static void test_staging_layout(void) {
     printf("staging layout\n");
     corr_config c = make_config();
@@ -153,7 +167,15 @@ static void test_staging_layout(void) {
 
     const size_t frame_stride = (size_t)2 * c.n_freq;
     const size_t slot_stride = frame_stride * (size_t)c.frames_per_slot;
-    const size_t station_stride = slot_stride * (size_t)c.block_slots;
+    const size_t samples_stride = slot_stride * (size_t)c.block_slots;
+    /* One bit per frame of a slot, rounded up to whole bytes, appended after the
+     * samples. It is part of the station's extent: the device reads this to decide
+     * which frames are silence, so a caller that sizes its own buffer from
+     * total_bytes minus the mask would be handing the library a buffer it will
+     * read past. */
+    const size_t mask_bytes_per_slot = ((size_t)c.frames_per_slot + 7) / 8;
+    const size_t mask_stride = mask_bytes_per_slot * (size_t)c.block_slots;
+    const size_t station_stride = samples_stride + mask_stride;
 
     for (int32_t g = 0; g < c.n_station; ++g) {
         corr_staging st;
@@ -163,6 +185,12 @@ static void test_staging_layout(void) {
               st.frame_stride, frame_stride);
         CHECK(st.slot_stride == slot_stride, "slot_stride %zu != %zu",
               st.slot_stride, slot_stride);
+        CHECK(st.validity_bytes_per_slot == mask_bytes_per_slot,
+              "validity_bytes_per_slot %zu != %zu", st.validity_bytes_per_slot,
+              mask_bytes_per_slot);
+        CHECK(st.validity_offset == samples_stride,
+              "validity_offset %zu should follow the samples at %zu",
+              st.validity_offset, samples_stride);
         /* base is already offset to this station, so total_bytes is this
          * station's extent, not the size of the whole allocation. Getting this
          * wrong is how a caller walks off the end of the buffer. */
@@ -202,6 +230,33 @@ static void test_staging_layout(void) {
         if (s0.base[i] != 0) ++nonzero;
     CHECK(nonzero == 0, "staging was not zero initialised (%d nonzero samples)", nonzero);
 
+    /* --- the validity mask's lifecycle ---
+     *
+     * It starts all-zero ("nothing present"), the receive thread sets a bit per
+     * frame that arrived whole, and corr_row_slot_free clears the whole slot as it
+     * hands it back. That last clear is what keeps a station that sends nothing at
+     * all for a whole slot from inheriting the previous lap's bits, which the
+     * device would then read as real data. */
+    {
+        unsigned char *mask = (unsigned char *)s0.base + s0.validity_offset;
+        size_t set = 0;
+        for (size_t i = 0; i < mask_stride; ++i)
+            if (mask[i] != 0) ++set;
+        CHECK(set == 0, "the validity mask should start all-zero, %zu bytes are set", set);
+
+        memset(mask, 0xAA, mask_bytes_per_slot);
+        s = corr_row_accumulate(ctx, 0, c.frames_per_slot);
+        CHECK(s == CORR_OK, "accumulating a marked slot failed: %s", corr_last_error());
+        s = corr_row_slot_free(ctx, 0);
+        CHECK(s == CORR_OK, "slot_free failed: %s", corr_last_error());
+        set = 0;
+        for (size_t i = 0; i < mask_stride; ++i)
+            if (mask[i] != 0) ++set;
+        CHECK(set == 0,
+              "slot_free must hand the slot back with an empty mask, %zu bytes are set",
+              set);
+    }
+
     /* --- row lifecycle --- */
     const size_t row_bytes = (size_t)corr_n_baseline(c.n_station) * (size_t)c.n_freq * 8;
     void *out = malloc(row_bytes * (size_t)c.rows_per_fetch);
@@ -238,10 +293,14 @@ static void test_staging_layout(void) {
     CHECK(s == CORR_ERR_ARG, "row_end(0) should be CORR_ERR_ARG, got %s", status_name(s));
 
     /* Staging is all zeros, so a real row must come out all zeros: anything
-     * else means uninitialised device memory reached the output. */
+     * else means uninitialised device memory reached the output. The mask is set
+     * all-valid first so that the samples are actually correlated -- otherwise the
+     * device would zero the whole slot and this would pass without reading a
+     * sample. */
     for (int32_t i = 0; i < c.block_slots; ++i) {
         const int64_t seq = i;
         const int32_t slot = (int32_t)(seq % c.block_slots);
+        mark_all_valid(ctx, &c, slot);
         s = corr_row_accumulate(ctx, seq, c.frames_per_slot);
         CHECK(s == CORR_OK, "accumulate(%lld) failed: %s", (long long)seq, corr_last_error());
 
@@ -293,6 +352,7 @@ static void test_staging_layout(void) {
     /* Fetching clears the rows, so the pipeline can cycle. */
     for (int32_t i = 0; i < c.block_slots; ++i) {
         const int64_t seq = c.block_slots + i; /* carry on where the block above stopped */
+        mark_all_valid(ctx, &c, (int32_t)(seq % c.block_slots));
         CHECK(corr_row_accumulate(ctx, seq, c.frames_per_slot) == CORR_OK,
               "reuse accumulate failed");
         CHECK(corr_row_slot_free(ctx, seq) == CORR_OK, "reuse slot_free failed");

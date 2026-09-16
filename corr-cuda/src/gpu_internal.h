@@ -74,9 +74,12 @@ struct StagingLayout {
 ///
 /// `cfg` still describes the *whole* run (n_station is the global count, which
 /// is what the staging layout and the two-dimensional copies are built from);
-/// `pl` says which slice of it this device owns. The caller must have made
-/// `pl.device` current with cudaSetDevice().
-corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl, GpuState **out);
+/// `pl` says which slice of it this device owns. `layout` sizes the device-side
+/// validity-mask buffer, which is one bit per frame of a slot per station -- the
+/// same region the ABI publishes, so the two cannot be sized differently. The
+/// caller must have made `pl.device` current with cudaSetDevice().
+corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl,
+                       const StagingLayout &layout, GpuState **out);
 
 /// Free everything. Safe on nullptr.
 corr_status gpu_destroy(GpuState *g);

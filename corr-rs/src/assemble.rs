@@ -35,6 +35,25 @@
 //! is detected the instant the next one arrives, with no timeout involved; the
 //! timeout in the configuration exists only for a station that stops sending
 //! altogether, which is a different failure.
+//!
+//! What finality does *not* mean is that the bytes are there. A final frame whose
+//! packets were lost is declared missing in this station's validity mask (one bit
+//! per frame of a slot, inside the staging region; see `corr_cuda.h`) and zeroed
+//! on the device. The receive thread used to write those zeros itself, which cost
+//! it the socket time it needed to catch up, and cost a whole slot period of
+//! waiting for the pipeline at every step of a long gap -- the loop that made one
+//! station's loss everyone's loss (docs/DESIGN-zero-fill-decoupling.md).
+//!
+//! Writing the mask is the stronger statement of the two, so it is also the
+//! cheaper one: it is a bit set per *complete* frame, and nothing at all for the
+//! missing ones. Two things follow, and both are load bearing:
+//!
+//! * `progress` may run ahead of the data, so a jump over a gap is now a handful
+//!   of host-side bookkeeping and one publish, not a slot-by-slot crawl.
+//! * the assembler never clears a mask bit: an all-zero mask is what a slot holds
+//!   when nothing arrived, and `corr_row_slot_free` restores that state as the
+//!   pipeline hands each slot back. The receive thread may only write a slot after
+//!   the ring grants it, so a bit it sets belongs to the sequence it is filling.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -317,7 +336,7 @@ impl SlotRing {
     /// that has gone silent: the front end is still sending, the packets are
     /// piling up in the socket, and the thread simply cannot read them until the
     /// pipeline catches up. Without this, one station stalling makes the
-    /// scheduler judge every other station dead as well and zero fill their data:
+    /// scheduler judge every other station dead as well and declare their data missing:
     /// measured, 28 spurious recoveries and 3606 good frames discarded during a
     /// single 1.5 s stall.
     ///
@@ -429,7 +448,10 @@ pub struct AssembleStats {
     pub lost_packets: u64,
     pub duplicates: u64,
     pub out_of_order: u64,
-    /// Frames that had to be zero filled because at least one packet was lost.
+    /// Frames that will be zeroed on the device because at least one packet was
+    /// lost. The count is the assembler's own tally of the frames it declared
+    /// missing in the validity mask, which is what the GPU acts on; it no longer
+    /// counts bytes this thread wrote.
     pub zero_filled_frames: u64,
     pub finalized_frames: u64,
     /// How many times this thread had to wait for the pipeline to release a
@@ -467,7 +489,7 @@ pub enum AssembleError {
     /// will never release. Not an error to report, just a reason to unwind.
     Aborted,
     /// The first packet this station produced is so far past the run's start frame
-    /// that the frames in between cannot be zero filled without lapping the
+    /// that the frames in between cannot be declared missing without lapping the
     /// staging ring. See [`AssembleError::is_fatal`].
     StartupGap { gap: u64, window: u64 },
     /// This station has fabricated more frames of silence than the configuration
@@ -581,7 +603,7 @@ pub struct StationAssembler {
     /// True once a packet has actually been written into the staging.
     ///
     /// The startup gap check only applies before that: once this station is
-    /// contributing data, a jump is ordinary packet loss and is zero filled as
+    /// contributing data, a jump is ordinary packet loss and is declared missing as
     /// before, because by then the pipeline is demonstrably consuming slots and a
     /// release is on its way.
     placed_any: bool,
@@ -599,11 +621,14 @@ pub struct StationAssembler {
     /// mask, which is what a unit test or a dry run passes.
     ///
     /// The mask is one bit per frame of a slot, **LSB first** (`byte f/8`, bit
-    /// `f%8`), set when that frame's samples in the staging are real. It exists so
-    /// that zeroing a missing frame can move to the GPU (see
-    /// docs/DESIGN-zero-fill-decoupling.md). Until that lands the assembler still
-    /// fills, and the mask is a characterisation of what it filled: the two must
-    /// agree, and a test asserts it.
+    /// `f%8`), set when that frame's samples in the staging are real. It is what
+    /// moves the zeroing of a missing frame to the GPU (see
+    /// docs/DESIGN-zero-fill-decoupling.md): the device reads it with the samples
+    /// and zeroes every frame whose bit is clear. This side therefore sets a bit
+    /// per frame that arrived whole and writes nothing else -- in particular it
+    /// never clears one, because clearing a mask the pipeline is still copying
+    /// would turn real frames into silence, which is the one failure mode of this
+    /// design that produces no error at all.
     validity_offset: usize,
     validity_bytes_per_slot: usize,
 
@@ -614,7 +639,7 @@ pub struct StationAssembler {
     /// Cap on the frames this station may fabricate as silence. 0 disables it.
     ///
     /// The scheduler has its own cap, on the frames it *asks* for; this one also
-    /// covers the frames a station zero fills because its own counter jumped.
+    /// covers the frames a station declares missing because its own counter jumped.
     /// Both exist for the same reason: a station that is not producing data must
     /// not be able to make the run grind out rows of silence for ever.
     zero_fill_limit: u64,
@@ -754,47 +779,41 @@ impl StationAssembler {
         Some(unsafe { self.base.add(off) })
     }
 
-    /// A slot the ring has recycled starts with nothing present; every frame that
-    /// arrives whole sets its own bit.
-    fn mask_clear_slot(&mut self, slot_seq: u64) {
-        if let Some(p) = self.mask_slot(slot_seq) {
-            // SAFETY: as above; the region is `validity_bytes_per_slot` long.
-            unsafe { std::ptr::write_bytes(p, 0, self.validity_bytes_per_slot) };
-        }
-    }
-
     /// Mark this frame's samples as real.
+    ///
+    /// Only ever sets bits. A frame that is missing keeps whatever the slot had,
+    /// which is nothing: the mask starts at zero when the staging is allocated and
+    /// `corr_row_slot_free` puts a slot back to zero as the pipeline hands it over,
+    /// so "no bit" is the default the assembler inherits rather than something it
+    /// has to write. That is the whole reason a gap no longer costs this thread a
+    /// slot-by-slot walk.
     fn mask_set_frame(&mut self, frame_id: u64) {
         if let Some(p) = self.mask_slot(frame_id / self.frames_per_slot) {
             let f = (frame_id % self.frames_per_slot) as usize;
             // SAFETY: `f/8 < validity_bytes_per_slot` because the mask has one bit
-            // per frame of a slot and `frames_per_slot` is what sized it.
+            // per frame of a slot and `frames_per_slot` is what sized it. The slot
+            // was granted by `ensure_writable` before any packet was written into
+            // it, so no copy of a previous sequence can still be reading this.
             unsafe { *p.add(f / 8) |= 1u8 << (f % 8) };
         }
     }
 
     /// Borrow the arrival bitmap for the slot holding `frame_id`, resetting it if
     /// the physical slot has been recycled since it was last used.
+    ///
+    /// The reset is this thread's own memory only. The staging's mask for that
+    /// slot is deliberately *not* touched here: this is called from paths that may
+    /// not own the slot (a jump finalizes frames of slots it never wrote into), and
+    /// clearing a mask the pipeline is still copying would turn real frames into
+    /// silence -- a wrong answer that reads as a clean run.
     fn arrival_for(&mut self, frame_id: u64) -> &mut FrameArrival {
         let slot_seq = frame_id / self.frames_per_slot;
         let slot = (slot_seq % self.ring.slots() as u64) as usize;
         if self.arrival_seq[slot] != slot_seq {
             self.arrival[slot].reset();
             self.arrival_seq[slot] = slot_seq;
-            // The staging for this slot is about to be written for this sequence,
-            // so the mask starts empty with it.
-            self.mask_clear_slot(slot_seq);
         }
         &mut self.arrival[slot]
-    }
-
-    /// Zero the whole frame, so a frame that lost a packet contributes silence
-    /// rather than whatever the previous use of this slot left behind.
-    fn zero_frame(&mut self, frame_id: u64) {
-        let (p, _) = self.frame_ptr(frame_id);
-        // SAFETY: p points at frame_stride bytes inside this station's region,
-        // which this thread owns.
-        unsafe { std::ptr::write_bytes(p, 0, self.frame_stride) };
     }
 
     /// Feed one packet. `payload` is the sample bytes, with the 8-byte counter
@@ -838,7 +857,7 @@ impl StationAssembler {
         // change again: the counter passed it, so the missing packets are gone.
         if frame_id > self.progress {
             // Before this station has contributed anything, the ring has not been
-            // handed over at all, so the zero fill below runs with the window
+            // handed over at all, so the declaration below runs with the window
             // still open and may move it. That is only safe while the whole range
             // fits inside the ring, i.e. while no physical slot is written twice:
             // a range of a lap or more would lap the staging, and the last write
@@ -923,35 +942,30 @@ impl StationAssembler {
         Ok(())
     }
 
-    /// Zero fill and finalize every frame in `[from, to)`, one staging slot at a
-    /// time, waiting for the ring before each step.
+    /// Declare every frame in `[from, to)` final, counting the ones that never
+    /// arrived whole.
     ///
-    /// Stepwise is a correctness requirement, not a detail. Writing the whole
-    /// range in one sweep goes wrong in two independent ways:
+    /// This used to zero fill them, one staging slot at a time, waiting for the
+    /// ring before each step. Both halves of that are gone:
     ///
-    /// * **The bytes are not ours yet.** A physical slot may only be overwritten
-    ///   once the pipeline has copied its previous use out -- `corr_row_slot_free`
-    ///   is `cudaEventSynchronize` on that slot's H2D copy. With a 3-slot ring
-    ///   whose copy takes about 2 ms while a slot is consumed every 2.6 ms, the
-    ///   pipeline is copying *some* slot most of the time, so an unguarded sweep
-    ///   has a real chance of landing on it -- and it lands on a whole slot's
-    ///   worth, because recycling the slot resets the arrival bitmap. The result
-    ///   is a row that reports every frame valid while 256 of them are zeros.
-    /// * **Waiting for one slot needs the range to advance.** The pipeline may
-    ///   only release the previous use of a slot once this station's *published*
-    ///   progress lets it submit that far, and this station cannot publish
-    ///   progress until the release happens. In one sweep the far end of the range
-    ///   waits for a release that only the far end can unlock: a deadlock. The
-    ///   loop below publishes after every slot, which is what lets the two threads
-    ///   take turns, and it is why `alive` is written to from inside the assembler
-    ///   rather than only by the receive loop.
+    /// * **The zeros are the device's job now.** A frame that did not arrive whole
+    ///   is simply a clear bit in the validity mask, which the GPU reads and acts
+    ///   on. Nothing here writes samples, so nothing here has to own the slot.
+    /// * **The waiting was the bug.** `wait_free` per step meant a 150 ms gap took
+    ///   150 ms to walk, during which this station read no packets and every other
+    ///   station's slots were held -- one station's loss, everyone's loss. With the
+    ///   walk reduced to host bookkeeping, `progress` crosses the whole gap before
+    ///   the next packet is even addressed.
     ///
-    /// The cost is honest and bounded: during a long jump this station stops
-    /// reading its socket for about as long as the pipeline needs to consume the
-    /// missing frames. Up to `SO_RCVBUF` (measured 0.5 s per station here) that
-    /// costs nothing, because the socket holds the live data; past it the station
-    /// starts losing live data too, which is what [`Self::set_zero_fill_limit`]
-    /// is there to stop.
+    /// The cost that remains is honest and bounded by the configuration: the walk
+    /// is one pass over the frames the counter skipped, and the frame count is what
+    /// [`Self::set_zero_fill_limit`] caps, so a station that stops sending cannot
+    /// make this loop unbounded.
+    ///
+    /// The arrival bitmap still has to be reset slot by slot (`arrival_for` does
+    /// that as it goes): for a slot this station never wrote, "no frames arrived" is
+    /// exactly what the reset says, and it is what the missing-frame count is made
+    /// of.
     fn finalize_range(&mut self, from: u64, to: u64) -> Result<(), AssembleError> {
         let mut frame = from;
         while frame < to {
@@ -960,27 +974,19 @@ impl StationAssembler {
                 .min(to)
                 .max(frame + 1);
 
-            // Publish before waiting: the pipeline's permission to release the
-            // slot this step is about to overwrite is derived from this station's
-            // progress, so a progress that is not published is a progress the
-            // pipeline cannot see.
-            self.publish();
-            self.ensure_writable(slot_seq)?;
-
             for f in frame..step_end {
                 let frame_in_slot = (f % self.frames_per_slot) as usize;
                 // A recycled physical slot has had its arrival bitmap reset by
                 // `arrival_for`, so every frame of a jumped-over slot reads as
-                // incomplete here -- which is exactly what it is.
+                // incomplete here -- which is exactly what it is. Its mask bit is
+                // clear for the same reason (nothing has set it this sequence), so
+                // the device will see silence, not the previous lap's samples.
                 let complete = self.arrival_for(f).is_complete(frame_in_slot);
                 if !complete {
-                    self.zero_frame(f);
                     self.stats.zero_filled_frames += 1;
                 }
                 self.stats.finalized_frames += 1;
             }
-            // Publish the step *before* the next step waits for its slot.
-            self.advance_to(step_end);
             frame = step_end;
 
             if self.zero_fill_limit > 0 && self.stats.zero_filled_frames > self.zero_fill_limit {
@@ -993,12 +999,13 @@ impl StationAssembler {
         Ok(())
     }
 
-    /// Finalize everything below `frame_id`, zero filling whatever is missing.
+    /// Finalize everything below `frame_id`, counting whatever is missing.
     ///
     /// Used when a station stops sending: the scheduler's watermark could
     /// otherwise never advance past frames this station will never produce. The
-    /// receive thread must be the one to do it, because it owns these bytes --
-    /// the pipeline writing them would race with the next packet.
+    /// receive thread is still the one to do it, because these frames are declared
+    /// missing in *its* station's mask and it owns that decision; it no longer has
+    /// to own the bytes, which is what makes the walk cheap.
     pub fn finalize_upto(&mut self, frame_id: u64) -> Result<(), AssembleError> {
         if frame_id <= self.progress {
             return Ok(());
@@ -1025,6 +1032,14 @@ mod tests {
     const FRAME_STRIDE: usize = 8192;
     const SLOT_STRIDE: usize = FRAME_STRIDE * FPS as usize;
     const STATION_BYTES: usize = SLOT_STRIDE * SLOTS;
+    const MASK_BYTES: usize = (FPS as usize).div_ceil(8);
+    const STATION_TOTAL: usize = STATION_BYTES + MASK_BYTES * SLOTS;
+
+    /// What the staging holds before anything is written into it. A frame the
+    /// assembler did not fill must still hold this, because filling missing frames
+    /// became the device's job: if this thread wrote a zero there, the test that
+    /// says "the mask alone decides" would pass for the wrong reason.
+    const UNTOUCHED: u8 = 0xA5;
 
     struct Fixture {
         buf: Vec<u8>,
@@ -1035,10 +1050,12 @@ mod tests {
 
     impl Fixture {
         fn new(first_frame_id: u64) -> Self {
-            let mut buf = vec![0u8; STATION_BYTES];
+            // Samples prefilled with a sentinel, mask zeroed: the state
+            // `corr_create` leaves behind, except that the samples are non-zero so
+            // that a missing frame cannot be mistaken for a written one.
+            let mut buf = vec![UNTOUCHED; STATION_TOTAL];
+            buf[STATION_BYTES..].fill(0);
             let ring = Arc::new(SlotRing::primed(SLOTS, first_frame_id / FPS));
-            // The fixture's buffer holds samples only, so the mask is disabled --
-            // the same path a dry run takes.
             let asm = StationAssembler::new(
                 P,
                 FPS,
@@ -1047,8 +1064,8 @@ mod tests {
                 ring.clone(),
                 buf.as_mut_ptr(),
                 first_frame_id,
-                0,
-                0,
+                STATION_BYTES,
+                MASK_BYTES,
             );
             Fixture {
                 buf,
@@ -1090,6 +1107,13 @@ mod tests {
             &self.buf[off..off + FRAME_STRIDE]
         }
 
+        /// The staging mask byte holding `frame_id`'s bit.
+        fn mask_byte(&self, frame_id: u64) -> u8 {
+            let slot = ((frame_id / FPS) % SLOTS as u64) as usize;
+            let f = (frame_id % FPS) as usize;
+            self.buf[STATION_BYTES + slot * MASK_BYTES + f / 8]
+        }
+
         fn expect_frame_content(&self, frame_id: u64) {
             let expect0 = Self::payload(frame_id * P);
             assert_eq!(
@@ -1105,28 +1129,69 @@ mod tests {
             );
         }
 
-        fn expect_frame_zero(&self, frame_id: u64) {
-            assert!(
-                self.frame(frame_id).iter().all(|b| *b == 0),
-                "frame {frame_id} should be zero filled"
+        /// The frame is declared missing: its bit is clear, which is what makes the
+        /// device zero the whole frame -- including any packets of it that did
+        /// arrive, exactly as the old zero fill discarded them. The bytes are *not*
+        /// this thread's business any more, so nothing is asserted about them here.
+        fn expect_frame_missing(&self, frame_id: u64) {
+            let f = (frame_id % FPS) as usize;
+            assert_eq!(
+                self.mask_byte(frame_id) & (1u8 << (f % 8)),
+                0,
+                "frame {frame_id} must be declared missing"
             );
         }
 
-        /// The pipeline releases a slot once the GPU has copied it out.
-        fn release_upto(&self, last_slot_seq: u64) {
+        /// Nothing at all was written into this frame, so it still holds what the
+        /// staging held before: for a frame that never had a packet, that is the
+        /// sentinel, and the assembler must not have zeroed it on the way past.
+        fn expect_frame_untouched(&self, frame_id: u64) {
+            assert!(
+                self.frame(frame_id).iter().all(|b| *b == UNTOUCHED),
+                "frame {frame_id} never arrived, so nothing may have been written there"
+            );
+        }
+
+        /// The frame is declared present.
+        fn expect_frame_valid(&self, frame_id: u64) {
+            let f = (frame_id % FPS) as usize;
+            assert_ne!(
+                self.mask_byte(frame_id) & (1u8 << (f % 8)),
+                0,
+                "frame {frame_id} arrived whole and must be declared valid"
+            );
+        }
+
+        /// The pipeline releases a slot once the GPU has copied it out -- and, as
+        /// `corr_row_slot_free` does in the library, hands its mask back empty. That
+        /// clear is the other half of this design: it is what stops a slot nobody
+        /// wrote this lap from inheriting the previous lap's bits, which would make
+        /// the device correlate stale samples as data.
+        /// One slot handed back the way `corr_row_slot_free` hands it back: the ring
+        /// is told the copy is done, and the slot's mask is cleared so the next lap
+        /// starts from "nothing present".
+        fn release(&mut self, slot_seq: u64) {
+            self.ring.release(slot_seq);
+            let slot = (slot_seq % SLOTS as u64) as usize;
+            let off = STATION_BYTES + slot * MASK_BYTES;
+            self.buf[off..off + MASK_BYTES].fill(0);
+        }
+
+        fn release_upto(&mut self, last_slot_seq: u64) {
             for sq in 0..=last_slot_seq {
-                self.ring.release(sq);
+                self.release(sq);
             }
         }
     }
 
     #[test]
-    fn the_mask_marks_exactly_the_frames_that_were_not_filled() {
-        // The mask and the fill are two descriptions of the same fact, and this is
-        // the test that keeps them equal while the fill still exists. It is what
-        // step 3 of docs/DESIGN-zero-fill-decoupling.md will lean on: the GPU is
-        // told which frames to zero, and that answer has to be the one the
-        // assembler used.
+    fn the_mask_marks_exactly_the_frames_that_did_not_arrive_whole() {
+        // The mask is the *only* statement of which frames are real: the device
+        // reads it, with the samples, and zeroes every frame whose bit is clear. So
+        // the bit has to mean "every packet of this frame landed", and the bytes of
+        // a frame it calls missing have to be left exactly as they were -- if this
+        // thread also wrote zeros there, this test would pass while the mask was
+        // saying nothing at all.
         const P: u64 = 2; // packets per frame
         const FPS: u64 = 4; // frames per slot
         const FRAME: usize = 2 * SAMPLES_PER_PACKET as usize;
@@ -1134,7 +1199,8 @@ mod tests {
         const MASK_BYTES: usize = (FPS as usize).div_ceil(8);
 
         let samples = SLOTS * FPS as usize * FRAME;
-        let mut buf = vec![0u8; samples + SLOTS * MASK_BYTES];
+        let mut buf = vec![UNTOUCHED; samples + SLOTS * MASK_BYTES];
+        buf[samples..].fill(0); // as corr_create leaves the mask
         let ring = Arc::new(SlotRing::primed(SLOTS, 0));
         let base = buf.as_mut_ptr();
         let mut a = StationAssembler::new(
@@ -1153,11 +1219,23 @@ mod tests {
         assert_eq!(
             mask & 0b0000_1111,
             0b0000_1011,
-            "bits 0, 1 and 3 are whole frames; bit 2 was filled and must stay clear"
+            "bits 0, 1 and 3 are whole frames; bit 2 did not complete and must stay clear"
         );
-        // And the frame the mask calls missing is the frame that is actually zero.
+        // And the frame the mask calls missing is left to the device: the packet of
+        // it that did arrive stays where it landed (the device discards it by
+        // zeroing the whole frame), and the part that never arrived is untouched --
+        // if this thread had zeroed either, the mask would be saying nothing.
         let f2 = &buf[2 * FRAME..3 * FRAME];
-        assert!(f2.iter().all(|&b| b == 0), "frame 2 must have been zero filled");
+        assert_eq!(
+            &f2[..SAMPLES_PER_PACKET as usize],
+            &payload[..],
+            "the packet of frame 2 that did arrive must not be touched either way"
+        );
+        assert!(
+            f2[SAMPLES_PER_PACKET as usize..].iter().all(|&b| b == UNTOUCHED),
+            "the rest of frame 2 must be left alone: the zeroing is the device's job now"
+        );
+        assert_eq!(a.stats().zero_filled_frames, 1);
         let f0 = &buf[0..FRAME];
         assert!(f0.iter().all(|&b| b == 7), "frame 0 must hold its samples");
     }
@@ -1168,7 +1246,6 @@ mod tests {
         // says the station is done with it, so an unpublished advance is a
         // deadlock. This asserts the property directly rather than trusting that
         // every call site remembers.
-        use std::sync::atomic::Ordering;
         use std::sync::Arc;
 
         let ring = Arc::new(SlotRing::primed(3, 0));
@@ -1216,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_packet_zero_fills_only_that_frame() {
+    fn a_lost_packet_declares_only_that_frame_missing() {
         let mut f = Fixture::new(0);
         f.send(0); // frame 0 packet 0
         f.send(1); // frame 0 packet 1  -> frame 0 complete
@@ -1226,15 +1303,16 @@ mod tests {
         f.send(5);
 
         f.expect_frame_content(0);
-        f.expect_frame_zero(1);
+        f.expect_frame_valid(0);
+        f.expect_frame_missing(1);
         f.expect_frame_content(2);
+        f.expect_frame_valid(2);
 
         let s = f.asm.stats();
         assert_eq!(s.lost_packets, 1);
         assert_eq!(s.zero_filled_frames, 1);
         assert_eq!(f.asm.progress(), 3, "frames 0,1,2 are final");
     }
-
     #[test]
     fn a_whole_lost_frame_is_detected_without_a_timeout() {
         let mut f = Fixture::new(0);
@@ -1245,22 +1323,25 @@ mod tests {
         f.send(5);
 
         f.expect_frame_content(0);
-        f.expect_frame_zero(1);
+        f.expect_frame_missing(1);
+        f.expect_frame_untouched(1);
         f.expect_frame_content(2);
         assert_eq!(f.asm.stats().zero_filled_frames, 1);
         assert_eq!(f.asm.progress(), 3);
     }
 
     #[test]
-    fn a_previous_use_of_the_slot_never_leaks_into_a_zero_filled_frame() {
-        // This is the failure mode that a fully-zero staging buffer hides: on the
-        // second time round the ring, a zero filled frame must beat data that is
-        // already there from the previous lap.
+    fn a_recycled_slot_does_not_inherit_the_previous_laps_bits() {
+        // The failure mode a fully-zero staging buffer hides: on the second time
+        // round the ring, a frame that is missing must end up with a clear bit even
+        // though the same bit was set by the previous use of that physical slot.
+        // (The clear itself is `corr_row_slot_free`'s, which `release_upto` mirrors;
+        // what is asserted here is that nothing sets it back.)
         let mut f = Fixture::new(0);
         f.send_full_ring();
         f.release_upto(SLOTS as u64);
 
-        // Frame 12 reuses slot 0, which still holds frame 0's bytes.
+        // Frame 12 reuses slot 0, which held frames 0..3 and their bits.
         f.send(12 * P); // packet 0 of frame 12
         f.send(12 * P + 1);
         f.send(13 * P + 1); // frame 13 packet 1 arrives; frame 13 packet 0 lost
@@ -1268,7 +1349,7 @@ mod tests {
         f.send(14 * P + 1);
 
         f.expect_frame_content(12);
-        f.expect_frame_zero(13);
+        f.expect_frame_missing(13);
         f.expect_frame_content(14);
         assert_eq!(f.asm.stats().zero_filled_frames, 1);
     }
@@ -1287,7 +1368,7 @@ mod tests {
         assert_eq!(f.asm.stats().packets, before.packets + 1);
         assert_eq!(f.asm.progress(), progress_before);
         assert_eq!(f.asm.stats().before_start_packets, 0, "not a startup packet");
-        f.expect_frame_zero(1);
+        f.expect_frame_missing(1);
     }
 
     #[test]
@@ -1348,19 +1429,21 @@ mod tests {
     }
 
     #[test]
-    fn finalize_upto_zero_fills_a_station_that_stopped() {
+    fn finalize_upto_declares_a_station_that_stopped_missing() {
         let mut f = Fixture::new(0);
         f.send(0);
         f.send(1); // frame 0 complete
         f.send(2); // frame 1 partial
         assert_eq!(f.asm.progress(), 1);
 
-        f.asm.finalize_upto(3).expect("a free ring must not refuse");
+        f.asm.finalize_upto(3).expect("nothing here needs the ring");
         assert_eq!(f.asm.progress(), 3);
         assert_eq!(f.asm.finalized_to(), Some(3));
         f.expect_frame_content(0);
-        f.expect_frame_zero(1);
-        f.expect_frame_zero(2);
+        f.expect_frame_valid(0);
+        f.expect_frame_missing(1);
+        f.expect_frame_missing(2);
+        f.expect_frame_untouched(2);
         assert_eq!(f.asm.stats().zero_filled_frames, 2);
 
         // Idempotent, and never walks backwards.
@@ -1466,10 +1549,12 @@ mod tests {
     }
 
     #[test]
-    fn a_startup_jump_wider_than_the_ring_is_refused_not_zero_filled() {
+    fn a_startup_jump_wider_than_the_ring_is_refused_not_declared() {
         // FPS*SLOTS = 12 frames of staging. A first packet exactly one lap past
-        // the start frame would be written over the slot the zero filled range
-        // still occupies, so it must be refused rather than silently mis-addressed.
+        // the start frame would be written over the slot the declared range
+        // still occupies -- the mask for a physical slot cannot describe two
+        // sequences at once -- so it must be refused rather than silently
+        // mis-addressed.
         let mut f = Fixture::new(1000);
         let counter = (1000 + FPS * SLOTS as u64) * P;
         let err = f
@@ -1486,19 +1571,20 @@ mod tests {
         assert!(err.is_fatal(), "the run cannot continue, and must say so");
         assert!(!AssembleError::ShortPacket { len: 1 }.is_fatal());
 
-        // One frame less still fits: the gap is zero filled and the packet lands.
+        // One frame less still fits: the gap is declared missing and the packet
+        // lands.
         let mut f = Fixture::new(1000);
         let last = 1000 + FPS * SLOTS as u64 - 1;
         f.send(last * P);
         f.send(last * P + 1);
         for frame in 1000..last {
-            f.expect_frame_zero(frame);
+            f.expect_frame_missing(frame);
         }
         f.expect_frame_content(last);
         assert_eq!(f.asm.progress(), last + 1);
 
         // The check is a startup check only: once a packet has been placed, a jump
-        // is ordinary loss and must be zero filled as before.
+        // is ordinary loss and is declared missing as before.
         let mut f = Fixture::new(1000);
         f.send(1000 * P);
         let counter = (1000 + 4 * (FPS * SLOTS as u64)) * P;
@@ -1506,44 +1592,81 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_zero_fills_only_after_the_ring_releases_the_slot_it_reuses() {
-        // The pipeline owns a slot until its H2D copy is done: corr_row_slot_free
-        // is cudaEventSynchronize on that copy, and the receive side may only
-        // write a physical slot again after the pipeline has released its previous
-        // use. A zero fill that ignores that can land on the slot being copied
-        // right now -- with a 3-slot ring, a ~2 ms copy per slot and a slot
-        // consumed every ~2.6 ms, that is not a narrow window -- and recycling a
-        // slot resets its arrival bitmap, so it would zero a whole slot's worth of
-        // frames that the row being written reports as valid.
+    fn a_jump_is_declared_without_waiting_for_the_ring_or_touching_staging() {
+        // This is the fix, stated as a test. The old path zero filled the gap one
+        // slot at a time and waited for the ring before each step, so a 150 ms gap
+        // cost this station 150 ms of not reading its socket and held every other
+        // station's slots meanwhile. Now the walk is host bookkeeping: it must not
+        // wait for a single slot, must not write a single byte of staging, and must
+        // leave `progress` past the whole gap.
+        let mut f = Fixture::new(0);
+        f.send_full_ring(); // sequences 0, 1, 2 written
+        f.release_upto(SLOTS as u64 - 1); // the pipeline consumed that lap
+        f.ring.close_window(); // now it has taken over: the window is frozen
+        let spins_before = f.asm.stats().slot_wait_spins;
+
+        // Frames 12..1000 span 247 slots, not one of which is writable -- and not
+        // one of which this station has any business writing.
+        f.asm.finalize_upto(1000).expect("a jump must not need the ring");
+
+        assert_eq!(f.asm.progress(), 1000, "progress must cross the gap in one step");
+        assert_eq!(
+            f.asm.stats().slot_wait_spins, spins_before,
+            "declaring the gap missing must not wait for the ring"
+        );
+        assert_eq!(f.asm.stats().zero_filled_frames, 1000 - FPS * SLOTS as u64);
+        // The slots of that lap were handed back empty and nothing has set a bit in
+        // them since, so the device will treat every frame of the gap as silence ...
+        for frame in 12..(12 + FPS * SLOTS as u64) {
+            f.expect_frame_missing(frame);
+        }
+        // ... and nothing was written into the staging either: frames 12.. are the
+        // same bytes frames 0.. left there, lap for lap.
+        for frame in 12..(12 + FPS * SLOTS as u64) {
+            f.expect_frame_content(frame - FPS * SLOTS as u64);
+        }
+    }
+
+    #[test]
+    fn the_packet_that_ends_a_gap_still_waits_for_its_own_slot() {
+        // The walk over the gap needs no slot, but the write that ends it does: the
+        // pipeline owns a physical slot until its H2D copy is done, and
+        // corr_row_slot_free is cudaEventSynchronize on that copy. Dropping the wait
+        // from the walk must not have dropped it from the write -- that would put a
+        // live packet into a slot being copied right now, and the row would report
+        // every frame valid while some of them are the previous lap's.
         let mut f = Fixture::new(0);
         f.send_full_ring(); // sequences 0, 1, 2 written; nothing released
         f.ring.close_window(); // the pipeline has taken over: the window is frozen
-        f.ring.release(1); // the packet's own slot becomes writable ...
+        // The pipeline has finished copying sequences 0 and 2 -- so the gap's first
+        // slots are back in the receive side's hands, with empty masks, which is
+        // what makes frames 12..15 correctly missing -- but not sequence 1, which is
+        // the physical slot the incoming packet (sequence 4) needs.
+        f.release(0);
+        f.release(2);
 
-        assert!(f.ring.is_free(4), "the packet's own slot is writable");
-        assert!(
-            !f.ring.is_free(3),
-            "... but the slot the zero fill has to reuse is not"
-        );
+        assert!(!f.ring.is_free(4), "the packet's own slot is still the GPU's");
+        assert!(f.ring.is_free(3), "the gap's first slot is writable");
 
         let ring = f.ring.clone();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            ring.release(0);
+            ring.release(1);
         });
-        // Frames 12..15 are the jump; frame 16 is the packet that revealed it.
+        // Frames 12..15 are the gap; frame 16 is the packet that revealed it.
         f.send(16 * P);
         f.send(16 * P + 1);
         releaser.join().expect("the releaser must finish");
 
         for frame in 12..16 {
-            f.expect_frame_zero(frame);
+            f.expect_frame_missing(frame);
         }
         f.expect_frame_content(16);
+        f.expect_frame_valid(16);
         assert_eq!(f.asm.progress(), 17);
         assert!(
             f.asm.stats().slot_wait_spins > 0,
-            "the zero fill must have waited for the ring, not written straight over it"
+            "the write must have waited for the ring, not gone straight over it"
         );
     }
 

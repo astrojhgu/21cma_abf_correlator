@@ -202,7 +202,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
 
     while !a.stop.is_stopped() {
         // Service the scheduler's stall recovery first: if this station has gone
-        // quiet, its frames must be zero filled before the watermark can move
+        // quiet, its frames must be declared missing before the watermark can move
         // past them. It can fail -- the ring may be unwinding, or the station may
         // have fabricated more silence than the cap allows -- and both mean the
         // run is over, so this is reported like any other fatal assemble error.

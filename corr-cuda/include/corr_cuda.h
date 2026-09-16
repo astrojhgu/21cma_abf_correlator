@@ -47,6 +47,12 @@
  * independent of the integration length: a 1 second integration and a 10 ms
  * integration need the same staging.
  *
+ * What a slot does *not* have to be is complete. Each slot carries a validity
+ * mask (see corr_staging) saying which of its frames arrived whole, and the
+ * missing ones are zeroed on the device. Zeroing there rather than on the receive
+ * thread is what keeps a station that fell behind from having to write gigabytes
+ * of silence through the same thread that needs to be reading its socket.
+ *
  * Overlap
  * -------
  * The library owns two streams. Host-to-device copies run on a copy stream and
@@ -74,8 +80,18 @@
 extern "C" {
 #endif
 
-/* Bump on any layout or semantic change of the structures below. */
-#define CORR_ABI_VERSION 6u
+/*
+ * Bump on any layout or semantic change of the structures below.
+ *
+ * v7: the validity mask became load bearing. From this version the GPU reads it
+ *     and zeroes every frame whose bit is clear, and corr_row_slot_free() clears
+ *     it as it hands the slot back. A v6 library linked against a v7 host would
+ *     ignore the mask while the host had stopped zero filling, i.e. it would
+ *     correlate whatever the previous lap left in the staging and report it as
+ *     data -- silently. That is the one failure this version number exists to
+ *     refuse. See docs/DESIGN-zero-fill-decoupling.md.
+ */
+#define CORR_ABI_VERSION 7u
 
 /*
  * How the pair space is divided over the devices.
@@ -239,9 +255,9 @@ typedef struct corr_device_stats {
  *   base + slot*slot_stride + (f % frames_per_slot)*frame_stride
  *
  * A frame is exactly 2*n_freq int8 samples, two's complement, assembled by
- * concatenating consecutive UDP packet payloads in packet-counter order. A frame
- * whose packets did not all arrive must be zero filled by the host: the GPU is
- * deliberately unaware of missing frames.
+ * concatenating consecutive UDP packet payloads in packet-counter order. Frames
+ * whose packets did not all arrive are left as they are by the host -- missing
+ * ones are declared in the validity mask below and zeroed on the device.
  */
 typedef struct corr_staging {
     int8_t *base;          /* start of THIS station's region                 */
@@ -254,15 +270,24 @@ typedef struct corr_staging {
      * bytes per slot starting `validity_offset` bytes into this station's region.
      * Bit `f` of slot `s` is set when frame `f` of that slot is present.
      *
+     * This is the only statement of which frames are real: corr_row_accumulate()
+     * uploads it with the samples, and a frame whose bit is clear is zeroed on
+     * the device before the FFT, exactly as if the host had filled it with zeros.
+     * A frame that is present must still be filled in full -- a bit set over
+     * half-written samples is the one wrong answer this scheme can produce, so
+     * the writer sets the bit only once every packet of that frame has landed.
+     *
      * The region starts at all-zero, i.e. "nothing present". That default is
      * deliberate: a consumer that reads a slot before the frame assembler has
      * written its mask sees an entirely missing slot, which fails loudly in a
      * phase test, instead of a slot that is silently claimed valid.
      *
-     * Nothing reads it yet: the assembler still writes zeros into the staging and
-     * the GPU is still unaware of missing frames. See
-     * docs/DESIGN-zero-fill-decoupling.md for the change that gives this region
-     * its purpose, and for why it has to land in one piece.
+     * Bits are set by the receive thread that owns the station; the slot's whole
+     * mask is cleared by corr_row_slot_free(), which is the moment the slot stops
+     * being the GPU's and starts being the next writer's. Clearing it there is
+     * what covers a station that sends nothing at all for a whole slot: without
+     * it the next lap would inherit the previous lap's bits and correlate stale
+     * samples as data.
      */
     size_t  validity_offset;
     size_t  validity_bytes_per_slot;
@@ -321,6 +346,10 @@ corr_status corr_staging_info(void *ctx, int32_t station, corr_staging *out);
  * The caller must not modify that slot's staging again until
  * corr_row_slot_free(slot) has returned.
  *
+ * The slot's validity mask is uploaded with the samples and decides which frames
+ * are zeroed on the device (see corr_staging). Frames the caller did not fill
+ * must have their bit clear; the bits of frames past `frames` are not read.
+ *
  * Returns CORR_ERR_ARG for a slot outside [0, block_slots) or a frame count
  * outside [1, frames_per_slot].
  */
@@ -332,6 +361,12 @@ corr_status corr_row_accumulate(void *ctx, int64_t slot_seq, int32_t frames);
  * deliberately much earlier than corr_row_wait(): the copy finishes in
  * milliseconds while the row may run for a second, and holding the receive ring
  * that long would stall reception.
+ *
+ * Returning also hands the slot's validity mask back: every bit of it is cleared,
+ * because the next writer of that physical slot starts from "nothing present" and
+ * sets a bit per frame it actually completes. The clear happens after the copy is
+ * known to be done and before the caller may release the slot to the receive
+ * side, so a writer that inherits the slot can never see last lap's bits.
  */
 corr_status corr_row_slot_free(void *ctx, int64_t slot_seq);
 

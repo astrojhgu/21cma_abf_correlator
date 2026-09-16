@@ -76,10 +76,10 @@ impl<'a> Pipeline<'a> {
                     break;
                 }
             }
-            // A station that has been asked to zero fill past the configured cap is
-            // not coming back. Stop rather than keep writing rows of silence that
-            // look like observations, and rather than let the receive buffers grow to
-            // hold data nobody will use.
+            // A station that has declared more missing frames than the configured
+            // cap allows is not coming back. Stop rather than keep writing rows of
+            // silence that look like observations, and rather than let the receive
+            // buffers grow to hold data nobody will use.
             // The *second* line of defence. A station's own receive thread caps
             // its fabricated frames first (AssembleError::ZeroFillCapExceeded, which
             // arrives here as a fatal reason), so this fires only when that thread is

@@ -13,8 +13,9 @@
 //! * R2C with the Nyquist bin dropped, no `fftshift`, no FFT normalisation;
 //! * `n_cum` counts FFT frames, not packets, and the block sum is divided by
 //!   `n_cum` regardless of how many frames actually arrived;
-//! * a frame whose packets did not all arrive is zero filled, and the count of
-//!   valid frames is recorded so the amplitude bias is explainable downstream.
+//! * a frame whose packets did not all arrive contributes silence: it is declared
+//!   missing in the staging validity mask and zeroed on the device, and the count
+//!   of valid frames is recorded so the amplitude bias is explainable downstream.
 //!
 //! Module map, and what each one owns:
 //!

@@ -669,7 +669,8 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
     for (int d = 0; d < ctx->n_devices(); ++d) {
         if ((st = select_device(ctx, d)) != CORR_OK) break;
         corr::GpuState *g = nullptr;
-        if ((st = corr::gpu_create(*cfg, ctx->plans[static_cast<size_t>(d)], &g)) != CORR_OK)
+        if ((st = corr::gpu_create(*cfg, ctx->plans[static_cast<size_t>(d)],
+                                   ctx->layout, &g)) != CORR_OK)
             break;
         ctx->gpus.push_back(g);
     }
@@ -832,7 +833,23 @@ extern "C" corr_status corr_row_slot_free(void *h, int64_t slot_seq) {
         if (st != CORR_OK) return st;
     }
 
-    // Only now may the receive thread write this slot again.
+    // Only now may the receive thread write this slot again -- and it has to find
+    // an empty validity mask when it gets there. The clear is here rather than in
+    // the receive thread for two reasons: the copies that read this mask are known
+    // to be finished (the events above), and the receiver cannot be writing this
+    // slot yet (it is still marked busy, and the caller only releases the ring
+    // after this returns). It also covers what the receive thread cannot: a station
+    // that sends nothing at all for a whole slot runs no code that would clear it,
+    // so the next lap would inherit this lap's bits and have the GPU correlate
+    // stale samples as if they were data.
+    for (int station = 0; station < ctx->cfg.n_station; ++station) {
+        int8_t *mask = ctx->layout.base +
+                       static_cast<size_t>(station) * ctx->layout.station_stride +
+                       ctx->layout.validity_offset +
+                       static_cast<size_t>(slot) * ctx->layout.validity_bytes_per_slot;
+        std::memset(mask, 0, ctx->layout.validity_bytes_per_slot);
+    }
+
     std::lock_guard<std::mutex> lock(ctx->mu);
     ctx->slots[static_cast<size_t>(slot)] = SlotState::kFree;
     return CORR_OK;
