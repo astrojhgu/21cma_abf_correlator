@@ -98,7 +98,7 @@
 | 步 | 内容 | 验证命令与判据 | 状态 |
 |---|---|---|---|
 | **0** | 记录基线（今天就能做）| 用第 4 节的 stall 场景跑一次，保存 `blocks.csv`、`rows_trend.py` 的三段趋势、以及报告里"等 staging 槽"的时间。**这就是修复要改善的对照** | 见 §8.1：A/B/A/B 交错，用 `/scratch/corr-baseline` 的旧二进制做对照腿 |
-| 1 | ABI 加 `validity_offset` / `validity_bytes_per_slot` / `validity_total_bytes`；staging 分配加上掩码区并清零（全"缺失"：宁可让读早了的人拿到全零，也不要让他拿到假的有效）；Rust 侧镜像 + 编译期断言 | `corr --check` 通过、`abi_smoke` 通过、`--print-plan` 里 staging 大小含掩码区 | ✅ `ce15866`（ABI 6）|
+| 1 | ABI 加 `validity_offset` / `validity_bytes_per_slot` / `validity_total_bytes`；staging 分配加上掩码区并清零（全"缺失"：宁可让读早了的人拿到全零，也不要让他拿到假的有效）；Rust 侧镜像 + 编译期断言 | `corr --check` 通过、`abi_smoke` 通过、`--print-plan` 里 staging 大小含掩码区 | ✅ `ce15866`（当时的 ABI 6；第 3 步把它提到 **7**，因为掩码从此有语义）|
 | 2 | 组帧器**在继续补零的同时**写掩码；加一个测试断言"掩码标记的缺失帧 == 实际被补零的帧" | `cargo test`；行为未变（golden 测试逐字节一致）| ✅ `ce15866` |
 | 3 | kernel 读掩码把无效帧清零；组帧器**停止**补零 | 第 4 节判据 1（`blocks.csv` 逐行一致）+ 判据 3（相位 276/276）| ✅ `b76339e`，实测见 §8.2、§8.5 |
 | 4 | 去掉第 7 项的开关（或反过来，用它做回退）| 判据 2、4（正反馈消失、压力对照）| ✅ `b76339e`：开关没有实现，回退用旧二进制（§8.1）；判据 2 的实测结论见 §8.3，判据 4 见 §8.4 |
@@ -135,6 +135,11 @@ grep -E "receive threads|per second" /tmp/feedback-before-run.log
 `corr`，它链的是 ABI 6 的旧 `libcorr_cuda.so`，也就是"宿主补零 + GPU 不知道缺失帧"的
 行为。四条腿按 **旧 / 新 / 旧 / 新** 交错跑同一份注入场景，所以这台机器十分钟量级的负载
 漂移不会伪装成改动效果。每条腿记 `load before/after`（`/proc/loadavg`）。
+
+**判据一律读逐行数字**（`tools/compare_blocks.py`、`tools/rows_trend.py` 读的都是
+`blocks.csv`），不用运行报告里那份每站汇总量 —— 汇总会把"一行里丢了一半"抹成 0.07%，
+而逐行看是 38 行里 6 行全零。**load 是这些数字的自变量**：同一份 nf4096 配置在两个窗口里
+跑出 0.0105%（load 均值 21.4）与 0.0325%（23.0），差 3 倍；所以对比只能在同一窗口内交错。
 
 确定性来自四处，缺一处两条腿就不能逐行比：
 

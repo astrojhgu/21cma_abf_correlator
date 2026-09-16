@@ -32,8 +32,11 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
 
 ## 1. 当前状态（交接点）
 
-* 最后提交 `b76339e`：**补零解耦的第 3、4 步已落地**（ABI 7：掩码随样本上设备、kernel 按
-  掩码整帧清零、组帧器不再补零也不再为补零等环）。`cargo test` **81 + 7 通过**、
+* 两个会话在同一条链上：重构链 `10de600 → ce15866`（A）→ 补零解耦 `bd33583 → b76339e`（B，
+  ABI 6 → 7）→ 判读工具与文档 `477d45b`、`bf29bae`、`36e87d3`、`edfa08e`、`2b3fc7e`（B）
+  → `684e827`（A：`tools/phase_test.sh`）。当前 HEAD `684e827`。
+* **补零解耦的第 3、4 步已落地（`b76339e`，ABI 7）**：掩码随样本上设备、kernel 按
+  掩码整帧清零、组帧器不再补零也不再为补零等环。下面这条与 §2 的实测都以它为准。`cargo test` **81 + 7 通过**、
   `clippy` **0 条代码告警**、C 侧 `ctest` **6/6**（abi_smoke / multi_device / 两个 numpy golden）。
   验收实测见 `docs/DESIGN-zero-fill-decoupling.md` §8：判据 1、3 通过（含逐字节对照），
   **判据 2 的后半与判据 4 的预期没有兑现**，原因在 §8.3/§8.4，下一步在 §8.6。
@@ -59,7 +62,13 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
 
 ## 2. 下一步：别再把整槽的零搬上设备
 
-补零解耦已经做完，但实测表明**真正吃掉管线的是"空槽照样要 H2D / FFT / 相关"**（§8.3、
+**补零解耦的第 3、4 步已经做完（`b76339e`，ABI 6 → 7）**：掩码随样本一起上设备（每个 chunk
+一次小 strided 拷贝）、`zero_invalid_frames_kernel` 在 int8→float 之前按掩码把无效帧整帧写零、
+`corr_row_slot_free` 在交还槽时清空该槽掩码、组帧器停止补零且不再为补零等环（`finalize_range`
+里已无 `wait_free`、无 memset，缺口一次 `advance_to` 越过）。四条判据的实测（逐行数字、
+协议与 load 区间）在 `docs/DESIGN-zero-fill-decoupling.md` §8。**`--check` 现在报 abi=7。**
+
+但它实测表明**真正吃掉管线的是"空槽照样要 H2D / FFT / 相关"**（§8.3、
 §8.6）。现在掩码已经在设备侧、主机提交时也能读，于是"这一槽 24 个站一帧有效都没有"是
 可判定的：跳过它的 H2D 和三个 kernel，结果不变（行最后统一除以 `n_cum`）。饱和工况下
 每个站缺 ~310 个槽的帧、整轮只提交 693 个槽 —— 上限接近一半的设备工作是在算零。
@@ -72,6 +81,10 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
 3. `writer` 移出 pipeline 线程（短积分/高频吐数时才需要）。
 
 **别做的事**：不要再往组帧器里加回补零。掩码是唯一判据，写零只会重新引入 §1 那条正反馈。
+**判据的来源**：一律用逐行数字（`tools/rows_trend.py`、`tools/longrun_report.py`、
+`tools/compare_blocks.py` 读的都是 `blocks.csv`），不要用运行报告里的每站汇总量 ——
+一次 40 s 跑汇总 0.07%，而 38 行里只有 6 行是全零。load 是这些数字的自变量，同配置在
+load 16–21 与 24–27 之间差一个量级，比较必须在同一窗口内交错（A/B/A/B）。
 ## 3. 已知的坑（照单别再踩）
 
 * **判据用逐行数字**（`tools/rows_trend.py` / `tools/longrun_report.py`），不要用运行报告里的

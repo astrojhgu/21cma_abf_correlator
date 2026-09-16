@@ -36,7 +36,7 @@ RFSoC 前端 24 路组播 UDP（4104 B = 8 B 小端计数器 + 4096 int8）
 |---|---|---|
 | `corr-rs/src/config.rs` | 配置解析、校验、派生 `RunPlan`、**绑核策略解析** | 加/改配置项；改绑核规则 |
 | `corr-rs/src/net.rs` | socket 建/配、recvmmsg、绑核 syscall | 收包系统调用层、socket 选项 |
-| `corr-rs/src/assemble.rs` | `SlotRing` + `StationAssembler` + 到达位图；补零；进度发布 | 拼帧、环的所有权、补零逻辑 |
+| `corr-rs/src/assemble.rs` | `SlotRing` + `StationAssembler` + 到达位图 + 有效性掩码；进度发布 | 拼帧、环的所有权、缺失帧的**声明**（零由设备补，ABI 7）|
 | `corr-rs/src/sched.rs` | 水位线、提交/关闭行的状态机、停滞恢复、`StationProgress` | 调度策略、停滞判定 |
 | `corr-rs/src/run.rs` | 启动顺序、收包线程、调度循环 + GPU 提交、取数写盘 | 主流程；**这里的函数最长，动它要最小心** |
 | `corr-rs/src/report.rs` | `RunReport` 等类型 + 渲染（纯数据/格式化） | 加一条报告字段 |
@@ -59,6 +59,11 @@ RFSoC 前端 24 路组播 UDP（4104 B = 8 B 小端计数器 + 4096 int8）
    组帧器只能领先 pipeline "可写槽数"这么远，所以积压一旦超过领先量就**只能涨不能消**，
    此后每次被抢占都直接丢包。实测：640 ms 缓冲配 63 ms 领先 → 30 min 丢 1.96%；
    80 ms 配 105 ms → 0.35%（同负载）。
+   **2026-09-16 复测（补零解耦之后）：这条的数量级变了。** 收包线程不再为补零长时间离岗，
+   大缓冲因此不再是毒药：nch=4096 生产档（请求 256 MiB、实得 512 MiB ≈ 640 ms，配 39 ms
+   领先）三次 300 s 实测丢包 0.0092% / 0.0178% / 0.0317%（load 均值 21.4 / 22.7 / 23.0）；
+   而 nch=16384 档照抄别的档案的 32 MiB（84 ms）时丢 0.42%，改成 256 MiB 后 0.077%。
+   所以这一项**要按档案实测，不能跨档案抄** —— 见 `config/README.md` 第 3 条。
 
 3. **收包线程不要网卡 IRQ 所在的核，也不要网卡自己的 NUMA 节点**（`cpu.avoid_nic_interfaces`）。
    RX 环只有 1024 描述符（≈0.22 ms 余量），NAPI 一晚就硬件丢包（`rx_discards_phy`）。
@@ -112,6 +117,9 @@ tools/phase_triangle.py /scratch/xxx/<run>/ --mosaic phase   # 相位正确性�
 | 40 路 | 三道硬墙：源只有 24 路；入口 200G < 259 Gbit/s；40 收包线程 > 32 核（需 epoll 多 socket） |
 | 负载相关的残余丢包 | 网卡 RX 环 1024/8192、IRQ 掩码 0-31、`netdev_max_backlog=5000`、无 `CAP_NET_ADMIN` ⇒ 都要管理员 |
 | ~~`run.rs::run_receive` 仍偏长~~ | 已完成：`receiver.rs` + `pipeline.rs` + `report.rs` 拆出，`run.rs` 1303 → 639 行 |
-| 补零与读包争同一线程 | 正反馈：落后 → 补零 → 更落后。设计 + **第 1、2 步已落地**（ABI 6 掩码区、组帧器维护掩码 + 等价性测试）；**第 3、4 步（行为切换）未做** —— 见 `docs/DESIGN-zero-fill-decoupling.md` §7。原状：**设计已写好**：`docs/DESIGN-zero-fill-decoupling.md`（触点、判据、风险齐全，未实现）|
+| ~~补零与读包争同一线程~~ | **已做完（ABI 6 → 7，`b76339e`）**：掩码随样本上设备、kernel 按掩码整帧清零、`corr_row_slot_free` 交还槽时清空掩码、组帧器停止补零也不再为补零等环。四条判据的实测见 `docs/DESIGN-zero-fill-decoupling.md` §8：判据 1、3 通过（逐字节 / 276-276），**判据 2 的后半（等环时间下降）与判据 4 的"更低"没有兑现** —— 那笔等待属于管线不属于补零 |
+| **整槽缺失就不必上设备** | 下一步，收益最大：提交时主机已能读掩码，"24 个站一帧有效都没有"的槽无需 H2D/FFT/相关（贡献恒为零，行最后统一除以 `n_cum`）。饱和工况 ~310/693 个提交槽属于此类。设计 §8.6 |
+| 流先停、`--duration` 后到会挂住 | 新旧二进制都一样（既有问题，不是补零解耦引入的）：让回放活得比关联机久就绕开了；要么把这条路径修掉 |
+| C 侧测试没人跑 | `abi_smoke` 自 ABI 6（掩码区进 staging）起一直失败到 ABI 7 才被发现——它还在按"每站 = 纯样本"算 stride。已修并加了掩码生命周期检查；**改 ABI 就顺手跑 `ctest`** |
 | writer 仍在 pipeline 线程里 | 短积分/高频吐数时需要独立 writer 线程 |
-| 仓库没有版本控制 | 建议 `git init` + 以当前状态为基线提交 |
+| ~~仓库没有版本控制~~ | 已完成：一直在用 git（重构链 `10de600 → ce15866`、补零解耦 `bd33583 → b76339e`）；`/scratch/corr-baseline` 是改动前的 worktree，A/B 对照腿用它 |
