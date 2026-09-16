@@ -328,6 +328,17 @@ pub fn run_receive(
         }
     };
 
+    // The validity-mask layout comes from the C side, which owns the allocation;
+    // `--check` already verified it against this side's arithmetic. A dry run has
+    // no device and nothing to zero, so the mask stays disabled there.
+    let (validity_offset, validity_bytes_per_slot) = match gpu.as_ref() {
+        Some(corr) => {
+            let s = corr.staging(0).context("reading the staging layout")?;
+            (s.validity_offset, s.validity_bytes_per_slot)
+        }
+        None => (0, 0),
+    };
+
     let mut handles = Vec::with_capacity(n_station);
     // Where a receive thread records an error the whole run has to answer.
     for (idx, sock) in sockets.into_iter().enumerate() {
@@ -343,6 +354,8 @@ pub fn run_receive(
             packets_per_frame: plan.packets_per_frame,
             frames_per_slot,
             frame_stride: fft_len as usize,
+            validity_offset,
+            validity_bytes_per_slot,
             start_frame,
         };
         handles.push(std::thread::spawn(move || recv_thread(args)));

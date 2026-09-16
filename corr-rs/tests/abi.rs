@@ -83,7 +83,10 @@ fn a_context_can_be_created_from_the_shipped_config() {
 
     let frame_stride = 2 * plan.n_freq as usize;
     let slot_stride = frame_stride * plan.frames_per_slot as usize;
-    let station_bytes = slot_stride * plan.block_slots as usize;
+    // The ABI appends a validity mask to each station's samples: one bit per frame
+    // of a slot, rounded up to whole bytes (see `corr_staging` in corr_cuda.h).
+    let mask_bytes_per_slot = (plan.frames_per_slot as usize).div_ceil(8);
+    let station_bytes = (slot_stride + mask_bytes_per_slot) * plan.block_slots as usize;
 
     for st in &staging {
         assert_eq!(st.frame_stride, frame_stride);
@@ -91,6 +94,8 @@ fn a_context_can_be_created_from_the_shipped_config() {
         // base is already advanced to this station, so total_bytes is the extent
         // of that station's region, not the size of the whole allocation.
         assert_eq!(st.total_bytes, station_bytes);
+        assert_eq!(st.validity_offset, slot_stride * plan.block_slots as usize);
+        assert_eq!(st.validity_bytes_per_slot, mask_bytes_per_slot);
         assert!(!st.base.is_null());
     }
     // Stations are contiguous, so the scheduler can index them arithmetically.

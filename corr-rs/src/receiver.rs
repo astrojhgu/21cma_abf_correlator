@@ -153,6 +153,9 @@ pub(crate) struct RecvThreadArgs {
     pub(crate) packets_per_frame: u64,
     pub(crate) frames_per_slot: u64,
     pub(crate) frame_stride: usize,
+    /// Validity-mask layout from the ABI; zero disables the mask.
+    pub(crate) validity_offset: usize,
+    pub(crate) validity_bytes_per_slot: usize,
     pub(crate) start_frame: u64,
 }
 
@@ -173,6 +176,8 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
         a.ring,
         a.base.0,
         a.start_frame,
+        a.validity_offset,
+        a.validity_bytes_per_slot,
     );
     // Waiting for a staging slot is being alive, not being silent: the front end
     // is still sending and the packets are queueing in the socket.

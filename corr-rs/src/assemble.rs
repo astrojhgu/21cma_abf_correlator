@@ -593,6 +593,20 @@ pub struct StationAssembler {
     /// the receive thread; `None` in tests that do not care.
     alive: Option<Arc<StationProgress>>,
 
+    /// Where this station's validity mask lives inside its staging region, and
+    /// how many bytes it takes per slot. Both come from the C side's layout,
+    /// which `--check` validates against this side's arithmetic; `0` disables the
+    /// mask, which is what a unit test or a dry run passes.
+    ///
+    /// The mask is one bit per frame of a slot, **LSB first** (`byte f/8`, bit
+    /// `f%8`), set when that frame's samples in the staging are real. It exists so
+    /// that zeroing a missing frame can move to the GPU (see
+    /// docs/DESIGN-zero-fill-decoupling.md). Until that lands the assembler still
+    /// fills, and the mask is a characterisation of what it filled: the two must
+    /// agree, and a test asserts it.
+    validity_offset: usize,
+    validity_bytes_per_slot: usize,
+
     /// Set once `finalize_upto` has been called with a frame id, so a stream that
     /// stops is still closed out.
     finalized_to: Option<u64>,
@@ -612,6 +626,7 @@ unsafe impl Send for StationAssembler {}
 
 impl StationAssembler {
     /// `base` must be the station's staging base from `corr_staging_info`.
+    #[allow(clippy::too_many_arguments)] // staging layout + ring + mask layout
     pub fn new(
         packets_per_frame: u64,
         frames_per_slot: u64,
@@ -620,6 +635,8 @@ impl StationAssembler {
         ring: Arc<SlotRing>,
         base: *mut u8,
         first_frame_id: u64,
+        validity_offset: usize,
+        validity_bytes_per_slot: usize,
     ) -> Self {
         let slots = ring.slots();
         StationAssembler {
@@ -629,6 +646,8 @@ impl StationAssembler {
             slot_stride,
             ring,
             base,
+            validity_offset,
+            validity_bytes_per_slot,
             arrival: (0..slots).map(|_| FrameArrival::new(frames_per_slot as usize, packets_per_frame)).collect(),
             arrival_seq: vec![u64::MAX; slots],
             granted: vec![u64::MAX; slots],
@@ -723,6 +742,37 @@ impl StationAssembler {
         Ok(())
     }
 
+    /// This station's mask bytes for one physical slot, or `None` when disabled.
+    fn mask_slot(&self, slot_seq: u64) -> Option<*mut u8> {
+        if self.validity_bytes_per_slot == 0 {
+            return None;
+        }
+        let slot = (slot_seq % self.ring.slots() as u64) as usize;
+        let off = self.validity_offset + slot * self.validity_bytes_per_slot;
+        // SAFETY: the caller owns this station's staging region, and the offset is
+        // inside it by the layout the ABI reported and `--check` verified.
+        Some(unsafe { self.base.add(off) })
+    }
+
+    /// A slot the ring has recycled starts with nothing present; every frame that
+    /// arrives whole sets its own bit.
+    fn mask_clear_slot(&mut self, slot_seq: u64) {
+        if let Some(p) = self.mask_slot(slot_seq) {
+            // SAFETY: as above; the region is `validity_bytes_per_slot` long.
+            unsafe { std::ptr::write_bytes(p, 0, self.validity_bytes_per_slot) };
+        }
+    }
+
+    /// Mark this frame's samples as real.
+    fn mask_set_frame(&mut self, frame_id: u64) {
+        if let Some(p) = self.mask_slot(frame_id / self.frames_per_slot) {
+            let f = (frame_id % self.frames_per_slot) as usize;
+            // SAFETY: `f/8 < validity_bytes_per_slot` because the mask has one bit
+            // per frame of a slot and `frames_per_slot` is what sized it.
+            unsafe { *p.add(f / 8) |= 1u8 << (f % 8) };
+        }
+    }
+
     /// Borrow the arrival bitmap for the slot holding `frame_id`, resetting it if
     /// the physical slot has been recycled since it was last used.
     fn arrival_for(&mut self, frame_id: u64) -> &mut FrameArrival {
@@ -731,6 +781,9 @@ impl StationAssembler {
         if self.arrival_seq[slot] != slot_seq {
             self.arrival[slot].reset();
             self.arrival_seq[slot] = slot_seq;
+            // The staging for this slot is about to be written for this sequence,
+            // so the mask starts empty with it.
+            self.mask_clear_slot(slot_seq);
         }
         &mut self.arrival[slot]
     }
@@ -837,6 +890,12 @@ impl StationAssembler {
                 slot: slot_in_frame,
                 slots: self.fm.packets_per_frame() as usize,
             })?;
+
+        if complete {
+            // The frame's samples are all real: say so, for whoever zeroes the
+            // missing ones later.
+            self.mask_set_frame(frame_id);
+        }
 
         // An in-order stream finalizes frames as soon as all their packets land.
         if complete && frame_id == self.progress {
@@ -978,6 +1037,8 @@ mod tests {
         fn new(first_frame_id: u64) -> Self {
             let mut buf = vec![0u8; STATION_BYTES];
             let ring = Arc::new(SlotRing::primed(SLOTS, first_frame_id / FPS));
+            // The fixture's buffer holds samples only, so the mask is disabled --
+            // the same path a dry run takes.
             let asm = StationAssembler::new(
                 P,
                 FPS,
@@ -986,6 +1047,8 @@ mod tests {
                 ring.clone(),
                 buf.as_mut_ptr(),
                 first_frame_id,
+                0,
+                0,
             );
             Fixture {
                 buf,
@@ -1058,6 +1121,48 @@ mod tests {
     }
 
     #[test]
+    fn the_mask_marks_exactly_the_frames_that_were_not_filled() {
+        // The mask and the fill are two descriptions of the same fact, and this is
+        // the test that keeps them equal while the fill still exists. It is what
+        // step 3 of docs/DESIGN-zero-fill-decoupling.md will lean on: the GPU is
+        // told which frames to zero, and that answer has to be the one the
+        // assembler used.
+        const P: u64 = 2; // packets per frame
+        const FPS: u64 = 4; // frames per slot
+        const FRAME: usize = 2 * SAMPLES_PER_PACKET as usize;
+        const SLOTS: usize = 3;
+        const MASK_BYTES: usize = (FPS as usize).div_ceil(8);
+
+        let samples = SLOTS * FPS as usize * FRAME;
+        let mut buf = vec![0u8; samples + SLOTS * MASK_BYTES];
+        let ring = Arc::new(SlotRing::primed(SLOTS, 0));
+        let base = buf.as_mut_ptr();
+        let mut a = StationAssembler::new(
+            P, FPS, FRAME, FRAME * FPS as usize, ring, base, 0, samples, MASK_BYTES,
+        );
+        let payload = vec![7i8 as u8; SAMPLES_PER_PACKET as usize];
+
+        // Frames 0, 1 and 3 arrive whole; frame 2 delivers only its first packet.
+        for counter in [0u64, 1, 2, 3, 4, 6, 7] {
+            a.on_packet(counter, &payload).expect("in-order packets");
+        }
+        // Frame 3's arrival is what walks past frame 2 and finalises it.
+        assert!(a.progress() >= 4, "frame 2 must have been walked past");
+
+        let mask = buf[samples];
+        assert_eq!(
+            mask & 0b0000_1111,
+            0b0000_1011,
+            "bits 0, 1 and 3 are whole frames; bit 2 was filled and must stay clear"
+        );
+        // And the frame the mask calls missing is the frame that is actually zero.
+        let f2 = &buf[2 * FRAME..3 * FRAME];
+        assert!(f2.iter().all(|&b| b == 0), "frame 2 must have been zero filled");
+        let f0 = &buf[0..FRAME];
+        assert!(f0.iter().all(|&b| b == 7), "frame 0 must hold its samples");
+    }
+
+    #[test]
     fn advancing_progress_always_publishes() {
         // The scheduler releases a staging slot only when the published progress
         // says the station is done with it, so an unpublished advance is a
@@ -1067,7 +1172,7 @@ mod tests {
         use std::sync::Arc;
 
         let ring = Arc::new(SlotRing::primed(3, 0));
-        let mut a = StationAssembler::new(2, 4, 8, 32, ring, std::ptr::null_mut(), 0);
+        let mut a = StationAssembler::new(2, 4, 8, 32, ring, std::ptr::null_mut(), 0, 0, 0);
         let prog = Arc::new(StationProgress::new(0));
         a.set_liveness(prog.clone());
         assert_eq!(prog.get(), 0, "nothing published before anything happened");
