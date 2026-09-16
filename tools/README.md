@@ -10,6 +10,8 @@
 | `counter_probe_120s.log` | 2026-09-14 那次 120 s 长跑的原始输出（4 路，零丢包零漂移） |
 | `phase_check.py` | 从相关机落盘的 baseline 文件拟合**相位随频率的斜率**，反推站间采样延迟 |
 | `stress_integration.sh` | 用不同积分时间（1 s / 100 ms / 10 ms）压写盘路径，观察 fsync 与吞吐 |
+| `ab_zerofill.sh` | 补零解耦的 A/B 单腿：同一份确定性回放（`--start-counter` 固定、`--gap-len/--gap-at` 造缺口、回放先起）打进指定二进制，存下 `blocks.csv`、运行报告与前后 load |
+| `compare_blocks.py` | 两条腿的 `blocks.csv` 逐行比对（按 `first_frame_id`+station 匹配），打印共有行数、逐行是否相同、以及排除启动首行后的缺失率 |
 
 ## phase_check
 
@@ -42,6 +44,29 @@ tools/stress_integration.sh 9728 10 10 25 D-100ms
 10 ms 即使存储免费也只有 86 行/s，嫌疑是"writer 在管线线程里同步跑"）。
 脚本会把每行计数、`rows_ms.bin`/`blocks.csv` 一致性、以及落后百分比打出来，
 跑完自动删掉输出目录（10 ms 档一次 20 s 就是 11 GB）。
+
+## ab_zerofill + compare_blocks
+
+判据一/判据四要用「同一份输入、旧行为 vs 新行为」的对照，不是两次随便跑的对比：
+
+```sh
+OLD=/scratch/corr-baseline/corr-rs/target/release/corr   # 停在改动前的 worktree
+NEW=corr-rs/target/release/corr
+for leg in "a1 $OLD" "b1 $NEW" "a2 $OLD" "b2 $NEW"; do set -- $leg
+  tools/ab_zerofill.sh "$1" "$2" 40 60 20000        # A/B/A/B 交错，抵消负载漂移
+done
+python3 tools/compare_blocks.py /scratch/zerofill-ab/a1/*/ /scratch/zerofill-ab/b1/*/
+```
+
+实测（缺口 40000 个包落在运行中，load 18–22）：含缺口的那一行两条腿**一位不差**
+（240000/2347008 = 10.2258%），`tools/compare_runs.py` 对同几行做逐字节比较也是
+identical；唯一不同的是每轮的**启动首行**——那是启动瞬态，差异在输入不在数据通路。
+解读与四条判据的完整实测见 `docs/DESIGN-zero-fill-decoupling.md` §8。
+
+`--stall INDEX:SECONDS` **不是**丢包的站：它冻结该站的计数器，恢复后该站的包落在别人
+已经走过的帧上（变 late），而其他站在它身后被环挡住。要造"缺口"用 `--gap-len/--gap-at`。
+
+**不要让回放比关联机的 `--duration` 早结束**：新旧二进制都会挂住（停在 futex，无报错）。
 
 **不要用全局 `sync` 计时**：本机 `sync` 要等所有用户的脏页，实测 2 GB 写完后
 `sync` 超过 7 分钟没回来。判读一律用行数 / `blocks.csv` / 文件大小对齐。
