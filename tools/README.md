@@ -10,6 +10,7 @@
 | `counter_probe_120s.log` | 2026-09-14 那次 120 s 长跑的原始输出（4 路，零丢包零漂移） |
 | `phase_check.py` | 从相关机落盘的 baseline 文件拟合**相位随频率的斜率**，反推站间采样延迟 |
 | `stress_integration.sh` | 用不同积分时间（1 s / 100 ms / 10 ms）压写盘路径，观察 fsync 与吞吐 |
+| `autospectra.py` | 24 条**自相关谱**（j==k）一屏看：每站一格 + 全站叠加；dB 用全局参考（能看出端口间电平差）、`--skip-bins` 跳过 DC 尖峰。顺带检查自相关的虚部（应为 0）与每站被补零的帧数 |
 | `daily_rollover_test.sh` | 每日文件集的端到端判据：用 POSIX TZ 把本地零点挪进测试窗口，跑 2–4 分钟真跨零点，检查 12 条（套名自洽、行数之和、row_index/帧网格连续、时间单调、归属、切套代价与逐行补零）|
 | `ab_zerofill.sh` | 补零解耦的 A/B 单腿：同一份确定性回放（`--start-counter` 固定、`--gap-len/--gap-at` 造缺口、回放先起）打进指定二进制，存下 `blocks.csv`、运行报告与前后 load |
 | `compare_blocks.py` | 两条腿的 `blocks.csv` 逐行比对（按 `first_frame_id`+station 匹配），打印共有行数、逐行是否相同、以及排除启动首行后的缺失率 |
@@ -51,6 +52,20 @@ tools/stress_integration.sh 9728 10 10 25 D-100ms
 10 ms 即使存储免费也只有 86 行/s，嫌疑是"writer 在管线线程里同步跑"）。
 脚本会把每行计数、`rows_ms.bin`/`blocks.csv` 一致性、以及落后百分比打出来，
 跑完自动删掉输出目录（10 ms 档一次 20 s 就是 11 GB）。
+
+## autospectra
+
+阵列健康检查的第一步：自相关就是功率谱，一眼能看出死端口、增益不对的端口、杂散和带内形状。
+
+```sh
+tools/autospectra.py /scratch/jhgu/corr/nf16384-1s-24                    # 最新一套
+tools/autospectra.py <run_dir> --prefix 20260917_000000 --db --skip-bins 2 \
+        --out /scratch/jhgu/auto.png --overlay /scratch/jhgu/auto-overlay.png
+```
+
+- `--db` 用**全局**参考（最强的那个通道 = 0 dB），所以端口间 10 dB 的差会直接看出来；线性模式下 y 轴按分位数裁，免得 DC 尖峰把整幅压平。
+- `--skip-bins 2` 不画 DC 附近 —— nch=16384 时 R2C 的 DC bin 比带内高 3–4 个数量级。
+- 顺手打印 **max|Im|/Re**（自相关必须是实数，正常 ~1e-10，不对就是共轭方向或布局错了）和每站被补零的帧数（短跑的首行会把平均值拉低，但不改变形状）。
 
 ## daily_rollover_test
 
