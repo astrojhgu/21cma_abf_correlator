@@ -1084,13 +1084,22 @@ impl Writer {
             None => Vec::with_capacity(self.row_bytes),
         };
         buf.extend_from_slice(spectrum);
-        self.tx
+        if self
+            .tx
             .send(Job::Row {
                 buf,
                 row_ms,
                 blocks: blocks.clone(),
             })
-            .map_err(|_| anyhow::anyhow!("the writer thread has stopped"))?;
+            .is_err()
+        {
+            // The thread stopped between the check above and this send. Its own
+            // error is the reason whenever it recorded one: a bare "the thread
+            // stopped" here would lose the type the pipeline needs (a failed day
+            // rollover is a `RolloverFailed`, and the report names it).
+            self.take_error()?;
+            bail!("the writer thread has stopped without reporting a reason");
+        }
         self.sent += 1;
         let queued = self.queued();
         if queued > self.max_outstanding {
@@ -1115,12 +1124,16 @@ impl Writer {
             return self.take_error();
         }
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(Job::Sync(ack_tx))
-            .map_err(|_| anyhow::anyhow!("the writer thread has stopped"))?;
+        if self.tx.send(Job::Sync(ack_tx)).is_err() {
+            // A stopped thread answers nothing; whatever it recorded is the reason.
+            self.take_error()?;
+            bail!("the writer thread has stopped without reporting a reason");
+        }
         match ack_rx.recv() {
             Ok(Ok(n)) => self.rows_final = n.max(self.rows_final),
             Ok(Err(msg)) => return Err(anyhow::anyhow!("{msg}")),
+            // The thread died instead of answering (it hit an error and stopped);
+            // `take_error` below turns that into the error it recorded.
             Err(_) => {}
         }
         self.take_error()
@@ -1737,6 +1750,53 @@ mod tests {
         assert!(b2.starts_with("2,0,"), "row_index continues across sets: {b2:?}");
         // ... and the first row of the new set is on the new local day.
         assert_eq!(local_day_at(t1), local_day_at(t0 + 24 * 3600 * 1000 + 60_000));
+    }
+
+    #[test]
+    fn a_rollover_that_cannot_open_its_set_stops_with_that_reason() {
+        // The day boundary now happens in the writer thread, so this is the path
+        // that has to keep its *type* across the thread boundary: the pipeline
+        // downcasts `RolloverFailed` to stop the run with a reason the report
+        // carries, and a stringified error would end the run without saying why.
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-roll-fail");
+        let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        let t0 = midday_now();
+        w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+        w.sync().unwrap();
+        let p1 = sets_on_disk(d.path(), &plan)[0].0.clone();
+
+        let t1 = t0 + 24 * 3600 * 1000 + 60_000;
+        if local_day_at(t1) == local_day_at(t0) {
+            return; // pathological timezone, as in the rollover test above
+        }
+        // The new day's set cannot be created: something already owns that name.
+        let next = local_stamp_at(t1, &cfg.storage.file_prefix_format);
+        let squatter = d.path().join(format!("{next}{}", baseline_file_name(0, 0, 0)));
+        std::fs::write(&squatter, b"not ours").unwrap();
+
+        // The thread hits it on the row that crosses the boundary, so that row is
+        // not written; the caller is told at the next `write_row` (or here, at
+        // `finish`, which waits for the thread and then reports what it hit --
+        // that join is what makes this test deterministic rather than a race
+        // against the thread).
+        w.write_row(&make_row(&plan, 1), t1, &blocks_for(&plan, 1, plan.n_cum as u64))
+            .unwrap();
+        let err = w.finish().unwrap_err();
+        let rf = err
+            .downcast_ref::<RolloverFailed>()
+            .unwrap_or_else(|| panic!("typed, not a string: {err:#}"));
+        assert_eq!(rf.prefix, next);
+        assert!(rf.detail.contains("already holds"), "{:?}", rf.detail);
+
+        // And the set that was left is closed cleanly, with the rows it did get:
+        // the boundary is not a reason to lose the day that ended.
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(sets[0].0, p1);
+        assert_eq!((sets[0].1, sets[0].2), (1, 1), "the crossing row was not written");
+        assert_eq!(std::fs::read(&squatter).unwrap(), b"not ours");
     }
 
     #[test]
