@@ -6,6 +6,8 @@
 
 | 文件 | 用途 |
 |---|---|
+| `raw_capture.c` | 把**一个站**的 UDP 载荷原样落盘（8 字节 counter + 4096 int8），不重排不修补：C 收包才能跟住 195 kpps（Python 单线程只到 ~35 kpps，会把谱测成 Python 的性能）|
+| `raw_spectrum.py` | 对抓到的裸数据做 FFT（帧定义、R2C、无窗无归一化都与相关机一致）并画谱，可与相关机自己存的自相关逐条对照 |
 | `counter_probe.c` | 每 station 一个线程、各绑一核，测**跨站 counter 是否共享同一时钟** |
 | `counter_probe_120s.log` | 2026-09-14 那次 120 s 长跑的原始输出（4 路，零丢包零漂移） |
 | `phase_check.py` | 从相关机落盘的 baseline 文件拟合**相位随频率的斜率**，反推站间采样延迟 |
@@ -52,6 +54,24 @@ tools/stress_integration.sh 9728 10 10 25 D-100ms
 10 ms 即使存储免费也只有 86 行/s，嫌疑是"writer 在管线线程里同步跑"）。
 脚本会把每行计数、`rows_ms.bin`/`blocks.csv` 一致性、以及落后百分比打出来，
 跑完自动删掉输出目录（10 ms 档一次 20 s 就是 11 GB）。
+
+## raw_capture + raw_spectrum
+
+某个站的谱看着不对时，第一个问题是**裸数据是不是本来就那样** —— 相关机的结果已经过拼帧、
+FFT 和平均。这套工具回答它：
+
+```sh
+gcc -O2 -o /tmp/raw_capture tools/raw_capture.c
+taskset -c 28 /tmp/raw_capture 239.1.173.3 10073 172.23.0.11 1.0 /scratch/jhgu/s13-raw.bin
+#             GROUP            PORT     IFACE_IP     秒   输出
+python3 tools/raw_spectrum.py s13=/scratch/jhgu/s13-raw.bin --n-freq 16384 \
+        --against <run_dir> --station 21 --out /scratch/jhgu/raw-vs-corr.png
+```
+
+一秒钟一个站是 ~800 MB（194 kpps × 4104 B）。`raw_spectrum.py` 用**与相关机完全相同的估计量**
+（`n_freq/2048` 个连续包一帧、R2C、无窗、无归一化、帧间取 |Y|² 平均），所以两条曲线可以直接
+比形状**和电平**。实测（2026-09-17，nch=16384）：S13 的裸数据 FFT 与相关机存的自相关在
+50–150 MHz 上平均差 **−0.91 dB**，把该站 17% 的补零稀释补回去之后是 **−0.10 dB / RMS 0.12 dB**。
 
 ## autospectra
 
