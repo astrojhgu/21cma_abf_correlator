@@ -699,8 +699,20 @@ impl Writer {
             }
             Decision::Keep => Ok(()),
             Decision::Roll => {
+                let rows = self.rows_in_set;
+                let from_day = self.set_day.clone().unwrap_or_default();
                 let from = self.close_set()?;
-                self.create_set(&day, row_ms, blocks, SetKind::Rollover, Some(from))
+                self.create_set(&day, row_ms, blocks, SetKind::Rollover, Some(from.clone()))?;
+                // Loud, because this is the one event this feature exists for and a
+                // multi-day run's log is the only place it can be seen while it
+                // happens; the prefix is not knowable in advance (it is this row's
+                // own local time), so it has to be printed rather than documented.
+                eprintln!(
+                    "writer: local day changed {from_day} -> {day}: closed set {from} \
+                     ({rows} rows) and opened {}",
+                    self.prefix
+                );
+                Ok(())
             }
             Decision::WarnBackwards => {
                 if !self.backward_warned {

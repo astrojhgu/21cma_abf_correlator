@@ -30,6 +30,13 @@ DUR=${2:-240}
 LEAD_MIN=${3:-2}          # start this many minutes before local midnight
 CFG=config/correlator-24-replay.yaml
 OUT=${OUT:-/scratch/daily-rollover-$(date +%H%M%S)}
+# Never judge a directory that already holds a run: an earlier attempt's sets would
+# be read as this run's, which fails every count check for a reason that has nothing
+# to do with the code. A second run into the same path gets its own subdirectory.
+if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ]; then
+  OUT="$OUT/$(date +%Y%m%d-%H%M%S)"
+  echo "note       : that output path was not empty; using $OUT"
+fi
 
 # --- put local midnight LEAD_MIN minutes from now ---
 read -r TZSTR LOCALNOW <<<"$(python3 - "$LEAD_MIN" <<'PY'
