@@ -6,6 +6,7 @@
 | `correlator-24.yaml` | **24 路标准实跑（推荐）** | 24 | 4096 | tslice + 4 卡，`auto_layout` 绑核 |
 | `correlator-24-nf8192.yaml` | 24 路 × 8192 信道 / 1 s | 24 | 8192 | staging 2.3 GiB；输出 19.6 MB/s |
 | `correlator-24-nf16384.yaml` | 24 路 × 16384 信道 / 1 s | 24 | 16384 | staging 2.0 GiB；输出 39 MB/s；**收包缓冲必须 256 MiB**（见下）|
+| `correlator-24-nf16384-manual.yaml` | **手动跑用**：同上，但输出固定在 `/scratch/jhgu/corr/`（`run.name: corr` + `output_dir: /scratch/jhgu`，不再套一层运行目录）| 24 | 16384 | 配套脚本 `tools/run-24-nf16384.sh`；同一天同配置的第二次运行会续写当日那一套，另起一套用 `--allow-second-set` |
 | `correlator-20-nf8192.yaml` | 20 路 × 8192 信道 / 1 s | 20 | 8192 | 这台机器的收包能力边界之内（0 丢包）|
 | `correlator-24-replay.yaml` | 回放测试（相位/故障注入）| 24 | 8192 | 组走 239.1.200.x，可与观测同时跑 |
 | `correlator-40-replay.yaml` | 40 路功能测试（回放）| 40 | 4096 | 需要 `auto_layout` 共享核警告；40 线程 > 32 核 |
