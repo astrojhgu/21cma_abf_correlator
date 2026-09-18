@@ -8,7 +8,7 @@
 //!   <P><station_j><station_k>-<T>.bin   complex64[ntime][n_freq], one row per integration
 //!   ...                                 one per baseline, j <= k, station names
 //!   <P><T>-time.bin                     int64 little-endian Unix milliseconds, one per row
-//!   <P><T>-time.txt                     "<row_index> <ms>" per line
+//!   <P><T>-time.txt                     local "YYYY-mm-DD HH:MM:SS.mmm" per line
 //!   <P><T>-blocks.csv                   row_index, station, frame range, valid frames
 //!   <P><T>-metadata.yaml                everything needed to read the raw files
 //! ```
@@ -809,7 +809,7 @@ impl SetState {
             .ms_bin
             .write_all(&row_ms.to_le_bytes())
             .context("writing rows_ms.bin")?;
-        writeln!(files.ms_txt, "{} {}", self.rows_total, row_ms).context("writing rows_ms.txt")?;
+        writeln!(files.ms_txt, "{}", text_time(row_ms)).context("writing rows_ms.txt")?;
 
         for (station, valid) in blocks.valid_frames_per_station.iter().enumerate() {
             writeln!(
@@ -823,6 +823,21 @@ impl SetState {
                 blocks.n_cum as u64 - *valid
             )
             .context("writing blocks.csv")?;
+        }
+
+        // Flush the sidecars on the same schedule as the rows they describe. They go
+        // through `BufWriter`s, and `rows_ms.txt` is about 24 bytes a row, so its own
+        // 8 KiB flush is 341 rows -- close to six minutes during which a reader
+        // watching that file concludes the run has stopped (measured: 121 rows behind
+        // `rows_ms.bin`, which is written unbuffered).
+        //
+        // This has to sit *after* the writes above. The first attempt put it in the
+        // fsync branch, which runs earlier in this function, so it flushed an empty
+        // buffer and changed nothing at all -- the branch was entered, the call
+        // returned Ok, and the file stayed empty until the next `sync`.
+        if self.rows_total % self.fsync_every == 0 {
+            files.ms_txt.flush()?;
+            files.blocks.flush()?;
         }
 
         self.rows_total += 1;
@@ -1465,6 +1480,26 @@ pub fn read_metadata_field(path: &Path, key: &str) -> Option<String> {
 
 /// Rewrite `ms.txt` so that it lists exactly the first `rows` timestamps of
 /// `ms.bin`. The text file is a convenience view, never a source of truth.
+/// One row's wall clock, as a person reads it: local date, time, milliseconds.
+///
+/// Local, not UTC: that is what the startup line prints and what an operator
+/// comparing the log against the data is looking at.
+///
+/// Both the writing path (`write_one`) and the rebuilding path (`rebuild_ms_text`)
+/// go through here on purpose. Two spellings of the same format is exactly how a
+/// text view and a binary view drift apart, and this file has paid for that lesson
+/// once already (the naming change of 2026-09-18).
+///
+/// `rem_euclid` rather than `%`: for an instant before 1970 the latter is negative,
+/// and "-123" milliseconds is not a thing.
+fn text_time(row_ms: i64) -> String {
+    format!(
+        "{}.{:03}",
+        local_stamp_at(row_ms, "%Y-%m-%d %H:%M:%S"),
+        row_ms.rem_euclid(1000)
+    )
+}
+
 fn rebuild_ms_text(bin: &Path, txt: &Path, rows: u64) -> Result<()> {
     let mut s = String::new();
     let len = file_len(bin)?;
@@ -1473,9 +1508,10 @@ fn rebuild_ms_text(bin: &Path, txt: &Path, rows: u64) -> Result<()> {
         let mut raw = vec![0u8; (rows * 8) as usize];
         f.read_exact(&mut raw)
             .with_context(|| format!("reading {}", bin.display()))?;
-        for (i, chunk) in raw.chunks_exact(8).enumerate() {
+        for chunk in raw.chunks_exact(8) {
             let ms = i64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-            s.push_str(&format!("{i} {ms}\n"));
+            s.push_str(&text_time(ms));
+            s.push('\n');
         }
     }
     std::fs::write(txt, s).with_context(|| format!("rewriting {}", txt.display()))?;
@@ -1629,6 +1665,9 @@ fn write_metadata(
     // reconstruct a baseline's name, which no longer starts with the tag.
     let _ = writeln!(s, "# --- the file set this metadata belongs to ---");
     let _ = writeln!(s, "set_prefix: {}", names.tag());
+    // The text view is derived, but it is derived into a format, and a reader should
+    // not have to guess which one.
+    let _ = writeln!(s, "rows_ms_txt_format: \"local YYYY-mm-DD HH:MM:SS.mmm\"");
     let _ = writeln!(s, "file_prefix: {}", names.file_prefix);
     let _ = writeln!(s, "stamp: {}", names.stamp);
     let _ = writeln!(s, "set_day: {day}");
@@ -1882,6 +1921,68 @@ mod tests {
     // -----------------------------------------------------------------------
     // daily file sets
     // -----------------------------------------------------------------------
+
+    /// The text view answers "when was this row" for a person: local time with
+    /// milliseconds, and both paths that write it share one formatter.
+    #[test]
+    fn the_text_sidecar_is_local_time_with_milliseconds() {
+        let t = 1_789_732_717_123_i64;
+        let s = text_time(t);
+        assert!(
+            s.starts_with(&local_stamp_at(t, "%Y-%m-%d %H:%M:%S")),
+            "{s} should start with the local date and time"
+        );
+        assert!(s.ends_with(".123"), "{s}");
+        assert_eq!(s.len(), 23, "{s} is YYYY-mm-DD HH:MM:SS.mmm");
+        assert!(text_time(t + 1).ends_with(".124"), "{}", text_time(t + 1));
+        // Pre-1970 instants must not produce "-123" milliseconds.
+        assert!(text_time(-1).ends_with(".999"), "{}", text_time(-1));
+        assert!(text_time(0).ends_with(".000"), "{}", text_time(0));
+    }
+
+    /// A reader watching `-time.txt` has to see rows as they are written. The file
+    /// goes through an 8 KiB `BufWriter` whose natural flush is 341 rows (~5.7
+    /// minutes), which reads as "the text view stopped growing".
+    #[test]
+    fn the_text_sidecar_keeps_up_with_the_rows() {
+        let (cfg, plan) = test_plan_and_cfg();
+        let d = TempDir::new("sidecar-live");
+        let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        let t0 = midday_now();
+        w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+
+        let tag = only_tag(d.path());
+        let txt = d.path().join(format!("{tag}-time.txt"));
+        let count = || {
+            std::fs::read_to_string(&txt)
+                .map(|s| s.lines().count())
+                .unwrap_or(9999)
+        };
+        // Poll without syncing: that is the property under test.
+        let mut before = 0;
+        for _ in 0..300 {
+            before = count();
+            if before > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The same must hold for `blocks.csv`, which is also a `BufWriter`: one line
+        // per station, visible without a sync. Read both before syncing, or the test
+        // would be measuring the sync.
+        let blocks = std::fs::read_to_string(d.path().join(format!("{tag}-blocks.csv")))
+            .map(|s| s.lines().count())
+            .unwrap_or(9999);
+        // `write_row` only surfaces a writer-thread error on the *next* call.
+        let err = w.take_error().err().map(|e| format!("{e:#}"));
+        w.sync().unwrap();
+        let after = count();
+        assert_eq!(err, None, "the writer thread failed");
+        assert_eq!(before, 1, "rows_ms.txt: one line without syncing");
+        assert_eq!(blocks, plan.n_station, "blocks.csv: one line per station, no sync");
+        assert_eq!(after, 1, "and still one line after a sync");
+    }
 
     /// A wall-clock instant on the current local day, kept well away from local
     /// midnight so that "two rows on one day" cannot race the day boundary.
@@ -2340,7 +2441,9 @@ mod tests {
 
         let txt = std::fs::read_to_string(time_txt_path(d.path())).unwrap();
         assert_eq!(txt.lines().count(), 5);
-        assert!(txt.lines().next().unwrap().starts_with("0 1000"));
+        // The format itself is pinned by `the_text_sidecar_is_local_time_with_milliseconds`;
+        // what matters here is that the text view follows the binary one.
+        assert_eq!(txt.lines().next().unwrap(), text_time(1000));
 
         assert_eq!(
             count_csv_rows(&blocks_path(d.path())).unwrap(),
@@ -2406,6 +2509,6 @@ mod tests {
         let ms = std::fs::read(time_bin_path(d.path())).unwrap();
         assert_eq!(i64::from_le_bytes(ms[..8].try_into().unwrap()), 4242);
         let txt = std::fs::read_to_string(time_txt_path(d.path())).unwrap();
-        assert_eq!(txt.trim(), "0 4242");
+        assert_eq!(txt.trim(), text_time(4242));
     }
 }

@@ -267,7 +267,8 @@ box(60, 1078, 900, 152, "行拼装 + writer（在管道线程里同步执行）"
      "covering 下每卡的基线在全局编号里散开 → 库内先取到 scratch，再按全局基线号逐个放置",
      "基线归属由 corr_device_baselines 可查；拼好后写盘：",
      "  每个 baseline 一个 <file_prefix><站j><站k>-<时刻>.bin（O_APPEND 语义但用 seek，可续写）",
-     "  <file_prefix><时刻>-time.bin / -time.txt（每行首帧 final 的时刻，Unix ms）",
+     "  <file_prefix><时刻>-time.bin / -time.txt（每行首帧 final 的时刻；.bin 是 Unix ms，"
+     ".txt 是本地 YYYY-mm-DD HH:MM:SS.mmm）",
      "  <file_prefix><时刻>-blocks.csv（每站每行：first_frame_id, n_cum, valid, zero_filled）",
      "  <file_prefix><时刻>-metadata.yaml（几何 + config_hash + 每个 baseline 的文件名）"],
     C_OUT)

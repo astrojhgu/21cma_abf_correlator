@@ -15,7 +15,7 @@ sidecar，共 304 个文件，同一个前缀。**套前缀** = `%Y%m%d_%H%M%S`�
    <file_prefix><站j><站k>-<stamp>.bin   complex64[ntime][n_freq]，每个 baseline 一个
    ...
    <file_prefix><stamp>-time.bin         int64 LE Unix 毫秒，每行一条
-   <file_prefix><stamp>-time.txt         "<row_index> <ms>" 每行一条（派生视图）
+   <file_prefix><stamp>-time.txt         本地 "YYYY-mm-DD HH:MM:SS.mmm" 每行一条（派生视图）
    <file_prefix><stamp>-blocks.csv       row_index, station, first_frame_id, n_cum, valid, zero_filled
    <file_prefix><stamp>-metadata.yaml    自描述：配置 + 几何 + config_hash + 套起始行号/帧号 + 时区 + 类型 + 每个 baseline 的文件名
    ```
