@@ -233,6 +233,7 @@ counter 都在按 ~197 k/s 前进（=195 kpps/组，标称值），于是问题�
 | `corr_common.py` | 共用换算：`fft_len(nch) = 2*nch` 等。**通道轴是 R2C 的保留半谱**，这条算术独立错过三次，只允许在这里实现一次。 |
 | `compare_runs.py` | 两次运行的逐基线对比（按 `first_frame_id` 对齐），用于"改了配置之后数据是否一致"。 |
 | `mk_dataflow.py` | 画数据流图（`dataflow.svg/png`）。 |
+| `loss_attribution.py` | 补零的包**丢在哪一层**：把网卡（`rx_prio0_discards` / `rx_discards_phy` / `rx_out_of_buffer`）、内核软中断（`/proc/net/softnet_stat` 的 dropped / time_squeeze）、我们自己的 socket（corr 的 `socket_drops`）、corr 的 `lost` 四层增量并排打成一行，末尾一句责任判定；顺带指出 mlx5 中断与 squeeze 集中在**哪些核**（无 root 时这是唯一能看的线索）。**只读、不 join 组播**，所以别的 corr 正在跑时也能用 —— `doctor.py` 不行，它会收包。 |
 | `corr-web.py` | 独立运行的**状态监测界面**：轮询 corr 的两个只读端点——每秒取 `GET /status.json`（运行状态，自己攒历史画曲线），每 5 s 取 `GET /autospectra.json`（最新那一行的自相关谱，每路一格 dB 曲线）；页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库，**不读 NFS**（谱由写盘端记录，不是读回来的——这台机器上被测的就是写盘那条路径）；corr 停了也不崩，显示"断开 N 秒"并继续展示最后一份。接口契约见 `docs/DESIGN-status-http.md`。 |
 
 **三条使用纪律**（都是踩出来的）：
