@@ -469,10 +469,24 @@ pub struct StationCfg {
 /// resuming with different geometry would silently misread every existing row.
 /// This is a fingerprint, not a security measure -- it only has to notice that
 /// two configurations differ.
+///
+/// **`monitoring` is left out on purpose.** It decides how a run is *watched* --
+/// how often the stderr line is printed, and whether the read-only status endpoint
+/// listens -- and none of that changes what a stored row means. Including it meant
+/// that switching the status endpoint on refused to append to the day's existing
+/// set, reporting a hash mismatch instead of the harmless change behind it: a
+/// false alarm of exactly the kind this check exists to avoid. Everything else
+/// stays in, and the question to ask before excluding anything else is the same
+/// one this check asks -- would that change make an existing row mean something
+/// else?
 pub fn config_hash(cfg: &Config) -> String {
     // FNV-1a over the serialised form: stable, dependency free, and enough to
     // catch a changed n_freq, n_cum, station set or ordering.
-    let text = serde_yaml::to_string(cfg).unwrap_or_default();
+    let mut doc = serde_yaml::to_value(cfg).unwrap_or(serde_yaml::Value::Null);
+    if let serde_yaml::Value::Mapping(map) = &mut doc {
+        map.remove(serde_yaml::Value::String("monitoring".to_string()));
+    }
+    let text = serde_yaml::to_string(&doc).unwrap_or_default();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in text.as_bytes() {
         h ^= *b as u64;
@@ -1298,6 +1312,34 @@ mod tests {
             .join("config/correlator.yaml");
         std::fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()))
+    }
+
+    /// Watching a run is not part of its geometry: turning the status endpoint on,
+    /// or changing how often the line is printed, must not make the day's existing
+    /// set unresumable. Not hypothetical -- adding `monitoring.http` to a running
+    /// profile did exactly that, and the refusal named a hash mismatch.
+    #[test]
+    fn the_config_hash_ignores_monitoring_and_still_notices_geometry() {
+        let mut cfg = Config::from_yaml_str(&shipped_yaml()).unwrap();
+        let base = config_hash(&cfg);
+
+        cfg.monitoring.interval_ms = 250;
+        cfg.monitoring.http.enabled = true;
+        cfg.monitoring.http.bind = "0.0.0.0:9999".to_string();
+        assert_eq!(
+            config_hash(&cfg),
+            base,
+            "monitoring is observation, not geometry"
+        );
+
+        cfg.integration.n_cum += 1;
+        assert_ne!(
+            config_hash(&cfg),
+            base,
+            "a changed integration length is geometry"
+        );
+        cfg.integration.n_cum -= 1;
+        assert_eq!(config_hash(&cfg), base, "and undoing it gives the hash back");
     }
 
     #[test]
