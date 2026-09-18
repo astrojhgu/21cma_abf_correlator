@@ -19,3 +19,7 @@ __pycache__/
 .idea/
 *.swp
 .DS_Store
+
+# Cleanup staging: things to be deleted by hand. Nothing should be removed outright --
+# "clean up the test data" is not the same instruction as "delete it now".
+to_delete/
