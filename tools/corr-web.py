@@ -13,10 +13,14 @@ corr 进程自己（`monitoring.http.enabled: true`）在一个独立线程上 s
 
 用法::
 
-    tools/corr-web.py                       # 取 127.0.0.1:3081，页面开在 127.0.0.1:8080
+    tools/corr-web.py                       # 端口从配置里读（monitoring.http.bind）
+    tools/corr-web.py --config config/correlator-24-nf16384.yaml
     tools/corr-web.py --url http://127.0.0.1:3099/status.json
     tools/corr-web.py --bind 0.0.0.0:8080   # 让别的机器也能看（内网可见，谨慎）
     tools/corr-web.py --interval 0.5 --history 7200
+
+corr 的地址**只定义一处**：配置里的 `monitoring.http.bind`。本程序默认去那份配置里读它
+（读不到才退回 127.0.0.1:3081），所以在配置里改了端口不用在这里再改一次。
 
 页面上的 `connected: false` 不是错误，是"corr 现在没在跑或没开接口"——它会把最后
 一份已知快照继续留着，并显示已经断了多久，所以跑完一腿之后仍然能回看。
@@ -31,8 +35,54 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# 取数地址会先试配置里的 `monitoring.http.bind`（见 `read_bind`），因为端口只该在
+# 一处定义；这两个常量是读不到时的退路。
 DEFAULT_URL = "http://127.0.0.1:3081/status.json"
 DEFAULT_BIND = "127.0.0.1:8080"
+DEFAULT_CONFIG = "config/correlator-24-nf16384-manual.yaml"
+
+
+def read_bind(path):
+    """从配置里读 `monitoring.http.bind`；读不到返回 None。
+
+    手写解析而不是引 YAML：这里只要一个键，而标准库没有 YAML —— 为一个端口把脚本
+    变成"需要装依赖"不划算。这段格式是我们自己写的，缩进稳定。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    section = None
+    sub = None
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            section, sub = line.split(":", 1)[0].strip(), None
+            continue
+        if section != "monitoring":
+            continue
+        stripped = line.strip()
+        if indent == 2:
+            sub = stripped.split(":", 1)[0].strip()
+            continue
+        if sub == "http" and stripped.startswith("bind:"):
+            value = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+            return value or None
+    return None
+
+
+def url_from_bind(bind):
+    """`bind: 0.0.0.0:3081` 是"监听所有地址"，但我们是要**连**过去，不能连 0.0.0.0。"""
+    host, _, port = bind.rpartition(":")
+    if not port:
+        return None
+    if host in ("", "0.0.0.0", "::", "[::]"):
+        host = "127.0.0.1"
+    return f"http://{host}:{port}/status.json"
 
 # 页面里要画的每条曲线：字段取自 /api/state 的 history 元素。
 # (key, 标题, 单位, 归一化上限或 None=按数据自适应)
@@ -340,21 +390,30 @@ def split_bind(text):
 
 def main():
     ap = argparse.ArgumentParser(description="corr 的独立只读监测界面")
-    ap.add_argument("--url", default=DEFAULT_URL,
-                    help=f"corr 的状态接口（默认 {DEFAULT_URL}）")
+    ap.add_argument("--url", default=None,
+                    help="corr 的状态接口；默认按 --config 里的 monitoring.http.bind 拼")
+    ap.add_argument("--config", default=DEFAULT_CONFIG,
+                    help=f"从这份配置里读 monitoring.http.bind（默认 {DEFAULT_CONFIG}）")
     ap.add_argument("--bind", default=DEFAULT_BIND,
                     help=f"本程序的监听地址（默认 {DEFAULT_BIND}）")
     ap.add_argument("--interval", type=float, default=1.0, help="取数间隔秒（默认 1）")
     ap.add_argument("--history", type=int, default=3600, help="内存里保留多少个样本")
     args = ap.parse_args()
 
-    collector = Collector(args.url, args.interval, args.history)
+    url, source = args.url, "--url"
+    if not url:
+        bind = read_bind(args.config)
+        url = url_from_bind(bind) if bind else None
+        source = f"{args.config} 的 monitoring.http.bind"
+    if not url:
+        url, source = DEFAULT_URL, "默认值（没读到配置）"
+    collector = Collector(url, args.interval, args.history)
     collector.start()
     host, port = split_bind(args.bind)
     Handler.collector = collector
     httpd = ThreadingHTTPServer((host, port), Handler)
-    print(f"corr-web: 页面 http://{host}:{port}/  取数 {args.url} 每 {args.interval}s，"
-          f"保留 {args.history} 个样本", flush=True)
+    print(f"corr-web: 页面 http://{host}:{port}/  取数 {url}（{source}），"
+          f"每 {args.interval}s，保留 {args.history} 个样本", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
