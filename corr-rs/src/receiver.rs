@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use crate::assemble::{AssembleStats, SlotRing, StationAssembler};
+use crate::backend::{RecvSetup, ReceiveBackend};
 use crate::config::{Config, RunPlan};
 use crate::net::{pin_to_cpu, MulticastSocket, PACKET_BYTES};
 use crate::run::StagingPtr;
@@ -50,7 +51,7 @@ pub fn open_sockets(cfg: &Config, plan: &RunPlan) -> Result<Vec<MulticastSocket>
 }
 
 /// Drain until the first packet of every station has been seen, then keep
-/// draining for [`SNIFF_SETTLE`], and return **the latest counter seen** per
+/// draining for `SNIFF_SETTLE` (a private constant), and return **the latest counter seen** per
 /// station.
 ///
 /// Stations are polled round-robin rather than one at a time: a station that is
@@ -122,19 +123,24 @@ pub fn sniff_first_counters(
 }
 
 /// Statistics a receive thread publishes when it exits.
+///
+/// Shared with the other receive backend (`crate::async_recv`) because the report
+/// is built from these: a second receiver that could not fill them in would be
+/// invisible in exactly the numbers the two have to be compared with.
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct RecvOutcome {
-    pub(crate) stats: AssembleStats,
-    pub(crate) progress: u64,
-    pub(crate) batches: u64,
-    pub(crate) packets: u64,
-    pub(crate) empty_polls: u64,
-    pub(crate) truncated: u64,
-    pub(crate) ns_recv: u64,
-    pub(crate) ns_assemble: u64,
+    pub stats: AssembleStats,
+    pub progress: u64,
+    pub batches: u64,
+    pub packets: u64,
+    pub empty_polls: u64,
+    pub truncated: u64,
+    pub ns_recv: u64,
+    pub ns_assemble: u64,
     /// Longest this thread went without reading a batch, and how many times it
     /// went 20 ms or more. Sizes the socket-buffer + ring-lead budget.
-    pub(crate) max_stall_ms: u64,
-    pub(crate) stalls_over_20ms: u64,
+    pub max_stall_ms: u64,
+    pub stalls_over_20ms: u64,
 }
 
 /// Everything one receive thread needs. A named struct rather than a closure so
@@ -174,7 +180,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
         a.frame_stride,
         a.frame_stride * a.frames_per_slot as usize,
         a.ring,
-        a.base.0,
+        a.base.as_ptr(),
         a.start_frame,
         a.validity_offset,
         a.validity_bytes_per_slot,
@@ -305,6 +311,90 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
 /// A `PACKET_BYTES` sanity check used by the replayer and by tests.
 pub fn packet_bytes() -> usize {
     PACKET_BYTES
+}
+
+/// One thread per station, pinned to that station's core: the backend every
+/// measurement in this project has been taken with.
+///
+/// It is a [`ReceiveBackend`] rather than a block of code inside `run_receive` so
+/// that a second backend can be measured against it through the same
+/// orchestration: same ring, same scheduler, same report, one variable different.
+pub(crate) struct ThreadBackend {
+    handles: Vec<std::thread::JoinHandle<RecvOutcome>>,
+}
+
+impl ThreadBackend {
+    pub(crate) fn new() -> Self {
+        ThreadBackend {
+            handles: Vec::new(),
+        }
+    }
+}
+
+impl Default for ThreadBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReceiveBackend for ThreadBackend {
+    fn name(&self) -> &'static str {
+        "threads"
+    }
+
+    fn start(&mut self, setup: RecvSetup<'_>) -> Result<()> {
+        let RecvSetup {
+            cfg,
+            plan,
+            sockets,
+            staging,
+            ring,
+            progress,
+            stop,
+            start_frame,
+            frame_stride,
+            packets_per_frame,
+            frames_per_slot,
+            validity_offset,
+            validity_bytes_per_slot,
+        } = setup;
+        if sockets.len() != plan.n_station
+            || staging.len() != plan.n_station
+            || progress.len() != plan.n_station
+        {
+            bail!("sockets, staging and progress must cover every enabled station");
+        }
+        for (idx, sock) in sockets.into_iter().enumerate() {
+            let args = RecvThreadArgs {
+                sock,
+                base: staging[idx],
+                ring: ring.clone(),
+                prog: progress[idx].clone(),
+                stop: stop.clone(),
+                zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
+                idx,
+                cpu: plan.enabled[idx].recv_cpu,
+                packets_per_frame,
+                frames_per_slot,
+                frame_stride,
+                validity_offset,
+                validity_bytes_per_slot,
+                start_frame,
+            };
+            self.handles.push(std::thread::spawn(move || recv_thread(args)));
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> Vec<RecvOutcome> {
+        self.handles
+            .into_iter()
+            // A thread that panicked produced nothing worth reporting; the default
+            // outcome is what the report used to show for it (zero packets, zero
+            // progress), and it stays visible as such.
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// Convenience for the CLI: build the io error a missing interface would give.

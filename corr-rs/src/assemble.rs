@@ -57,6 +57,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::task::Waker;
 use std::time::Duration;
 
 /// How long a receive thread spins before it starts blocking on the ring.
@@ -137,6 +138,13 @@ pub struct SlotRing {
     last_have: AtomicI64,
     blocked: AtomicI64,
     block_events: AtomicU64,
+    /// Tasks parked on a release (`poll_free`), woken by the next one.
+    ///
+    /// Drained on every wake: a task that is refused again re-registers, and a
+    /// waker that is already there is recognised by `Waker::will_wake` instead of
+    /// being pushed twice. The list is therefore bounded by the number of tasks
+    /// currently parked, not by how often they park.
+    wakers: Mutex<Vec<Waker>>,
 }
 
 /// True when `CORR_RING_SPIN` is set: never block, spin instead. Only useful for
@@ -201,6 +209,7 @@ impl SlotRing {
             last_have: AtomicI64::new(-1),
             blocked: AtomicI64::new(0),
             block_events: AtomicU64::new(0),
+            wakers: Mutex::new(Vec::new()),
         }
     }
 
@@ -278,6 +287,9 @@ impl SlotRing {
         }
         self.base.fetch_max(new_base, Ordering::AcqRel);
         self.reprimes.fetch_add(1, Ordering::Relaxed);
+        // The window moved, so sequences nobody could write a moment ago are
+        // writable now: same event, same waiters.
+        self.wake_releasers();
         true
     }
 
@@ -286,6 +298,9 @@ impl SlotRing {
     pub fn abort(&self) {
         self.aborted.store(true, Ordering::Release);
         self.wake_waiters();
+        // A parked task has to come back and see the abort; without this it would
+        // wait for a release that is never coming.
+        self.wake_releasers();
     }
 
     /// Bump the generation and wake every waiter, so one that missed the change
@@ -319,6 +334,75 @@ impl SlotRing {
             return true;
         }
         self.freed[self.slot_of(slot_seq)].load(Ordering::Acquire) >= prev
+    }
+
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the tests below exercise it either way.
+    /// May `slot_seq` be written right now? Never blocks, never sleeps.
+    ///
+    /// This is the whole of [`SlotRing::wait_free`] minus the waiting, and it is
+    /// what a receiver that owns *several* stations on one thread needs: a thread
+    /// multiplexing 24 sockets cannot park on one station's full slot without
+    /// stopping the other 23, so it has to be able to ask the question and move on.
+    ///
+    /// The answer is stable in the only direction that matters: only the pipeline
+    /// releases slots and nothing ever takes one back, so a `true` stays true until
+    /// the caller writes and hands the slot over. A `false` is a snapshot.
+    ///
+    /// The `reprime` inside is not an extra: at startup the window may still be
+    /// open and a first packet further ahead than the ring is deep has to move it
+    /// rather than be refused for ever -- exactly the case `wait_free` handles, and
+    /// a multiplexed receiver would otherwise hang on it (see `reprime`).
+    pub(crate) fn probe_free(&self, slot_seq: u64) -> bool {
+        self.is_free(slot_seq) || self.reprime(slot_seq)
+    }
+
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the tests below exercise it either way.
+    /// As [`Self::probe_free`], but if the answer is no, register `waker` to be
+    /// woken by the next release.
+    ///
+    /// This exists because a readiness-based receiver cannot wait the way a
+    /// thread does. A parked thread has the condvar in `wait_free`; a parked
+    /// *task* has nothing, and the obvious substitute -- sleep a little and ask
+    /// again -- quantises the pipeline's momentum into timer ticks. Measured on
+    /// this machine with 24 streams on one worker: parking with a 200 us sleep
+    /// (rounded up to the timer's 1 ms) held the whole run at a quarter of the
+    /// stream rate, with every station refused a slot it would have got
+    /// microseconds later. The release *is* the event, so it is delivered as one.
+    ///
+    /// The registration and the re-check happen under the same lock `release`
+    /// takes, so a release can neither be lost between them (checked after
+    /// registering) nor be seen before the waker is in the list.
+    pub(crate) fn poll_free(&self, slot_seq: u64, waker: &Waker) -> bool {
+        let mut waiters = match self.wakers.lock() {
+            Ok(w) => w,
+            // A poisoned lock means some other task panicked; the honest fallback
+            // is to answer the question and let the caller poll again, rather than
+            // to pretend the slot is free.
+            Err(_) => return self.probe_free(slot_seq),
+        };
+        if self.probe_free(slot_seq) {
+            return true;
+        }
+        if !waiters.iter().any(|w| w.will_wake(waker)) {
+            waiters.push(waker.clone());
+        }
+        false
+    }
+
+    /// Wake every task parked on a release. Called wherever the set of writable
+    /// sequences can have grown: a release, an abort, or a window move.
+    fn wake_releasers(&self) {
+        let mut waiters = match self.wakers.lock() {
+            Ok(w) => w,
+            Err(p) => p.into_inner(),
+        };
+        for w in waiters.drain(..) {
+            w.wake();
+        }
     }
 
     /// Wait until `slot_seq` may be written.
@@ -413,6 +497,7 @@ impl SlotRing {
     pub fn release(&self, slot_seq: u64) {
         self.release_inner(slot_seq);
         self.wake_waiters();
+        self.wake_releasers();
     }
 
     fn release_inner(&self, slot_seq: u64) {
@@ -557,6 +642,36 @@ impl std::fmt::Display for AssembleError {
 }
 
 impl std::error::Error for AssembleError {}
+
+/// What a non-blocking feed did with a packet.
+///
+/// The distinction exists because a receiver that multiplexes many stations over
+/// one thread (see `corr-rs-async`) may not wait for a staging slot: it has to
+/// hand the packet back and service the other streams, then come back to this
+/// exact packet later. [`FeedOutcome::SlotBusy`] is the "come back later", and it
+/// guarantees that **the packet itself was not consumed**: no counter was
+/// recorded, no packet counted, no byte written. The retry is the same packet
+/// seen for the first time.
+///
+/// It does *not* promise that nothing happened. A packet that jumped the counter
+/// forward has the frames it skipped **declared final before the refusal**
+/// (progress moves, and those frames are counted as never having arrived whole),
+/// because that declaration is what lets the scheduler release the very slot being
+/// waited for. A caller that must not lose that progress has to have published it
+/// before it parks -- which is `try_on_packet`'s caller's job, and the reason
+/// `docs/ARCHITECTURE.md` invariant 1 exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the tests below exercise it either way.
+pub(crate) enum FeedOutcome {
+    /// The packet was taken: written into the staging, or deliberately dropped
+    /// (before the start frame, after its frame was finalized, or a short packet).
+    Taken,
+    /// The physical staging slot this packet's frame lives in is still the
+    /// pipeline's. Retry the same packet once [`SlotRing::probe_free`] says yes.
+    SlotBusy { slot_seq: u64 },
+}
 
 /// Assembles one station's packets into its region of the pinned staging ring.
 ///
@@ -942,6 +1057,75 @@ impl StationAssembler {
         Ok(())
     }
 
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the tests below exercise it either way.
+    /// Feed one packet without ever blocking on the staging ring.
+    ///
+    /// Byte for byte the same work as [`Self::on_packet`], with one difference:
+    /// where `on_packet` waits for the pipeline to release the frame's physical
+    /// slot, this returns [`FeedOutcome::SlotBusy`] and consumes nothing.
+    ///
+    /// The check is made *before* any state moves -- the counter tracker, the
+    /// statistics and the fingerprint of the packet are all untouched -- because
+    /// the caller will feed the same packet again. A check made afterwards would
+    /// count the packet twice and report gaps that never happened.
+    ///
+    /// It is safe to call `on_packet` after this returns `Taken` for the reason the
+    /// probe is placed where it is: a slot is only ever released, never re-taken,
+    /// so a slot that was free stays free until this thread hands it over.
+    pub(crate) fn try_on_packet(
+        &mut self,
+        counter: u64,
+        payload: &[u8],
+    ) -> Result<FeedOutcome, AssembleError> {
+        if payload.len() < SAMPLES_PER_PACKET as usize {
+            return Err(AssembleError::ShortPacket { len: payload.len() });
+        }
+        let frame_id = self.fm.frame_id(counter);
+
+        // Whatever the counter skipped is declared final *before* the slot probe
+        // below, exactly as `on_packet` does it. The order is not a detail: a packet
+        // that jumped forward belongs to a slot further ahead than the pipeline has
+        // released, so the probe refuses it -- and if the refusal came first, the
+        // jump would never be declared, this station's published progress would stay
+        // behind the packets it is already holding, and the watermark could never
+        // reach the slot the station is waiting for. That standoff is broken only by
+        // the stall detector, one slot per 200 ms round: measured on the
+        // 16384-channel profile it held a 24-stream run to one row per minute while
+        // the thread path produced 58 rows in the same period.
+        if frame_id >= self.first_frame_id && frame_id > self.progress {
+            if !self.placed_any {
+                let window = self.frames_per_slot.saturating_mul(self.ring.slots() as u64);
+                let gap = frame_id - self.progress;
+                if gap >= window {
+                    return Err(AssembleError::StartupGap { gap, window });
+                }
+            }
+            self.finalize_range(self.progress, frame_id)?;
+            // Publishes, and it must: the probe below can park, and a park may not
+            // start before the progress it depends on is visible to the scheduler
+            // (docs/ARCHITECTURE.md section 3, invariant 1).
+            self.advance_to(frame_id);
+        }
+
+        // Only a packet that will be written needs a slot: before the start frame
+        // and behind the watermark are both discarded without touching staging,
+        // which is also why neither may be refused here.
+        if frame_id >= self.first_frame_id && frame_id >= self.progress {
+            let slot_seq = frame_id / self.frames_per_slot;
+            let slot = (slot_seq % self.ring.slots() as u64) as usize;
+            // `granted` is the same short-circuit `ensure_writable` uses: once this
+            // thread owns a physical slot, every later packet of that slot is known
+            // writable without reading the ring's shared cache line at all.
+            if self.granted[slot] != slot_seq && !self.ring.probe_free(slot_seq) {
+                return Ok(FeedOutcome::SlotBusy { slot_seq });
+            }
+        }
+        self.on_packet(counter, payload)?;
+        Ok(FeedOutcome::Taken)
+    }
+
     /// Declare every frame in `[from, to)` final, counting the ones that never
     /// arrived whole.
     ///
@@ -1014,6 +1198,23 @@ impl StationAssembler {
         self.advance_to(frame_id);
         self.finalized_to = Some(frame_id);
         Ok(())
+    }
+
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the tests below exercise it either way.
+    /// Account for time spent waiting for a staging slot **without blocking**.
+    ///
+    /// `ensure_writable` fills the same counters from inside `wait_free`, which is
+    /// where a thread-per-station receiver waits. A multiplexed receiver never
+    /// enters that path -- it asks `try_on_packet`, puts the packet back and waits
+    /// somewhere else -- so without this the run log's
+    /// "assembling them (of which Y s waiting for a staging slot)" would report
+    /// zero for a station that spent most of the run waiting for the ring, and the
+    /// one number a cross-backend comparison needs would be missing.
+    pub(crate) fn note_slot_wait(&mut self, ns: u64) {
+        self.stats.ns_slot_wait += ns;
+        self.stats.slot_wait_spins += 1;
     }
 
     /// The frame id this assembler was last explicitly finalized to, if any.
@@ -1426,6 +1627,134 @@ mod tests {
         // A release for an older sequence must never undo a newer one.
         f.ring.release(0);
         assert!(f.ring.is_free(SLOTS as u64 + 1));
+    }
+
+    /// The non-blocking twin of the test above: it must refuse, and it must refuse
+    /// *without consuming anything*, so that the same packet fed again later lands
+    /// exactly once.
+    #[test]
+    fn try_on_packet_refuses_a_busy_slot_without_consuming_the_packet() {
+        let mut f = Fixture::new(0);
+        f.send_full_ring();
+        // The pipeline has taken the first slot, so the window is frozen and the
+        // ring is genuinely full: sequence 3 lives in physical slot 0, which
+        // nothing has released. (Without the `close_window` the probe would move
+        // the open window instead of refusing -- see the test below, which pins
+        // that behaviour down.)
+        f.ring.close_window();
+        assert!(!f.ring.probe_free(SLOTS as u64));
+
+        let counter = FPS * SLOTS as u64 * P;
+        let payload = Fixture::payload(counter);
+        let stats_before = f.asm.stats();
+        let progress_before = f.asm.progress();
+        let bytes_before = f.frame(FPS * SLOTS as u64).to_vec();
+        match f.asm.try_on_packet(counter, &payload) {
+            Ok(FeedOutcome::SlotBusy { slot_seq }) => {
+                assert_eq!(slot_seq, FPS * SLOTS as u64 / FPS);
+            }
+            other => panic!("expected SlotBusy, got {other:?}"),
+        }
+        // Nothing moved: not one counter, not one statistic, not one byte of
+        // staging. This is what makes the retry a first sighting.
+        assert_eq!(f.asm.stats(), stats_before);
+        assert_eq!(f.asm.progress(), progress_before);
+        assert_eq!(
+            f.frame(FPS * SLOTS as u64),
+            &bytes_before[..],
+            "a refused packet must not have written anything into its frame"
+        );
+
+        // Release the sequence the packet needs and feed the very same packet.
+        f.ring.release(0);
+        let outcome = f.asm.try_on_packet(counter, &payload).expect("freed");
+        assert_eq!(outcome, FeedOutcome::Taken);
+        let after = f.asm.stats();
+        assert_eq!(after.packets, stats_before.packets + 1);
+        assert_eq!(after.duplicates, stats_before.duplicates);
+        assert_eq!(after.lost_packets, stats_before.lost_packets, "no invented gap");
+
+        // And the short packet that `on_packet` refuses is refused here too.
+        assert_eq!(
+            f.asm.try_on_packet(counter, &payload[..10]),
+            Err(AssembleError::ShortPacket { len: 10 })
+        );
+    }
+
+    /// A jump declared *before* the refusal is the whole reason this method checks
+    /// the ring second: the slot a jumped-forward packet needs is one the pipeline
+    /// has not released, and a station that parks without declaring the jump leaves
+    /// the watermark behind the packets it is holding -- a standoff the stall
+    /// detector can only break at its 200 ms timeout.
+    #[test]
+    fn try_on_packet_declares_a_jump_before_refusing_the_slot() {
+        let mut f = Fixture::new(0);
+        f.send_full_ring();
+        f.ring.close_window();
+        assert_eq!(f.asm.progress(), FPS * SLOTS as u64);
+
+        // A packet far ahead: its frame's slot has never been released, so the
+        // feed is refused -- but the frames in between are declared missing and
+        // progress moves to the packet's frame first, which is what unblocks the
+        // scheduler.
+        let jump_to = FPS * SLOTS as u64 + FPS * 3;
+        let counter = jump_to * P;
+        let payload = Fixture::payload(counter);
+        let before = f.asm.stats();
+        match f.asm.try_on_packet(counter, &payload) {
+            Ok(FeedOutcome::SlotBusy { slot_seq }) => {
+                assert_eq!(slot_seq, jump_to / FPS, "refused for the packet's own slot");
+            }
+            other => panic!("expected SlotBusy, got {other:?}"),
+        }
+        assert_eq!(
+            f.asm.progress(),
+            jump_to,
+            "the skipped frames must be declared final before the refusal"
+        );
+        let after = f.asm.stats();
+        assert_eq!(
+            after.zero_filled_frames - before.zero_filled_frames,
+            FPS * 3,
+            "three whole slots were skipped and declared missing"
+        );
+        assert_eq!(after.packets, before.packets, "the packet itself was not consumed");
+        assert_eq!(after.duplicates, before.duplicates);
+
+        // And the retry, once the slot is free, sees the packet for the first time.
+        f.ring.release(FPS * SLOTS as u64 - SLOTS as u64);
+        assert_eq!(
+            f.asm.try_on_packet(counter, &payload).expect("freed"),
+            FeedOutcome::Taken
+        );
+        let retry = f.asm.stats();
+        assert_eq!(retry.packets, before.packets + 1);
+        assert_eq!(
+            retry.zero_filled_frames, after.zero_filled_frames,
+            "the gap was counted once, not twice"
+        );
+    }
+
+    /// A station that comes up after its first packet is already past the ring's
+    /// window must be refused by `probe_free` no more eagerly than by `wait_free`:
+    /// while the window is still open the probe moves it, exactly as the waiting
+    /// path does. Without this a multiplexed receiver would refuse for ever what a
+    /// dedicated thread resolves on its first try.
+    #[test]
+    fn probe_free_moves_an_open_window_instead_of_refusing() {
+        let first = 1000;
+        let f = Fixture::new(first);
+        // A frame far past the primed window: nothing has been released for it.
+        let far = first + FPS * SLOTS as u64 * 4;
+        assert!(!f.ring.is_free(far / FPS));
+        assert!(f.ring.probe_free(far / FPS), "the open window must move");
+        assert_eq!(f.ring.reprimes(), 1);
+        // Once the pipeline has taken a slot the window is frozen and the probe
+        // reports the truth instead of moving anything.
+        f.ring.close_window();
+        let further = far + FPS * SLOTS as u64 * 4;
+        assert!(!f.ring.probe_free(further / FPS));
+        assert_eq!(f.ring.reprimes(), 1, "a closed window does not move");
     }
 
     #[test]

@@ -35,21 +35,25 @@ RFSoC 前端 24 路组播 UDP（4104 B = 8 B 小端计数器 + 4096 int8）
 | 文件 | 职责 | 什么时候改它 |
 |---|---|---|
 | `corr-rs/src/config.rs` | 配置解析、校验、派生 `RunPlan`、**绑核策略解析** | 加/改配置项；改绑核规则 |
-| `corr-rs/src/net.rs` | socket 建/配、recvmmsg、绑核 syscall | 收包系统调用层、socket 选项 |
-| `corr-rs/src/assemble.rs` | `SlotRing` + `StationAssembler` + 到达位图 + 有效性掩码；进度发布 | 拼帧、环的所有权、缺失帧的**声明**（零由设备补，ABI 7）|
+| `corr-rs/src/net.rs` | socket 建/配、recvmmsg、绑核 syscall、**非阻塞模式** | 收包系统调用层、socket 选项 |
+| `corr-rs/src/assemble.rs` | `SlotRing` + `StationAssembler` + 到达位图 + 有效性掩码；进度发布；**非阻塞试探 `try_on_packet` 与环上的 waker** | 拼帧、环的所有权、缺失帧的**声明**（零由设备补，ABI 7）|
 | `corr-rs/src/sched.rs` | 水位线、提交/关闭行的状态机、停滞恢复、`StationProgress` | 调度策略、停滞判定 |
-| `corr-rs/src/run.rs` | 启动顺序、收包线程、调度循环 + GPU 提交、取数写盘 | 主流程；**这里的函数最长，动它要最小心** |
+| `corr-rs/src/backend.rs` | **收包后端接缝**：`RecvSetup` + `ReceiveBackend`（`start`/`finish`），让"怎么收包"可替换而编排只有一份 | 换/加一种收包形状 |
+| `corr-rs/src/run.rs` | 启动顺序、`prepare_output`、`run_receive(_with)`、取数写盘 | 主流程；**这里的函数最长，动它要最小心** |
+| `corr-rs/src/receiver.rs` | **线程后端**（一线程一站）+ 发帧嗅探 | 收包线程本身的行为 |
+| `corr-rs/src/pipeline.rs` | 调度循环 + GPU 交接 | 提交/释放节奏、取数时机 |
+| `corr-rs/src/async_recv/*` | **异步收包后端**（`corr-async`，feature `async-recv`，默认开启）：worker 池 + 每站一个 task，一套 epoll 收多路 | 多路收包的行为（见 `docs/DESIGN-async-receive.md`）|
 | `corr-rs/src/report.rs` | `RunReport` 等类型 + 渲染（纯数据/格式化） | 加一条报告字段 |
 | `corr-rs/src/writer.rs` | 输出文件、`blocks.csv`、resume | 落盘格式、写盘节奏 |
 | `corr-rs/src/ffi.rs` / `gpu.rs` | C ABI 镜像与安全包装 | ABI 改动（见 §4） |
 | `corr-cuda/src/kernels.cu` | FFT + 相关核 | 核内算法、性能 |
 | `corr-cuda/src/corr_cuda.cpp` | staging、三种 split 规划、拷贝、计时 | 多卡放置、拷贝路径 |
 | `corr-rs/src/bin/replay.rs` | 仿真前端（含 `--delay-stride`、丢包/停顿注入） | 造测试数据 |
-| `tools/*.py` | 判读与体检（见 §5） | 判据、作图、体检项 |
+| `tools/*.py` | 判读与体检（见 §5）；`async_bench.py` 是收包形状的 A/B 台架 | 判据、作图、体检项 |
 
 ---
 
-## 3. 五条不变量（每一条都对应一次真实的、查了很久的故障）
+## 3. 六条不变量（每一条都对应一次真实的、查了很久的故障）
 
 1. **进度必须在"可能阻塞的等待"之前发布**（`assemble.rs`）。
    收包线程要等下一槽才能继续写，而调度器允许释放那一槽的依据正是它刚算出的进度；
@@ -75,6 +79,16 @@ RFSoC 前端 24 路组播 UDP（4104 B = 8 B 小端计数器 + 4096 int8）
 5. **FFT 长度是 `2·nch`，不是 `nch`**（所有相位相关代码与工具）。
    通道轴是 R2C 结果的**保留半谱**；把它当 FFT 长度会让延迟/斜率差**正好 2 倍** ——
    这个错误已经在三处出现过（含 `tools/phase_triangle.py` 两次）。
+
+---
+
+6. **多路复用收包不能阻塞在环上**（`corr-rs/src/async_recv/`，见 `docs/DESIGN-async-receive.md`）。
+   一个线程收 24 路时，某一路"等 staging 槽"不能把线程停住——它一停，另外 23 路一起停。
+   所以：写入前用 `try_on_packet` 非阻塞试探（被拒绝 = **什么都不消费**，同一个包以后重喂，
+   顺序因此不乱），等待用 `SlotRing::poll_free` 登记 waker 由 `release` 唤醒。
+   **不要用"睡一会儿再问"代替**：tokio 定时器粒度 1 ms，会把本来几微秒后就到的释放
+   量化掉——实测单 worker 因此只跑到流量的 1/4（`parks≈2×batches`、`consume` 只有 50 ms）。
+   同理，一个 socket 一直可读时 task 会永远不让位，所以每放 512 个包 `yield_now()` 一次。
 
 ---
 
@@ -105,6 +119,15 @@ tools/phase_triangle.py /scratch/xxx/<run>/ --mosaic phase   # 相位正确性�
   我们线程的停顿/等槽。只看一层会把责任判错（我们曾把网卡丢包误判为"机器噪声"）。
 - 长跑判据**只能是 `blocks.csv`**：报告里的每站汇总量会把"每行丢一点"藏起来
   （一次 40 s 跑汇总 0.07%，实际 38 行里只有 6 行全零）。
+- **压测/过载时，"这个接收端吃下了多少"不能看应用自己的缺口计数**。追不上来的接收端
+  永远在处理缓冲区里最老的那一段，永远看不到内核开始丢包的前沿，于是 `lost=0`、
+  `zero_filled=0`，而它在丢 85% 的包。判据是**送达率**（收到的包 ÷ 发出的包）
+  加上内核侧计数：`/proc/net/udp` 的 per-socket `drops`、网卡 `rx_missed_errors`。
+  系统级 `Udp: RcvbufErrors` **不要用**——常驻租户的丢包落在同一个计数器里
+  （实测每条腿稳定 ~150 万，与本次测量无关）。
+- 计数器要**对着真文件验证一次**：`/proc/net/snmp` 的表头首列是 `"Udp:"`（带冒号），
+  按 `"Udp"` 匹配会静默返回空；`rx_discards_phy` 在本机网卡上不存在，`cat` 失败被吞掉。
+  这两个 bug 都让"丢包"一栏永远是 0（`tools/async_bench.py` 里已修）。
 - 对比要在**同一窗口内交错**跑 A/B/A/B：这台共享机器的负载漂移是十分钟量级，
   同一配置两次跑实测差 3.2 倍。任何"跑 30 min A、再跑 30 min B"的结论都不可信。
 
@@ -114,7 +137,7 @@ tools/phase_triangle.py /scratch/xxx/<run>/ --mosaic phase   # 相位正确性�
 
 | 项 | 说明 |
 |---|---|
-| 40 路 | 三道硬墙：源只有 24 路；入口 200G < 259 Gbit/s；40 收包线程 > 32 核（需 epoll 多 socket） |
+| 40 路 | 三道硬墙：源只有 24 路；入口 200G < 259 Gbit/s；**40 收包线程 > 32 核** —— 第三道墙已有实现与实测：`corr-rs/src/async_recv/`（`corr-async`，epoll 多路复用，线程数变参数），40 路 / 16 核下 4 个 worker 比 40 个线程省 5% CPU，设计与数据见 `docs/DESIGN-async-receive.md`；真实前端下的对照**尚未做成**（该文档 §6） |
 | 负载相关的残余丢包 | 网卡 RX 环 1024/8192、IRQ 掩码 0-31、`netdev_max_backlog=5000`、无 `CAP_NET_ADMIN` ⇒ 都要管理员 |
 | ~~`run.rs::run_receive` 仍偏长~~ | 已完成：`receiver.rs` + `pipeline.rs` + `report.rs` 拆出，`run.rs` 1303 → 639 行 |
 | ~~补零与读包争同一线程~~ | **已做完（ABI 6 → 7，`b76339e`）**：掩码随样本上设备、kernel 按掩码整帧清零、`corr_row_slot_free` 交还槽时清空掩码、组帧器停止补零也不再为补零等环。四条判据的实测见 `docs/DESIGN-zero-fill-decoupling.md` §8：判据 1、3 通过（逐字节 / 276-276），**判据 2 的后半（等环时间下降）与判据 4 的"更低"没有兑现** —— 那笔等待属于管线不属于补零 |

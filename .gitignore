@@ -7,6 +7,9 @@ corr-cuda/build/
 *.o
 *.so
 
+# Benchmark artifacts: raw per-leg logs and results (docs/DESIGN-async-receive.md)
+bench/
+
 # Python
 __pycache__/
 *.pyc

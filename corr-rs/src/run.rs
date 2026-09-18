@@ -38,7 +38,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::assemble::SlotRing;
 pub use crate::receiver::{open_sockets, packet_bytes, require_interface, sniff_first_counters};
-use crate::receiver::{recv_thread, RecvThreadArgs};
+use crate::backend::{RecvSetup, ReceiveBackend};
+use crate::receiver::ThreadBackend;
 use crate::pipeline::Pipeline;
 use crate::stop::RunStop;
 use crate::report::{DeviceReport, RunReport, StationAssembleReport};
@@ -113,8 +114,20 @@ pub fn align_up(frame: u64, n_cum: u64) -> u64 {
 /// A raw pointer is not `Send` by default, and it should not be in general. Here
 /// it is justified by construction: the allocation is made once, handed to one
 /// thread, never aliased, and freed after that thread has been joined.
+///
+/// The pointer itself stays private and only [`StagingPtr::as_ptr`] hands it out,
+/// so nothing can be pointed somewhere this crate did not allocate; both receive
+/// backends (`crate::receiver`, `crate::async_recv`) take it the same way.
 #[derive(Clone, Copy)]
 pub(crate) struct StagingPtr(pub(crate) *mut u8);
+
+impl StagingPtr {
+    /// The staging base for one station. Valid until the run's staging is freed,
+    /// which happens only after every backend has been joined.
+    pub(crate) fn as_ptr(&self) -> *mut u8 {
+        self.0
+    }
+}
 
 // SAFETY: as above -- sole ownership transferred to one thread.
 unsafe impl Send for StagingPtr {}
@@ -289,6 +302,36 @@ pub fn run_receive(
     prepared: PreparedOutput,
     stop: Arc<RunStop>,
 ) -> Result<RunReport> {
+    run_receive_with(
+        cfg,
+        plan,
+        sockets,
+        first_counters,
+        opts,
+        prepared,
+        stop,
+        Box::new(ThreadBackend::new()),
+    )
+}
+
+/// Run the receive path with a chosen receiver.
+///
+/// Everything in here -- the staging, the ring, the scheduler, the GPU hand-off,
+/// the writer, the report -- is identical whatever the backend is; that is the
+/// point of the seam. A run with `corr-rs-async`'s backend reaches this function
+/// through the same call the thread-per-station binary uses, so a difference
+/// between two runs is a difference in the receiver and in nothing else.
+#[allow(clippy::too_many_arguments)] // plan + sockets + counters + options + prepared + stop + backend
+pub(crate) fn run_receive_with(
+    cfg: &Config,
+    plan: &RunPlan,
+    sockets: Vec<MulticastSocket>,
+    first_counters: &[u64],
+    opts: RunOptions,
+    prepared: PreparedOutput,
+    stop: Arc<RunStop>,
+    mut backend: Box<dyn ReceiveBackend>,
+) -> Result<RunReport> {
     let n_station = plan.n_station;
     if sockets.len() != n_station || first_counters.len() != n_station {
         bail!("sockets and counters must cover every enabled station");
@@ -372,27 +415,34 @@ pub fn run_receive(
         None => (0, 0),
     };
 
-    let mut handles = Vec::with_capacity(n_station);
-    // Where a receive thread records an error the whole run has to answer.
-    for (idx, sock) in sockets.into_iter().enumerate() {
-        let args = RecvThreadArgs {
-            sock,
-            base: staging[idx],
-            ring: ring.clone(),
-            prog: progress[idx].clone(),
-            stop: stop.clone(),
-            zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
-            idx,
-            cpu: plan.enabled[idx].recv_cpu,
-            packets_per_frame: plan.packets_per_frame,
-            frames_per_slot,
-            frame_stride: fft_len as usize,
-            validity_offset,
-            validity_bytes_per_slot,
-            start_frame,
-        };
-        handles.push(std::thread::spawn(move || recv_thread(args)));
-    }
+    // The receiver is chosen by the caller; what it is handed is fixed, and the
+    // staging it writes into is the device's pinned region whenever there is one.
+    let setup = RecvSetup {
+        cfg,
+        plan,
+        sockets,
+        staging: staging.clone(),
+        ring: ring.clone(),
+        progress: progress.clone(),
+        stop: stop.clone(),
+        start_frame,
+        frame_stride: fft_len as usize,
+        packets_per_frame: plan.packets_per_frame,
+        frames_per_slot,
+        validity_offset,
+        validity_bytes_per_slot,
+    };
+    println!(
+        "receiver   : {} ({} station(s), {} receive core(s) in the plan)",
+        backend.name(),
+        n_station,
+        plan.enabled
+            .iter()
+            .map(|s| s.recv_cpu)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
+    backend.start(setup)?;
 
     let sched = RowScheduler::new(
         progress.clone(),
@@ -455,27 +505,21 @@ pub fn run_receive(
     ring.abort();
 
     let mut stations = Vec::with_capacity(n_station);
-    for (idx, h) in handles.into_iter().enumerate() {
-        match h.join() {
-            Ok(o) => stations.push(StationAssembleReport {
-                name_idx: idx,
-                stats: o.stats,
-                progress: o.progress,
-                recv_batches: o.batches,
-                recv_packets: o.packets,
-                recv_empty_polls: o.empty_polls,
-                recv_truncated: o.truncated,
-                ns_recv: o.ns_recv,
-                ns_assemble: o.ns_assemble,
-                ns_slot_wait: o.stats.ns_slot_wait,
-                max_stall_ms: o.max_stall_ms,
-                stalls_over_20ms: o.stalls_over_20ms,
-            }),
-            Err(_) => stations.push(StationAssembleReport {
-                name_idx: idx,
-                ..Default::default()
-            }),
-        }
+    for (idx, o) in backend.finish().into_iter().enumerate() {
+        stations.push(StationAssembleReport {
+            name_idx: idx,
+            stats: o.stats,
+            progress: o.progress,
+            recv_batches: o.batches,
+            recv_packets: o.packets,
+            recv_empty_polls: o.empty_polls,
+            recv_truncated: o.truncated,
+            ns_recv: o.ns_recv,
+            ns_assemble: o.ns_assemble,
+            ns_slot_wait: o.stats.ns_slot_wait,
+            max_stall_ms: o.max_stall_ms,
+            stalls_over_20ms: o.stalls_over_20ms,
+        });
     }
 
     // Whatever the last partial fetch batch left behind, and a clean close.

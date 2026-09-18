@@ -36,6 +36,12 @@
 //! that can be verified without hardware or traffic.
 
 pub mod assemble;
+/// The readiness-driven receive backend (`corr-async`). On by default through the
+/// `async-recv` feature; `--no-default-features` removes the module, the binary and
+/// the `tokio` dependency together.
+#[cfg(feature = "async-recv")]
+pub mod async_recv;
+pub(crate) mod backend;
 pub mod config;
 pub mod ffi;
 pub mod frame;

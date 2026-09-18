@@ -16,6 +16,7 @@
 | `daily_rollover_test.sh` | 每日文件集的端到端判据：用 POSIX TZ 把本地零点挪进测试窗口，跑 2–4 分钟真跨零点，检查 12 条（套名自洽、行数之和、row_index/帧网格连续、时间单调、归属、切套代价与逐行补零）|
 | `ab_zerofill.sh` | 补零解耦的 A/B 单腿：同一份确定性回放（`--start-counter` 固定、`--gap-len/--gap-at` 造缺口、回放先起）打进指定二进制，存下 `blocks.csv`、运行报告与前后 load |
 | `compare_blocks.py` | 两条腿的 `blocks.csv` 逐行比对（按 `first_frame_id`+station 匹配），打印共有行数、逐行是否相同、以及排除启动首行后的缺失率 |
+| `async_bench.py` | 收包形状的 A/B 台架：同一份配置只换核池，交错跑 `corr`（一线程一站）与 `corr-async --workers W`（默认构建即产出），每腿 25 s；判据是**送达率**（收到的包 / 回放发出的包）＋三层丢包（应用缺口、`/proc/net/udp` 的 `drops`、网卡 `rx_missed_errors`）＋CPU µs/包。设计与数据见 `docs/DESIGN-async-receive.md` |
 
 ## phase_check
 

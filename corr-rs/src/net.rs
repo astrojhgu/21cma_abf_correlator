@@ -231,6 +231,35 @@ impl MulticastSocket {
     /// `WouldBlock`/`TimedOut` are returned as `Ok(0)`: an empty poll is the
     /// normal way a receive thread notices that it should service other work.
     pub fn recv_batch(&mut self) -> io::Result<usize> {
+        match self.recv_batch_nowait() {
+            Ok(n) => Ok(n),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                self.stats.empty_polls += 1;
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Receive up to one batch, reporting an empty socket as `WouldBlock`.
+    ///
+    /// The difference from [`Self::recv_batch`] is not cosmetic and is not a
+    /// preference: a readiness-based reactor (epoll, and therefore anything built
+    /// on it) only clears an edge-triggered socket's readiness when the caller
+    /// says the socket ran dry. `recv_batch` folds "empty" into `Ok(0)`, which a
+    /// reactor cannot tell from "one zero-length packet", so a level of the
+    /// pipeline that speaks to epoll has to see the `Err`. The batching, the
+    /// counters and the buffer layout are otherwise identical -- this is
+    /// [`Self::recv_batch`]'s own implementation, with the error left alone.
+    ///
+    /// Requires the socket to be non-blocking ([`Self::set_nonblocking`]),
+    /// otherwise an empty socket blocks for `SO_RCVTIMEO` before it says so.
+    pub(crate) fn recv_batch_nowait(&mut self) -> io::Result<usize> {
         for i in 0..self.vlen {
             let base = self.buf.as_mut_ptr().wrapping_add(i * self.stride);
             self.iovecs[i].iov_base = base as *mut libc::c_void;
@@ -255,14 +284,7 @@ impl MulticastSocket {
             )
         };
         if n < 0 {
-            let e = io::Error::last_os_error();
-            match e.kind() {
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
-                    self.stats.empty_polls += 1;
-                    return Ok(0);
-                }
-                _ => return Err(e),
-            }
+            return Err(io::Error::last_os_error());
         }
         let n = n as usize;
         self.stats.batches += 1;
@@ -273,6 +295,32 @@ impl MulticastSocket {
             }
         }
         Ok(n)
+    }
+
+    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
+    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
+    // the readiness-driven backend, and the test below exercises it either way.
+    /// Put the socket in non-blocking mode.
+    ///
+    /// Needed by any readiness-based receiver: with `SO_RCVTIMEO` still in force
+    /// (see [`Self::configure`]) an empty socket would still park the calling
+    /// thread for the timeout instead of returning `EAGAIN` at once, and the poll
+    /// would then be a wait the reactor did not know about. Calling this twice is
+    /// a no-op, and `SO_BUSY_POLL` keeps working: it is the socket receive path
+    /// that spins in the driver, not the syscall.
+    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
+        // SAFETY: fcntl(F_GETFL/F_SETFL) on a descriptor this socket owns.
+        let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK != 0 {
+            return Ok(());
+        }
+        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// The `i`-th packet of the last batch, as `(counter, samples)`.
@@ -423,5 +471,42 @@ mod tests {
         // CPU 0 always exists; the kernel clamps an affinity mask to the online
         // set, so this is safe on any host.
         pin_to_cpu(0).expect("sched_setaffinity(0) should work unprivileged");
+    }
+
+    /// The reactor's contract: an empty non-blocking socket says `WouldBlock`
+    /// *immediately*, and `recv_batch` still folds that into `Ok(0)`. A reactor
+    /// that got `Ok(0)` instead could not tell "empty" from "a zero-length
+    /// datagram" and would never clear its readiness, which is a busy loop that
+    /// looks like a hot socket.
+    #[test]
+    fn a_nonblocking_socket_reports_an_empty_poll_as_would_block() {
+        let cfg = test_receiver_cfg();
+        let mut sock = match MulticastSocket::open(&cfg, Ipv4Addr::new(239, 255, 0, 3), 29997) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: cannot open a multicast socket here: {e}");
+                return;
+            }
+        };
+        sock.set_nonblocking().expect("O_NONBLOCK is unprivileged");
+        sock.set_nonblocking().expect("setting it twice is a no-op");
+
+        let t0 = std::time::Instant::now();
+        let e = sock
+            .recv_batch_nowait()
+            .expect_err("nothing was sent, so the batch must report a dry socket");
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(5),
+            "a non-blocking poll must not wait for SO_RCVTIMEO, took {:?}",
+            t0.elapsed()
+        );
+
+        // The blocking-flavoured entry point still reports the same empty poll as
+        // `Ok(0)` and counts it, which is what the thread-per-station path relies
+        // on to notice that it should service other work.
+        let before = sock.stats().empty_polls;
+        assert_eq!(sock.recv_batch().expect("an empty poll is not an error"), 0);
+        assert_eq!(sock.stats().empty_polls, before + 1);
     }
 }

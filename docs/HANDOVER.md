@@ -15,9 +15,11 @@ RFSoC 阵列望远镜的**实时相关机**：收 24 路组播 UDP（每包 4104
 `corr-rs/`（Rust，负责收包/组帧/调度/落盘/判读）。
 
 ```bash
-cd corr-rs && cargo build --release      # 顺带构建 ../corr-cuda 的 .so
+cd corr-rs && cargo build --release      # 顺带构建 ../corr-cuda 的 .so；产 corr + corr-replay + corr-async
+cargo build --release --no-default-features   # 只要一线程一站那两个（不引入 tokio）
 ./target/release/corr --config ../config/correlator-24.yaml --check   # ABI/布局/编号一致性
-cargo test                               # 81 + 7
+cargo test                               # 90 + 7（默认含 async-recv，两条腿都编译）
+cargo test --no-default-features          # 同上，但不编译异步后端
                                              # C 侧（abi_smoke / multi_device / 两个 golden）
 cmake -S ../corr-cuda -B ../corr-cuda/build -DCMAKE_BUILD_TYPE=Release
 cmake --build ../corr-cuda/build -j && (cd ../corr-cuda/build && ctest)
@@ -64,7 +66,17 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
   同一窗口，只是面板放大到 1.05 in/150 dpi 以便阅读）。**两线版图的"斜率看着不同"只来自
   `--phase-window`**：每通道 0.021973°（fft_len = 2·nch = 16384），一格里铺 1536 个通道还是 384 个，
   决定它看着有多陡、画几圈；拟合值不受窗口影响。
-* **每日文件（2026-09-17）**：输出按**本地日期**分套 —— `<prefix>baseline_*.bin` /
+* **输出命名（2026-09-18）**：文件名改成
+  `<file_prefix><站j><站k>-<时刻>.bin`（每个 baseline 一个，站名直连）与
+  `<file_prefix><时刻>-time.bin` / `-time.txt` / `-blocks.csv` / `-metadata.yaml`；
+  `<file_prefix>` 是新增配置项 `storage.file_prefix`（默认空、不含路径），`<时刻>` 是该套
+  第一条行的本地时间（`storage.file_prefix_format` 默认改为 `"%Y%m%d-%H%M%S"`）。
+  metadata 里新增 `file_prefix` / `stamp` 两半，并逐条列出每个 baseline 的实际文件名，
+  读端不再重建命名规则；旧布局（`baseline_0000_j00_k00.bin` / `rows_ms.*`）**只读兼容**
+  （`tools/corr_common.py` 认出两种布局），新二进制不会续写旧套。三个二进制都搬到
+  `corr-rs/src/bin/`（`corr.rs` / `corr_async.rs` / `replay.rs`）。
+* 下面这条是 2026-09-17 的原始记录（命名已被上面这条取代，其余行为不变）：
+  输出按**本地日期**分套 —— `<prefix>baseline_*.bin` /
   `<prefix>rows_ms.*` / `<prefix>blocks.csv` / `<prefix>metadata.yaml`，`<prefix>` =
   该套第一条行的本地 `%Y%m%d_%H%M%S`。跨本地零点自动关旧套、开新套；`row_index` 继续全局、
   按行的**起始时刻**归属、当天重启追加当日那套。开关 `storage.daily_files`（默认**开**，
@@ -76,6 +88,50 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
 * 判读工具现在认前缀：`rows_trend.py` / `longrun_report.py` / `compare_blocks.py` /
   `compare_runs.py` / `phase_check.py` / `phase_triangle.py` 都可加 `--prefix`，
   默认取**最后一套**；不带前缀的老目录照旧能读（`tools/corr_common.py` 里的 `find_sets`）。
+* **异步收包后端（2026-09-17；2026-09-18 合并进 `corr-rs/src/async_recv/`，feature `async-recv` **默认开启**）**：`docs/ARCHITECTURE.md` §6 那条
+  "40 收包线程 > 32 核"的墙有了实现与实测。线程数变成参数（`--workers W`，一个 worker
+  一套 epoll 收多路）；接缝是 `corr-rs/src/backend.rs` 的 `ReceiveBackend`，
+  两条腿共用同一份编排/报告/writer/ABI，只换收包形状。**只加了公有 API，没改老路径语义**：
+  `cargo test` 89+7、clippy 0 告警、`--check` 仍报 abi=7；GPU 生产路径端到端跑通（96 行、
+  0 丢失 0 补零）；**规范相位检验 276/276、lag 误差 0 样本、overlay 0.00031 rad —— 与
+  本文 §1 里钉死的线程腿基线逐位相同**。性能（交错 A/B、每腿 25 s、dry run）：
+  24 路/8 核 `--workers 2` 比 24 线程**省 29–33% CPU**（送达都 100%），`--workers 8` 反而
+  贵 30%；40 路/16 核 `--workers 4` 省 5%、`--workers 16` 贵 34%；8 路/8 核（流数≤核数）
+  线程便宜 48%。**结论：异步的代价按 worker 数走不按流数走，W 要按负载定
+  （一条 worker ≈ 400–450 kpps），流数 ≤ 核数时别用。** 设计与全部数据
+  （含真实前端那次**没做成**的对照与两个把判据带偏过的测量陷阱）见
+  `docs/DESIGN-async-receive.md`，台架 `tools/async_bench.py`。
+  **补零率（生产档、逐行 `blocks.csv`）**：24 路/8 核 @30k、24 路/4 核 @40k、以及
+  "环压到 1 个可写槽"（`block_slots=2`）@30k 三种工况下，**两条腿都是 0.0000%**
+  （全干净行 45/45、48/48、35/35 与 44/44、48/48、36/36），即**能跟上的负载下换收包形状
+  不改变补零率**；超载（24 路/4 核 @60k）时 thread 腿补零 13–15%（前半→后半 0.9%→28%、
+  1.2–1.4 万次环阻塞）而异步腿 0.04–0.09%——但两腿看到的流量本身不同
+  （实测 counter 前进 55.9k vs 20.9k pps/站，网卡丢包 2.3–10.1 万 vs 8.3–35.2 万），
+  **那一行不能读成"异步质量更好"**，理由与需要补的采样见 `docs/DESIGN-async-receive.md` §4.4/§6。
+  **16384 信道 / 1 秒档（真实前端、生产档、交错 A/B，30 s 腿）**：异步腿补零率
+  **22.9% / 26.7%**（28–29 行里 1 / 0 行全干净），线程腿 12.2% / 17.7%；两腿 CPU 相同（≈11.8 核）。
+  补零率与主机侧丢包率几乎一比一（成串丢包 = socket 溢出）：dry 对照里线程腿
+  **0 丢包**，异步腿已差 6%、内核丢包 360k/s、每 socket 积压 400 MB。
+  前端/网卡不是原因（dry 线程腿 194 kpps/站、0 缺口、计数器与设计值一致）。
+  **⚠ 更正（2026-09-18）**：下面这句的因果是错的。另一侧会话查明并修好了真正的原因——
+  **writer 一直同步跑在管线线程上**（每行 300 文件 + 300 次 fsync = 158 ms/行），
+  每一行都把管线线程钉住，环因此被关、接收侧被拒槽、socket 溢出（他们的 `writer-thread`
+  分支 `497ff7d`，只改 `writer.rs`；文档 `/scratch/jhgu/head-wt/docs/baseline_test_sync.md`）。
+  我把异步腿搬到他们的分支上按同一协议对拍（3 臂 × 3 轮拉丁方 × 100 s，同一窗口）：
+  每站等环 **old 32.2–34.8 s → new 0.0 / async 0.0**，补零率 **old 2.16/3.08/6.42%、
+  new 0.0003/0.0000/1.1584%、async 0.0000/0.0012/0.0045%**（配对差 async−new =
+  −0.0003/+0.0012/−1.15 个百分点），CPU 基本相同。**结论：带 writer 线程之后，这份档案上
+  异步与同步等价**（它本来 1:1，异步既无收益也无代价）；我下面的旧数字是在未修代码上测的，
+  已改为只作症状记录。详见 `docs/DESIGN-async-receive.md` §4.5/§4.7 与
+  `/scratch/jhgu/async-side-comparison.md`（回给对方的比对报告）。
+  ~~同一档案在 5 个窗口交错复测：异步腿每一窗口都更差（15–33% vs 9–18%）~~，
+  且 `--workers 12`（容量正好压线）更差（42.7%）；线程腿今天也不是 0.1050%
+  ——报告显示 H2D 每卡 4.55–4.7 GB/s（满需求 4.80）、pipeline 有 25% 时间在等设备释放槽、
+  接收侧被拒槽最长 1 s，而**同档案 dry run 线程腿 0 丢包**，所以今天这笔账记在 GPU 链路上。
+  **结论：这份档案该用线程后端**（24 路 / 24 收包核 = 1:1，正是 §4.3 说的"别用异步"那一格）。
+  **这次验证抓出并修掉一个新 bug**：`try_on_packet` 原来先探环后声明计数跳变，
+  导致"站等环、环等水位线"的自锁——修前 60 s 只出 0–1 行，修后 58 行（与线程腿一致）；
+  详见 `docs/DESIGN-async-receive.md` §4.5.1。
 * 结构：`run.rs` 639 行（编排）+ `receiver.rs` / `pipeline.rs` / `report.rs` / `stop.rs`。
   **三条不变量已结构化**：进度发布唯一入口、`block_slots - ring_lead ≥ 1` 由校验强制、
   停止原因唯一且首个胜出（见 `docs/ARCHITECTURE.md` §3）。
@@ -134,6 +190,7 @@ load 16–21 与 24–27 之间差一个量级，比较必须在同一窗口内�
 | `docs/HANDOVER.md` | 本文：入口 |
 | `docs/ARCHITECTURE.md` | 数据路径、模块地图、**五条不变量**、判读流程、未完成清单 |
 | `docs/DESIGN-zero-fill-decoupling.md` | 补零解耦的设计 + **§7 分步计划与验收命令** |
+| `docs/DESIGN-async-receive.md` | **异步收包后端**（流数 > 核数）：设计、正确性证据、交错 A/B 实测、测量陷阱、未解决的问题 |
 | `config/README.md` | 7 个配置档案各自用途 + 三条"别再改回去"的约定 |
 | `tools/README.md` | 判读/体检工具清单 + 三条使用纪律 |
 | `docs/DESIGN-daily-files.md` | 按本地日期分文件集的行为、切套代价与两条被接受的风险 |
@@ -150,4 +207,5 @@ load 16–21 与 24–27 之间差一个量级，比较必须在同一窗口内�
   RX 环只有 1024/8192、没有 `SO_BUSY_POLL` 权限、常驻租户占着 15 个组。都没有 root 可改。
 * `RunStop::ZeroFillCap`（调度器侧上限）仍然没被实跑触发过 —— 收包线程自己的上限总是先到期。
 * `writer` 仍在 pipeline 线程里。
-* 40 路的三道墙：源只有 24 路、入口 200G < 259 Gbit/s、40 收包线程 > 32 核（需 epoll 多 socket）。
+* 40 路的三道墙：源只有 24 路、入口 200G < 259 Gbit/s、~~40 收包线程 > 32 核~~（**已做**：
+  `corr-rs/src/async_recv/`（`corr-async`），见本文 §1 与 `docs/DESIGN-async-receive.md`；剩下的是真实前端下的对照没做成）。

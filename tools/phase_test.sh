@@ -10,6 +10,9 @@
 #
 #   tools/phase_test.sh                       # defaults: 24 stations, stride 1, 50 kpps
 #   RATE=20000 DUR=20 tools/phase_test.sh     # slower injector, shorter run
+#   CORR=./corr-rs/target/release/corr-async CORR_ARGS="--workers 6" tools/phase_test.sh
+#                                             # the same test through the async receive
+#                                             # backend (docs/DESIGN-async-receive.md)
 #
 # Artifacts land in $OUT (default /scratch/phase-test-<timestamp>):
 #   replay.log  corr.log  analysis.txt  triangle.png  <run dir>/
@@ -22,9 +25,13 @@ DUR=${DUR:-25}               # seconds of correlation to keep (rows)
 STRIDE=${STRIDE:-1}          # station i is delayed by i*STRIDE samples
 OUT=${OUT:-/scratch/phase-test-$(date +%Y%m%d-%H%M%S)}
 CORR=${CORR:-./corr-rs/target/release/corr}
+# Extra arguments for $CORR, word-split on purpose: `corr` takes none, and
+# `corr-async` needs `--workers W` (docs/DESIGN-async-receive.md section 7).
+CORR_ARGS=${CORR_ARGS:-}
 REPLAY=${REPLAY:-./corr-rs/target/release/corr-replay}
 
 echo "config=$CFG rate=$RATE dur=$DUR stride=$STRIDE out=$OUT"
+echo "corr=$CORR $CORR_ARGS"
 mkdir -p "$OUT"
 
 # One producer at a time: two would interleave their counters and the test would
@@ -41,7 +48,8 @@ nohup "$REPLAY" --config "$CFG" --pattern prng --delay-stride "$STRIDE" \
 sleep 5
 head -1 "$OUT/replay.log"
 
-"$CORR" --config "$CFG" --duration "$DUR" --output-dir "$OUT" 2>&1 \
+# shellcheck disable=SC2086  # CORR_ARGS is meant to be word-split
+"$CORR" --config "$CFG" --duration "$DUR" --output-dir "$OUT" $CORR_ARGS 2>&1 \
   | tee "$OUT/corr.log" | grep -E "^start frame|^  R01 |^  R24 |output:" || true
 pkill -x corr-replay 2>/dev/null || true
 
