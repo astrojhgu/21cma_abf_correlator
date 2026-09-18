@@ -44,6 +44,9 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) gpu: Option<Correlator>,
     pub(crate) ring: &'a Arc<SlotRing>,
     pub(crate) writer: Option<Writer>,
+    /// Where each written row's autocorrelations go, when the status endpoint is on
+    /// and somebody can read them.
+    pub(crate) autospec: Option<Arc<crate::autospectra::Cell>>,
     pub(crate) progress: &'a [Arc<StationProgress>],
     pub(crate) stop: &'a Arc<RunStop>,
     pub(crate) n_station: usize,
@@ -180,6 +183,7 @@ impl<'a> Pipeline<'a> {
                                     &mut self.pending_meta,
                                     &mut self.fetch_buf,
                                     self.writer.as_mut(),
+                                    self.autospec.as_deref(),
                                 ) {
                                     Ok(n) => n,
                                     Err(e) => {

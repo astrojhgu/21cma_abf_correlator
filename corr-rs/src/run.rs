@@ -468,12 +468,24 @@ pub(crate) fn run_receive_with(
     } else {
         None
     };
+    // The autocorrelation curves of the newest row. Recorded as the row is written
+    // (see `flush_rows`), never read back off the disk, and only when somebody could
+    // actually read them: off by default, and nothing at all without the feature.
+    let autospec_cell = if cfg!(feature = "status-http") && cfg.monitoring.http.enabled {
+        Some(crate::autospectra::Cell::new(plan))
+    } else {
+        None
+    };
     // The endpoint itself, on a thread of its own (feature `status-http`, on by
     // default; `--no-default-features` keeps it out of the build entirely). A bind
     // that fails is a warning and a run that carries on: receiving is the point,
     // monitoring is not.
     #[cfg(feature = "status-http")]
-    let _ = crate::status::serve(&cfg.monitoring.http, status_cell.clone());
+    let _ = crate::status::serve(
+        &cfg.monitoring.http,
+        status_cell.clone(),
+        autospec_cell.clone(),
+    );
 
     // Everything the loop owns lives in `Pipeline`; naming it here, once, is the
     // whole of what this function has to know about the loop's state.
@@ -503,6 +515,7 @@ pub(crate) fn run_receive_with(
         t0: Instant::now(),
         elapsed: Duration::ZERO,
         monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, status_cell, plan),
+        autospec: autospec_cell,
     };
     pipeline.run()?;
     let elapsed = pipeline.elapsed;
@@ -552,6 +565,7 @@ pub(crate) fn run_receive_with(
             pending_meta,
             fetch_buf,
             writer,
+            autospec,
             ..
         } = &mut pipeline;
         if let Some(corr) = gpu.as_ref() {
@@ -564,6 +578,7 @@ pub(crate) fn run_receive_with(
                     pending_meta,
                     fetch_buf,
                     writer.as_mut(),
+                    autospec.as_deref(),
                 )?;
             }
         }
@@ -652,6 +667,7 @@ pub(crate) fn flush_rows(
     pending_meta: &mut Vec<(u64, i64)>,
     buf: &mut Vec<u8>,
     mut writer: Option<&mut Writer>,
+    autospec: Option<&crate::autospectra::Cell>,
 ) -> Result<u32> {
     corr.rows_wait().context("waiting for the rows")?;
     let need = corr.fetch_bytes()?;
@@ -691,6 +707,18 @@ pub(crate) fn flush_rows(
             .copied()
             .unwrap_or((0, crate::sched::system_ms()));
         let spectrum = &buf[i * row_bytes..(i + 1) * row_bytes];
+        // The autocorrelations of this row, taken while the bytes are in hand. The
+        // alternative -- reading them back off the disk afterwards -- would hit the
+        // same NFS this run is writing into, and they are 24 of the row's 300
+        // baselines, so there is nothing to gain by storing them twice.
+        if let Some(cell) = autospec {
+            cell.publish_row(
+                spectrum,
+                row_index,
+                open_ms,
+                crate::sched::system_ms(),
+            );
+        }
         if let Some(w) = writer.as_deref_mut() {
             let valid: Vec<u64> = per_row
                 .iter()

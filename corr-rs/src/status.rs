@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::autospectra::Cell as AutospectraCell;
 use crate::config::HttpCfg;
 use crate::monitor::{Cell, SCHEMA};
 
@@ -43,7 +44,11 @@ const MAX_REQUEST_BYTES: usize = 2048;
 /// Called once at startup from the thread that is about to run the pipeline.
 /// Returns whether a server is now running. `cell` is `None` when the endpoint is
 /// off, and then this does nothing at all.
-pub(crate) fn serve(cfg: &HttpCfg, cell: Option<Arc<Cell>>) -> bool {
+pub(crate) fn serve(
+    cfg: &HttpCfg,
+    cell: Option<Arc<Cell>>,
+    autospec: Option<Arc<AutospectraCell>>,
+) -> bool {
     if !cfg.enabled {
         return false;
     }
@@ -72,9 +77,12 @@ pub(crate) fn serve(cfg: &HttpCfg, cell: Option<Arc<Cell>>) -> bool {
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| cfg.bind.clone());
-    match spawn(listener, cell) {
+    match spawn(listener, cell, autospec) {
         Ok(_thread) => {
-            eprintln!("status     : http://{addr}/status.json (schema {SCHEMA}, read-only)");
+            eprintln!(
+                "status     : http://{addr}/status.json and /autospectra.json \
+                 (schema {SCHEMA}, read-only)"
+            );
             true
         }
         Err(e) => {
@@ -128,12 +136,21 @@ fn not_ready() -> Vec<u8> {
     format!("{{\"schema\":{SCHEMA},\"ready\":false}}").into_bytes()
 }
 
+/// The newest row's autocorrelations, or `ready: false` until a row has been
+/// written (the first one lands about one integration period after startup).
+fn autospec_body(cell: Option<&AutospectraCell>) -> Vec<u8> {
+    match cell.and_then(|c| c.current()) {
+        Some(snap) => serde_json::to_vec(&*snap).unwrap_or_else(|_| not_ready()),
+        None => not_ready(),
+    }
+}
+
 /// One request, one response, then close.
 ///
 /// Serial, deliberately: a monitor polls once a second, and a second reader
 /// waiting a few milliseconds behind the first is a smaller problem than the
 /// bookkeeping a thread pool would add to a process whose job is receiving.
-fn handle(mut stream: TcpStream, cell: &Cell) {
+fn handle(mut stream: TcpStream, cell: &Cell, autospec: Option<&AutospectraCell>) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
 
@@ -149,13 +166,14 @@ fn handle(mut stream: TcpStream, cell: &Cell) {
 
     let (status, body) = match (method, path) {
         ("GET", "/status.json") => ("200 OK", body(cell)),
+        ("GET", "/autospectra.json") => ("200 OK", autospec_body(autospec)),
         // `/` lists what exists, so a human who guessed the address is told where
         // to look instead of getting a bare 404. Still JSON: this endpoint never
         // serves HTML.
         ("GET", "/") => (
             "200 OK",
             format!(
-                "{{\"schema\":{SCHEMA},\"endpoints\":[\"/status.json\"],\
+                "{{\"schema\":{SCHEMA},\"endpoints\":[\"/status.json\",\"/autospectra.json\"],\
                  \"note\":\"one JSON object per request, no query parameters\"}}"
             )
             .into_bytes(),
@@ -164,7 +182,7 @@ fn handle(mut stream: TcpStream, cell: &Cell) {
             "404 Not Found",
             format!(
                 "{{\"schema\":{SCHEMA},\"error\":\"no such endpoint\",\
-                 \"endpoints\":[\"/status.json\"]}}"
+                 \"endpoints\":[\"/status.json\",\"/autospectra.json\"]}}"
             )
             .into_bytes(),
         ),
@@ -185,13 +203,17 @@ fn handle(mut stream: TcpStream, cell: &Cell) {
 }
 
 /// The serving thread. Detached on purpose: it ends when the process does.
-fn spawn(listener: TcpListener, cell: Arc<Cell>) -> std::io::Result<JoinHandle<()>> {
+fn spawn(
+    listener: TcpListener,
+    cell: Arc<Cell>,
+    autospec: Option<Arc<AutospectraCell>>,
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("corr-status".to_string())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => handle(stream, &cell),
+                    Ok(stream) => handle(stream, &cell, autospec.as_deref()),
                     // A failed accept is a per-connection condition (a descriptor
                     // limit, a connection reset between SYN and accept). The short
                     // sleep keeps a persistent one from spinning this thread.
@@ -224,7 +246,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         // Dropped handle: the thread is detached and dies with the test process.
-        drop(spawn(listener, cell).expect("spawn"));
+        drop(spawn(listener, cell, None).expect("spawn"));
         addr
     }
 
@@ -261,9 +283,17 @@ mod tests {
         let (status, _) = get(addr, "/status.json?cachebust=1");
         assert_eq!(status, "HTTP/1.1 200 OK");
 
-        // `/` names the endpoint instead of 404ing.
+        // `/` names the endpoints instead of 404ing.
         let (status, body) = get(addr, "/");
         assert_eq!(status, "HTTP/1.1 200 OK");
         assert!(body.contains("/status.json"), "{body}");
+        assert!(body.contains("/autospectra.json"), "{body}");
+
+        // The autocorrelation endpoint answers `ready: false` until a row has been
+        // written, which is a normal state one integration after startup.
+        let (status, body) = get(addr, "/autospectra.json");
+        assert_eq!(status, "HTTP/1.1 200 OK");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["ready"], false);
     }
 }

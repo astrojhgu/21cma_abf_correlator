@@ -36,6 +36,9 @@
 //! that can be verified without hardware or traffic.
 
 pub mod assemble;
+/// The autocorrelation spectra of the row being written, for the status endpoint.
+/// Always compiled (it is plain data), but only published when that endpoint is on.
+pub(crate) mod autospectra;
 /// The readiness-driven receive backend (`corr-async`). On by default through the
 /// `async-recv` feature; `--no-default-features` removes the module, the binary and
 /// the `tokio` dependency together.

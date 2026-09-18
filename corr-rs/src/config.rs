@@ -642,10 +642,8 @@ pub const DEFAULT_FILE_PREFIX_FORMAT: &str = "%Y%m%d-%H%M%S";
 pub const DEFAULT_RUN_NAME_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 /// Default address for the status endpoint: the loopback, so that turning it on
-/// exposes a run to this host and not to the network.
-///
-/// 3081 rather than 3080, which this machine's DSH web GUI already holds.
-pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3081";
+/// exposes a run to this host and not to the network, on 8000 by default.
+pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8000";
 
 /// Current UTC time as `YYYYmmdd_HHMMSS`.
 ///

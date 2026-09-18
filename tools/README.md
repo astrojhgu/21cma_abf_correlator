@@ -233,7 +233,7 @@ counter 都在按 ~197 k/s 前进（=195 kpps/组，标称值），于是问题�
 | `corr_common.py` | 共用换算：`fft_len(nch) = 2*nch` 等。**通道轴是 R2C 的保留半谱**，这条算术独立错过三次，只允许在这里实现一次。 |
 | `compare_runs.py` | 两次运行的逐基线对比（按 `first_frame_id` 对齐），用于"改了配置之后数据是否一致"。 |
 | `mk_dataflow.py` | 画数据流图（`dataflow.svg/png`）。 |
-| `corr-web.py` | 独立运行的**状态监测界面**：每秒从 corr 的 `GET /status.json` 取一次快照（配置里 `monitoring.http.enabled: true`），自己攒历史并画曲线，页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库；corr 停了也不崩——显示"断开 N 秒"并继续展示最后一份快照，所以跑完还能回看。接口契约见 `docs/DESIGN-status-http.md`。 |
+| `corr-web.py` | 独立运行的**状态监测界面**：轮询 corr 的两个只读端点——每秒取 `GET /status.json`（运行状态，自己攒历史画曲线），每 5 s 取 `GET /autospectra.json`（最新那一行的自相关谱，每路一格 dB 曲线）；页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库，**不读 NFS**（谱由写盘端记录，不是读回来的——这台机器上被测的就是写盘那条路径）；corr 停了也不崩，显示"断开 N 秒"并继续展示最后一份。接口契约见 `docs/DESIGN-status-http.md`。 |
 
 **三条使用纪律**（都是踩出来的）：
 

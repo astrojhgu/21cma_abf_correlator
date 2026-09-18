@@ -8,7 +8,7 @@ monitoring:
   interval_ms: 1000          # 已有的实时统计行（stderr）
   http:
     enabled: true
-    bind: "127.0.0.1:3081"   # 只监听回环；3080 已被本机 DSH web GUI 占用
+    bind: "127.0.0.1:8000"   # 默认值；只监听回环
 ```
 
 ## 1. 为什么可以放进生产进程里
@@ -54,12 +54,13 @@ abort 整个进程 —— 所以 `status.rs` 里没有任何可达的 `unwrap`/`
 | 方法 | 路径 | 回答 |
 |---|---|---|
 | GET | `/status.json` | 当前快照；`ready: false` 表示还没有第一份样本 |
+| GET | `/autospectra.json` | 最新写入那一行的自相关谱（每站一条 dB 曲线） |
 | GET | `/` | 端点清单（仍是 JSON，这个接口不 serve HTML） |
 | 其它 | 任何 | `404` + JSON |
 
 * 只有 GET；没有请求体、没有查询参数（查询串被忽略，方便加 cache buster）；
 * 无 keep-alive（每个请求一个连接，`Connection: close`）；
-* 无认证、无 TLS —— 默认只绑回环，要暴露到内网请自己权衡（`bind: 0.0.0.0:3081`）；
+* 无认证、无 TLS —— 默认只绑回环，要暴露到内网请自己权衡（`bind: 0.0.0.0:8000`）；
 * `schema` 是接口版本：**加字段向后兼容，改字段含义必须加版本号**。读者应当拒绝
   自己不认识的 `schema`。
 
@@ -97,13 +98,46 @@ GPU 链路 → 整机 load → 本进程 CPU → 有余量）。
    只报一处就会得出错误结论 —— 详见 `docs/HANDOVER.md` 里的两个测量陷阱。
 3. **`wait_pct` 高不等于丢数**，但等于"没有抖动余量"：它一高，下一次抢占就直接丢包。
 
+### `GET /autospectra.json`
+
+最新写入那一行的**自相关谱**：每站一条曲线（`|Y_j|^2`，也就是该路的功率谱），已降采样成
+画得出来的点数，单位 dB。`ready: false` 表示还没有行写出来（启动后大约一个积分周期）。
+
+**它在写盘端记录，不是从盘上读回来的。** 行在写的时候就在手里（`run.rs` 的 `flush_rows`），
+`j == k` 的那 24 条是这一行 300 个基线里的 24 个（8% 的字节）；读回来要碰的正是这个 run
+正在以 39 MB/s 写入的 NFS —— 而那条写盘路径本身就是要被观察的东西，让它去和监测抢带宽
+是拿被测对象换观测手段。管道是：
+
+| 环节 | 文件 | 知道什么 |
+|---|---|---|
+| 从一行里取出 `j == k` | `run.rs` 的 `flush_rows` | 什么时候一行写完了 |
+| 归纳成每站一条 dB 曲线 | `corr-rs/src/autospectra.rs` | 通道、dB、降采样 |
+| 对外 serve | `status.rs` | HTTP、一个线程、一个监听端口 |
+| 画出来 | `tools/corr-web.py` | 不知道 corr 的任何内部 |
+
+字段：`row_index` / `row_ms`（哪一行、它的墙钟）、`n_freq` / `bin_width_hz`（几何）、
+`points` / `step` / `skip_bins` / `freq_mhz`（频率轴）、`db_ref`（0 dB 是什么）、
+`ymin` / `ymax`（建议刻度，各站共用，这样端口之间的电平差才看得出来）、
+`stations[]`（`name` / `index` / `db[]` / `peak_db` / `peak_mhz` / `median_db`）。
+
+两个刻意的选择：
+
+* **跳过前 1 个通道。** R2C 的 bin 0 是前端直流偏置，实测比带内中位数高 27–51 dB
+  （`autospectra.py` 的 `--skip-bins` 说的是同一件事）。画进去会把其余全部压成一条线。
+* **dB 参考取带内最强通道**，所以 0 dB = 最强的那个通道。`autospectra.py --db` 用的是
+  *含* DC 的最大值 —— 离线图上可以接受，页面里不行。
+
+代价：`monitoring.http.enabled` 打开时，pipeline 线程每行多花几毫秒算这 24 条曲线；
+关掉时连 cell 都不创建，一分钱不花。全分辨率（16384 通道）的谱仍然用
+`tools/autospectra.py` 离线看，它读的就是盘上那些文件。
+
 ## 3. 配套的监测界面
 
 `tools/corr-web.py`：只用 Python 标准库，每秒取一次 `/status.json`，**自己攒历史**
 （接口只给当前快照），页面在 `http://127.0.0.1:8080/`。
 
 ```bash
-tools/corr-web.py                      # 默认取 127.0.0.1:3081
+tools/corr-web.py                      # 端口从配置里读（默认 127.0.0.1:8000）
 tools/corr-web.py --interval 0.5 --history 7200
 ```
 
@@ -119,5 +153,7 @@ stderr 日志（`run-24-nf16384.sh` 会把整段 tee 到 `<output_dir>/corr/<mod
   在接收进程里多一份常驻内存。
 * **不做认证**：默认只绑回环。要跨机看就先解决"谁可以看"这个问题，而不是把一个
   token 塞进这个接口。
+* **不给历史谱**：只 serve 最新那一行。要历史就看 `tools/autospectra.py`（读盘，全分辨率，
+  任意行数平均），或者自己按秒轮询这个端点存起来。
 * **不写 `stats.csv`**：`monitoring.stats_csv` 仍然是"接受并忽略"的字段（见
   `config/README.md`）；需要落盘的曲线交给监测程序。

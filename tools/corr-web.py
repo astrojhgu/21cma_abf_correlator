@@ -2,7 +2,7 @@
 """corr-web —— corr 的独立只读监测界面。
 
 corr 进程自己（`monitoring.http.enabled: true`）在一个独立线程上 serve 一份 JSON
-快照：`GET http://127.0.0.1:3081/status.json`。本程序每秒取一次，自己攒历史，
+快照：`GET http://127.0.0.1:8000/status.json`。本程序每秒取一次，自己攒历史，
 再用一个页面把它画出来。分工是刻意的：
 
   * corr 只提供**当前**一份快照，接口小到可以一眼看完，且不在数据通路上
@@ -18,9 +18,20 @@ corr 进程自己（`monitoring.http.enabled: true`）在一个独立线程上 s
     tools/corr-web.py --url http://127.0.0.1:3099/status.json
     tools/corr-web.py --bind 0.0.0.0:8080   # 让别的机器也能看（内网可见，谨慎）
     tools/corr-web.py --interval 0.5 --history 7200
+    tools/corr-web.py --spectra-interval 0          # 关掉自相关谱那一段
 
 corr 的地址**只定义一处**：配置里的 `monitoring.http.bind`。本程序默认去那份配置里读它
-（读不到才退回 127.0.0.1:3081），所以在配置里改了端口不用在这里再改一次。
+（读不到才退回 127.0.0.1:8000），所以在配置里改了端口不用在这里再改一次。
+
+本程序只做两件事：轮询 corr 的两个只读端点，画出来。
+
+    GET <bind>/status.json        运行状态（每秒）
+    GET <bind>/autospectra.json   最新那一行的自相关谱，每站一条 dB 曲线（默认 5 s）
+
+**自相关谱不是从盘上读回来的**：`j == k` 的那 24 条本来就在写盘端手里（一行 300 个基线
+里的 24 个，8% 的字节），corr 在写这一行时顺手把它们归纳成曲线（见
+`corr-rs/src/autospectra.rs`）。去 NFS 读回来只会和正在跑的写盘抢带宽，而这台机器
+的写盘就是那条要被观察的路径本身。
 
 页面上的 `connected: false` 不是错误，是"corr 现在没在跑或没开接口"——它会把最后
 一份已知快照继续留着，并显示已经断了多久，所以跑完一腿之后仍然能回看。
@@ -37,7 +48,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 取数地址会先试配置里的 `monitoring.http.bind`（见 `read_bind`），因为端口只该在
 # 一处定义；这两个常量是读不到时的退路。
-DEFAULT_URL = "http://127.0.0.1:3081/status.json"
+DEFAULT_URL = "http://127.0.0.1:8000/status.json"
 DEFAULT_BIND = "127.0.0.1:8080"
 DEFAULT_CONFIG = "config/correlator-24-nf16384-manual.yaml"
 
@@ -76,7 +87,7 @@ def read_bind(path):
 
 
 def url_from_bind(bind):
-    """`bind: 0.0.0.0:3081` 是"监听所有地址"，但我们是要**连**过去，不能连 0.0.0.0。"""
+    """`bind: 0.0.0.0:8000` 是"监听所有地址"，但我们是要**连**过去，不能连 0.0.0.0。"""
     host, _, port = bind.rpartition(":")
     if not port:
         return None
@@ -98,25 +109,36 @@ SERIES = [
 class Collector(threading.Thread):
     """每秒取一次 corr 的状态快照，留一份历史。"""
 
-    def __init__(self, url, interval, history):
+    def __init__(self, url, spectra_url, interval, spectra_interval, history):
         super().__init__(daemon=True, name="corr-web-collector")
         self.url = url
+        self.spectra_url = spectra_url
         self.interval = interval
+        self.spectra_interval = spectra_interval
         self.lock = threading.Lock()
         self.samples = deque(maxlen=history)
         self.latest = None
         self.error = None
         self.received_at = None
         self.count = 0
+        self.spectra = None
+        self.spectra_error = None
+        self.spectra_updated = None
         self.stop = threading.Event()
 
+    def _get(self, url, timeout):
+        req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
     def run(self):
+        # Two endpoints, one thread: the page asks for both and they are cheap, and a
+        # second thread would only add a second thing to shut down.
+        last_spectra = 0.0
         while not self.stop.is_set():
             started = time.monotonic()
             try:
-                req = urllib.request.Request(self.url, headers={"Cache-Control": "no-store"})
-                with urllib.request.urlopen(req, timeout=2.0) as resp:
-                    snap = json.loads(resp.read().decode("utf-8"))
+                snap = self._get(self.url, timeout=2.0)
                 with self.lock:
                     if snap.get("ready"):
                         self.latest = snap
@@ -127,7 +149,34 @@ class Collector(threading.Thread):
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 with self.lock:
                     self.error = f"{type(exc).__name__}: {exc}"
+            if self.spectra_interval > 0 and (started - last_spectra) >= self.spectra_interval:
+                last_spectra = started
+                try:
+                    # A bigger timeout: the response carries 24 curves.
+                    data = self._get(self.spectra_url, timeout=10.0)
+                    with self.lock:
+                        self.spectra = data
+                        self.spectra_error = None
+                        self.spectra_updated = time.time()
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    with self.lock:
+                        self.spectra_error = f"{type(exc).__name__}: {exc}"
             self.stop.wait(max(0.0, self.interval - (time.monotonic() - started)))
+
+    def spectra_state(self):
+        with self.lock:
+            return {
+                "ready": self.spectra is not None and bool(self.spectra.get("ready")),
+                "error": self.spectra_error,
+                "updated_at": self.spectra_updated,
+                "now": time.time(),
+                "data": self.spectra,
+                "url": self.spectra_url,
+            }
+
+    def latest_snapshot(self):
+        with self.lock:
+            return self.latest
 
     def state(self):
         """给页面用的紧凑视图：最新快照 + 每条曲线需要的字段。"""
@@ -196,6 +245,16 @@ svg { width:100%; height:80px; display:block; }
 polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
 .chart .last { color:var(--fg); font-size:12px; float:right; }
 .stale { color:var(--warn); }
+.specs { display:grid; gap:8px; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); }
+.spec { background:var(--card); border:1px solid var(--line); border-radius:6px;
+        padding:6px 8px; }
+.spec .n { display:flex; justify-content:space-between; color:var(--fg); font-size:12px; }
+.spec .lvl { color:var(--dim); font-size:10px; margin-top:1px; }
+.spec svg { height:72px; margin-top:4px; }
+.spec polyline { fill:none; stroke:var(--accent); stroke-width:1; }
+.spec.quiet polyline { stroke:#6e7681; }
+.spec .axis { display:flex; justify-content:space-between; color:var(--dim); font-size:10px; }
+.spec .axis .mid { color:var(--dim); }
 </style></head><body>
 <header>
   <h1 id="run">corr 状态</h1>
@@ -221,6 +280,11 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
   </div>
 
   <section><h2>曲线（本程序自己攒的）</h2><div class="charts" id="charts"></div></section>
+
+  <section><h2>自相关谱（每路，dB）</h2>
+    <div class="meta" id="spec-meta">读取中…</div>
+    <div class="specs" id="specs"></div>
+  </section>
 
   <section><h2>每站</h2>
     <table><thead><tr>
@@ -345,8 +409,70 @@ async function tick() {
     conn.textContent = "界面自身取数失败：" + e;
   }
 }
+
+// 自相关谱：一格一路。所有格共用同一段纵轴（d.ymin..d.ymax），这样端口之间的
+// 电平差看得出来 —— 那是这张图一半的用处。
+let specCount = 0;
+async function tickSpectra() {
+  const meta = document.getElementById("spec-meta");
+  let s;
+  try {
+    s = await (await fetch("/api/spectra", { cache: "no-store" })).json();
+  } catch (e) {
+    meta.className = "meta stale";
+    meta.textContent = "频谱取数失败：" + e;
+    return;
+  }
+  if (!s.ready) {
+    meta.className = "meta stale";
+    meta.textContent = "还没有谱：" + (s.error || "读取中…");
+    return;
+  }
+  const d = s.data;
+  const age = s.updated_at ? (s.now - s.updated_at) : 0;
+  const when = d.row_ms ? new Date(d.row_ms).toLocaleTimeString() : "?";
+  meta.className = "meta" + (age > 15 ? " stale" : "");
+  meta.textContent =
+    `第 ${d.row_index} 行（${when}） · ${d.stations.length} 路 · `
+    + `每格 ${d.points} 点（${d.step} 通道/点，跳过前 ${d.skip_bins} 个通道） · `
+    + `${d.freq_mhz[0]}–${d.freq_mhz[1]} MHz · 纵轴 ${d.ymin}..${d.ymax} dB · `
+    + `${d.db_ref} · ${age.toFixed(0)} s 前更新`;
+
+  const box = document.getElementById("specs");
+  if (specCount !== d.stations.length) { box.innerHTML = ""; specCount = d.stations.length; }
+  const span = Math.max(1e-9, d.ymax - d.ymin);
+  d.stations.forEach((st, i) => {
+    let el = box.children[i];
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "spec";
+      el.innerHTML = '<div class="n"><span class="nm"></span><span class="pk"></span></div>'
+        + '<svg viewBox="0 0 300 72" preserveAspectRatio="none"><polyline points=""/></svg>'
+        + '<div class="lvl"></div><div class="axis"></div>';
+      box.appendChild(el);
+    }
+    el.querySelector(".nm").textContent = `${st.name}  (${st.index},${st.index})`;
+    el.querySelector(".pk").textContent = st.db.length ? `${st.peak_db.toFixed(1)} dB` : "—";
+    el.querySelector(".lvl").textContent = st.db.length
+      ? `峰 ${st.peak_mhz} MHz · 中位 ${st.median_db.toFixed(1)} dB`
+      : "无数据";
+    el.querySelector(".axis").innerHTML =
+      `<span>${d.freq_mhz[0]}</span><span class="mid">MHz</span><span>${d.freq_mhz[1]}</span>`;
+    el.classList.toggle("quiet", !st.db.length);
+    const n = Math.max(st.db.length - 1, 1);
+    el.querySelector("polyline").setAttribute("points", st.db.map((v, k) => {
+      const x = (k / n) * 300;
+      const y = 70 - Math.min(Math.max((v - d.ymin) / span, 0), 1) * 68;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(" "));
+  });
+}
+
 tick();
 setInterval(tick, 1000);
+tickSpectra();
+// 服务端每 --spectra-interval 秒才重读一次盘（默认 5 s），所以这里也按 5 s 取。
+setInterval(tickSpectra, 5000);
 </script></body></html>
 """
 
@@ -361,6 +487,9 @@ class Handler(BaseHTTPRequestHandler):
             body, ctype = PAGE.encode("utf-8"), "text/html; charset=utf-8"
         elif path == "/api/state":
             body = json.dumps(self.collector.state()).encode("utf-8")
+            ctype = "application/json"
+        elif path == "/api/spectra":
+            body = json.dumps(self.collector.spectra_state()).encode("utf-8")
             ctype = "application/json"
         else:
             body, ctype = b'{"error":"no such path"}', "application/json"
@@ -398,6 +527,8 @@ def main():
                     help=f"本程序的监听地址（默认 {DEFAULT_BIND}）")
     ap.add_argument("--interval", type=float, default=1.0, help="取数间隔秒（默认 1）")
     ap.add_argument("--history", type=int, default=3600, help="内存里保留多少个样本")
+    ap.add_argument("--spectra-interval", type=float, default=5.0,
+                    help="自相关谱的取数间隔秒，0 = 不取（默认 5）")
     args = ap.parse_args()
 
     url, source = args.url, "--url"
@@ -407,13 +538,18 @@ def main():
         source = f"{args.config} 的 monitoring.http.bind"
     if not url:
         url, source = DEFAULT_URL, "默认值（没读到配置）"
-    collector = Collector(url, args.interval, args.history)
+    # The two endpoints sit next to each other on the same server.
+    spectra_url = url.rsplit("/", 1)[0] + "/autospectra.json"
+    collector = Collector(url, spectra_url, args.interval, args.spectra_interval, args.history)
     collector.start()
     host, port = split_bind(args.bind)
     Handler.collector = collector
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"corr-web: 页面 http://{host}:{port}/  取数 {url}（{source}），"
           f"每 {args.interval}s，保留 {args.history} 个样本", flush=True)
+    if args.spectra_interval > 0:
+        print(f"corr-web: 自相关谱取 {spectra_url}，每 {args.spectra_interval}s 一次",
+              flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
