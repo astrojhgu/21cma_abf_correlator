@@ -100,7 +100,7 @@ sleep 6
 RUN_ROOT="$OUT"
 export RUN_ROOT
 python3 - > "$OUT/switch-times.tsv" <<'POLL' &
-import os, time
+import os, re, time
 parent = os.environ["RUN_ROOT"]
 deadline = time.time() + float(os.environ.get("POLL_SECS", "900"))
 root = parent
@@ -115,10 +115,13 @@ while time.time() < deadline:
     if subdirs:
         root = os.path.join(parent, subdirs[-1])
         for name in os.listdir(root):
-            if not name.endswith("baseline_0000_j00_k00.bin"):
+            # A set announces itself through its metadata; the tag is the name
+            # without that suffix. The sidecar that grows every row is time.bin,
+            # so its mtime is what says the set is still being written.
+            if not name.endswith("-metadata.yaml"):
                 continue
-            prefix = name[: -len("baseline_0000_j00_k00.bin")]
-            path = os.path.join(root, name)
+            prefix = name[: -len("-metadata.yaml")]
+            path = os.path.join(root, prefix + "-time.bin")
             # Everything is timestamped with *this* process's clock. The file
             # system's own mtime is not usable here: the shared /scratch reports
             # mtimes about thirteen minutes behind the wall clock, so comparing one
@@ -134,10 +137,13 @@ while time.time() < deadline:
                 last_change[prefix] = time.time()
             if prefix not in lastname:
                 try:
-                    txt = open(os.path.join(root, prefix + "metadata.yaml")).read()
-                    n = int([l for l in txt.splitlines() if l.startswith("n_baseline:")][0].split(":")[1])
-                    st = int([l for l in txt.splitlines() if l.startswith("n_station:")][0].split(":")[1])
-                    lastname[prefix] = f"baseline_{n-1:04d}_j{st-1:02d}_k{st-1:02d}.bin"
+                    txt = open(os.path.join(root, prefix + "-metadata.yaml")).read()
+                    # The set's metadata lists every baseline's file name; the last
+                    # entry is the last file it creates, so its arrival means the
+                    # set is complete.
+                    files = re.findall(r"file: (\S+?)\}", txt)
+                    if files:
+                        lastname[prefix] = files[-1]
                 except Exception:
                     pass
             if prefix in lastname and prefix not in ready:
@@ -160,6 +166,8 @@ RUN_DIR=$(ls -d "$OUT"/corr_*/ | head -1)
 echo
 echo "checking $RUN_DIR"
 
+FILE_PREFIX_FORMAT=$(python3 -c "import yaml;print(yaml.safe_load(open('$CFG'))['storage'].get('file_prefix_format','%Y%m%d-%H%M%S'))")
+export FILE_PREFIX_FORMAT
 python3 - "$RUN_DIR" <<'PY'
 import os, re, struct, sys, time
 sys.path.insert(0, "tools")   # corr_common: the same set discovery the other tools use
@@ -215,10 +223,16 @@ check(len(sets) >= 2, "a second file set appeared (the day changed under the run
 if len(sets) < 2:
     sys.exit(1)
 
-# 2. prefix == local time of the set's own first row
+# 2. the set's stamp is the local time of its own first row, and its tag is the
+#    configured prefix followed by that stamp
+fmt = os.environ.get("FILE_PREFIX_FORMAT") or "%Y%m%d-%H%M%S"
 for i in info:
-    want = time.strftime("%Y%m%d_%H%M%S", time.localtime(i["ms"][0] / 1000.0))
-    check(i["s"]["prefix"] == want, f"prefix names its own first row ({i['s']['prefix']!r} vs {want!r})")
+    want = time.strftime(fmt, time.localtime(i["ms"][0] / 1000.0))
+    fp = cc.metadata_field(i["s"], "file_prefix") or ""
+    stamp = cc.metadata_field(i["s"], "stamp") or ""
+    check(stamp == want, f"stamp names its own first row ({stamp!r} vs {want!r})")
+    check(i["s"]["prefix"] == fp + stamp,
+          f"tag is the prefix plus the stamp ({i['s']['prefix']!r} vs {fp + stamp!r})")
 
 # 1+6. different days, and the boundary row attributed by its start
 n_cum = info[0]["n_cum"]
@@ -258,9 +272,11 @@ def mtime(path):
     except FileNotFoundError:
         return None
 
-def baseline_zero(d, prefix, plan_pairs_first=(0, 0)):
-    j, k = plan_pairs_first
-    return os.path.join(d, f"{prefix}baseline_0000_j{j:02d}_k{k:02d}.bin")
+def baseline_zero(d, prefix):
+    # corr_common reads the names out of the set's metadata, so this works for
+    # both layouts and does not repeat the naming rule here.
+    b = cc.set_baselines(d, prefix=prefix)
+    return b[0][3] if b else os.path.join(d, "missing-baseline")
 
 periods = []
 for i in info:

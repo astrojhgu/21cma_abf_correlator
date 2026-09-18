@@ -1,20 +1,29 @@
 //! Output: one raw spectrum file per baseline, plus sidecar files, in **sets**.
 //!
-//! Layout of a run directory (the prefix is empty when `storage.daily_files` is
-//! off, which is the old behaviour):
+//! Layout of a set, with `<P>` = `storage.file_prefix` (empty by default) and
+//! `<T>` = the local time of the set's first row, formatted with
+//! `storage.file_prefix_format` (`20260918-144142` by default):
 //!
 //! ```text
-//!   <prefix>baseline_0000_j00_k00.bin   complex64[ntime][n_freq], one row per integration
-//!   ...
-//!   <prefix>rows_ms.bin                 int64 little-endian Unix milliseconds, one per row
-//!   <prefix>rows_ms.txt                 "<row_index> <ms>" per line
-//!   <prefix>blocks.csv                  row_index, station, frame range, per-station valid frames
-//!   <prefix>metadata.yaml               everything needed to read the raw files
+//!   <P><station_j><station_k>-<T>.bin   complex64[ntime][n_freq], one row per integration
+//!   ...                                 one per baseline, j <= k, station names
+//!   <P><T>-time.bin                     int64 little-endian Unix milliseconds, one per row
+//!   <P><T>-time.txt                     "<row_index> <ms>" per line
+//!   <P><T>-blocks.csv                   row_index, station, frame range, valid frames
+//!   <P><T>-metadata.yaml                everything needed to read the raw files
 //! ```
 //!
+//! Nothing is inserted between the halves, so an empty prefix reads
+//! `S01W17-20260918-144142.bin` and `20260918-144142-time.txt`, while
+//! `file_prefix: "corr24-"` reads `corr24-S01W17-20260918-144142.bin` and
+//! `corr24-20260918-144142-time.txt`. A file is identified by the station pair it
+//! correlates and the time it starts at, which is what a person looking at the
+//! directory wants to know; the tag `<P><T>` is the set's identity and is what
+//! `--set` takes.
+//!
 //! A **set** is the four sidecars plus one file per baseline -- 304 files for the
-//! 24-station geometry -- sharing one prefix. The prefix names the *local* day and
-//! the *local* time of the set's first row, so a file set holds the day it says it
+//! 24-station geometry -- sharing one tag. The tag names the *local* day and the
+//! *local* time of the set's first row, so a file set holds the day it says it
 //! holds, and the boundary between two days is a boundary between two sets
 //! (docs/DESIGN-daily-files.md).
 //!
@@ -56,11 +65,67 @@ pub fn baseline_row_bytes(n_freq: u32) -> usize {
     n_freq as usize * 8 // complex64
 }
 
-/// Name of one baseline's raw file. Zero padded so that a directory listing is
-/// in baseline order, and carrying (j, k) so a file can be identified without
-/// reading metadata.yaml. The set prefix is prepended by the writer.
-pub fn baseline_file_name(index: usize, j: usize, k: usize) -> String {
-    format!("baseline_{index:04}_j{j:02}_k{k:02}.bin")
+/// How one set's files are named.
+///
+/// One place, because the writer, the resume scan, `--set` and every reader in
+/// `tools/` have to agree on it; a naming rule spread over five call sites is a
+/// naming rule that drifts. See the module documentation for the layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetNames {
+    /// `storage.file_prefix`, put verbatim at the front; empty by default.
+    pub file_prefix: String,
+    /// Local time of this set's first row, from `storage.file_prefix_format`.
+    pub stamp: String,
+}
+
+impl SetNames {
+    pub fn new(file_prefix: &str, stamp: &str) -> Self {
+        SetNames {
+            file_prefix: file_prefix.to_string(),
+            stamp: stamp.to_string(),
+        }
+    }
+
+    /// The set's identity: `<prefix><stamp>`, which is what goes into
+    /// `metadata.yaml` as `set_prefix`, what `--set` matches, and what the sidecar
+    /// names are built from.
+    ///
+    /// No separator is inserted between the two halves: whatever `file_prefix`
+    /// ends with is what the name has (write `corr24-` to get `corr24-20260918-...`).
+    /// An implicit separator would double up on a prefix that already ends in one,
+    /// which is exactly what a prefix is for.
+    pub fn tag(&self) -> String {
+        format!("{}{}", self.file_prefix, self.stamp)
+    }
+
+    /// `<prefix><station_j><station_k>-<stamp>.bin`.
+    ///
+    /// The station pair comes first so that a directory listing groups by pair,
+    /// and so that a file can be identified without reading `metadata.yaml`. It
+    /// also means the tag cannot be recovered from a baseline's name alone --
+    /// which is why `discover_sets` goes by the sidecars.
+    pub fn baseline(&self, station_j: &str, station_k: &str) -> String {
+        format!(
+            "{}{}{}-{}.bin",
+            self.file_prefix, station_j, station_k, self.stamp
+        )
+    }
+
+    pub fn time_txt(&self) -> String {
+        format!("{}-time.txt", self.tag())
+    }
+
+    pub fn time_bin(&self) -> String {
+        format!("{}-time.bin", self.tag())
+    }
+
+    pub fn blocks(&self) -> String {
+        format!("{}-blocks.csv", self.tag())
+    }
+
+    pub fn metadata(&self) -> String {
+        format!("{}-metadata.yaml", self.tag())
+    }
 }
 
 /// How a set came to exist, recorded in its metadata so a reader can tell a
@@ -138,7 +203,10 @@ struct SetFiles {
 /// One set found in the directory, from its metadata and file lengths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FoundSet {
+    /// The set's tag (`<prefix>-<stamp>`), which is what `--set` takes.
     pub prefix: String,
+    /// How its files are named, read back from the set's own metadata.
+    pub names: SetNames,
     /// Local day the set belongs to, from its metadata.
     pub day: String,
     pub kind: String,
@@ -272,9 +340,15 @@ impl Writer {
             truncated_rows: 0,
         };
         if !daily {
-            // The historical layout: one nameless set, created now, exactly as
-            // before this feature existed.
-            let (w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, "", None)?;
+            // No per-day splitting: one set for the whole run, stamped with the
+            // local time the writer opened it. The files still carry the station
+            // pair and a time, so a name stays self-describing; what is gone is
+            // the rollover at the local midnight (docs/DESIGN-daily-files.md).
+            let names = SetNames::new(
+                &cfg.storage.file_prefix,
+                &local_stamp_at(crate::sched::system_ms(), &cfg.storage.file_prefix_format),
+            );
+            let (w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, &names, None)?;
             return Ok((w, st));
         }
 
@@ -340,7 +414,8 @@ impl Writer {
         // Appending to an existing set: the config hash has to agree, or the two
         // geometries would be mixed into one file set. The message names the way
         // out, because the alternative is an operator guessing.
-        let (mut w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, &set.prefix, Some(&set))
+        let (mut w, st) =
+            Self::open_set(dir, plan, cfg, config_hash, fsync_every, &set.names, Some(&set))
             .map_err(|e| {
                 if matches!(policy, SetPolicy::Auto) {
                     e.context(format!(
@@ -359,7 +434,7 @@ impl Writer {
         Ok((w, st))
     }
 
-    /// Open one set, with `prefix` already chosen (empty means the legacy layout).
+    /// Open one set, whose naming has already been decided.
     ///
     /// `found` is the discovered metadata of that set when it already exists;
     /// `None` means "this set is being created now".
@@ -369,10 +444,13 @@ impl Writer {
         cfg: &Config,
         config_hash: &str,
         fsync_every: u64,
-        prefix: &str,
+        names: &SetNames,
         found: Option<&FoundSet>,
     ) -> Result<(Self, ResumeState)> {
-        let name = |n: &str| dir.join(format!("{prefix}{n}"));
+        // One file per baseline, named by the two stations it correlates.
+        let baseline_path = |j: usize, k: usize| {
+            dir.join(names.baseline(&plan.enabled[j].name, &plan.enabled[k].name))
+        };
 
         let n_baseline = plan.n_baseline;
         let per_baseline_row = baseline_row_bytes(plan.n_freq);
@@ -385,8 +463,8 @@ impl Writer {
         // --- work out how many complete rows exist, and where to resume ---
         let mut complete = u64::MAX;
         let mut sizes: Vec<u64> = Vec::with_capacity(n_baseline);
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = name(&baseline_file_name(idx, *j, *k));
+        for (j, k) in plan.baseline_pairs().iter() {
+            let p = baseline_path(*j, *k);
             let len = match std::fs::metadata(&p) {
                 Ok(m) => m.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -400,10 +478,10 @@ impl Writer {
         }
         let complete = if complete == u64::MAX { 0 } else { complete };
 
-        let ms_len = file_len(&name("rows_ms.bin"))?;
+        let ms_len = file_len(&dir.join(names.time_bin()))?;
         let ms_rows = ms_len / 8;
         // blocks.csv has one line per station per row.
-        let blocks_rows = count_csv_rows(&name("blocks.csv"))? / plan.n_station.max(1) as u64;
+        let blocks_rows = count_csv_rows(&dir.join(names.blocks()))? / plan.n_station.max(1) as u64;
         // The shortest file wins: a crash can only ever leave one of them short,
         // and taking the minimum means we re-write a row rather than claim one
         // that is not fully there.
@@ -412,7 +490,7 @@ impl Writer {
 
         // --- truncate everything back to that prefix ---
         for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = name(&baseline_file_name(idx, *j, *k));
+            let p = baseline_path(*j, *k);
             let want = rows_written * baseline_bytes as u64;
             if sizes.get(idx).copied().unwrap_or(0) != want {
                 let f = OpenOptions::new()
@@ -425,21 +503,28 @@ impl Writer {
                     .with_context(|| format!("truncating {} to {want} bytes", p.display()))?;
             }
         }
-        truncate_file(&name("rows_ms.bin"), rows_written * 8)?;
+        truncate_file(&dir.join(names.time_bin()), rows_written * 8)?;
         // blocks.csv carries one line per station per row.
-        truncate_csv(&name("blocks.csv"), rows_written * plan.n_station as u64)?;
-        // rows_ms.txt is a derived view of rows_ms.bin, so it is rebuilt rather
+        truncate_csv(
+            &dir.join(names.blocks()),
+            rows_written * plan.n_station as u64,
+        )?;
+        // The text view is derived from the binary one, so it is rebuilt rather
         // than truncated: two files that are supposed to agree are easier to keep
         // in step by regenerating one from the other than by truncating both.
-        rebuild_ms_text(&name("rows_ms.bin"), &name("rows_ms.txt"), rows_written)?;
+        rebuild_ms_text(
+            &dir.join(names.time_bin()),
+            &dir.join(names.time_txt()),
+            rows_written,
+        )?;
 
         // --- the previous row's frame range, for resuming the grid ---
-        let next_frame_id = read_last_block_first_frame(&name("blocks.csv"), plan.n_cum)?;
+        let next_frame_id = read_last_block_first_frame(&dir.join(names.blocks()), plan.n_cum)?;
 
         // --- open everything for appending ---
         let mut baselines = Vec::with_capacity(n_baseline);
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = name(&baseline_file_name(idx, *j, *k));
+        for (j, k) in plan.baseline_pairs().iter() {
+            let p = baseline_path(*j, *k);
             let mut f = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -457,12 +542,12 @@ impl Writer {
         // truncation. Opening without seeking leaves the position at zero, so a
         // resumed run silently overwrites its own sidecars from the start --
         // measured: 98 rows of spectrum with 49 timestamps and 49 block records.
-        let mut ms_bin = open_rw(&name("rows_ms.bin"))?;
+        let mut ms_bin = open_rw(&dir.join(names.time_bin()))?;
         ms_bin.seek(SeekFrom::Start(rows_written * 8))?;
-        let mut ms_txt_file = open_rw(&name("rows_ms.txt"))?;
+        let mut ms_txt_file = open_rw(&dir.join(names.time_txt()))?;
         ms_txt_file.seek(SeekFrom::End(0))?;
         let ms_txt = BufWriter::new(ms_txt_file);
-        let mut blocks_file = open_rw(&name("blocks.csv"))?;
+        let mut blocks_file = open_rw(&dir.join(names.blocks()))?;
         blocks_file.seek(SeekFrom::End(0))?;
         let blocks = BufWriter::new(blocks_file);
 
@@ -473,7 +558,7 @@ impl Writer {
         // than checked: a crash between creating the files and writing metadata
         // leaves a set nobody has described yet, and the geometry in hand is the
         // only description available.
-        let meta_path = name("metadata.yaml");
+        let meta_path = dir.join(names.metadata());
         let created_now = rows_written == 0 || !meta_path.exists();
         if created_now {
             let day = found
@@ -484,7 +569,7 @@ impl Writer {
                 plan,
                 cfg,
                 config_hash,
-                prefix,
+                names,
                 &day,
                 SetKind::Start,
                 None,
@@ -503,7 +588,7 @@ impl Writer {
         Ok((
             Writer {
                 dir: dir.to_path_buf(),
-                prefix: prefix.to_string(),
+                prefix: names.tag(),
                 daily: cfg.storage.daily_files,
                 plan: plan.clone(),
                 cfg: cfg.clone(),
@@ -554,15 +639,21 @@ impl Writer {
         kind: SetKind,
         continuation: Option<String>,
     ) -> Result<()> {
-        let prefix = local_stamp_at(row_ms, &self.cfg.storage.file_prefix_format);
+        // The set's identity is the configured prefix plus the local time of its
+        // first row; the files inside it are named from the same two halves.
+        let names = SetNames::new(
+            &self.cfg.storage.file_prefix,
+            &local_stamp_at(row_ms, &self.cfg.storage.file_prefix_format),
+        );
         let mut last: Option<anyhow::Error> = None;
         for attempt in 1..=3 {
-            match self.try_create_set(&prefix, day, kind, continuation.clone(), blocks) {
+            match self.try_create_set(&names, day, kind, continuation.clone(), blocks) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     eprintln!(
-                        "writer: opening file set {prefix} for local day {day} failed \
-                         (attempt {attempt}/3): {e}"
+                        "writer: opening file set {} for local day {day} failed \
+                         (attempt {attempt}/3): {e}",
+                        names.tag()
                     );
                     last = Some(e);
                     if attempt < 3 {
@@ -572,37 +663,48 @@ impl Writer {
             }
         }
         Err(anyhow::Error::new(RolloverFailed {
-            prefix,
+            prefix: names.tag(),
             detail: format!("{:#}", last.expect("three attempts set it")),
         }))
     }
 
     fn try_create_set(
         &mut self,
-        prefix: &str,
+        names: &SetNames,
         day: &str,
         kind: SetKind,
         continuation: Option<String>,
         blocks: &RowBlock,
     ) -> Result<()> {
-        let name = |n: &str| self.dir.join(format!("{prefix}{n}"));
-        // A prefix that already holds rows belongs to a set somebody else is
-        // writing (or wrote); reusing it would interleave two processes' rows.
-        // An empty one is a half-created set from a failed attempt: reuse it.
-        let probe = name(&baseline_file_name(0, 0, 0));
+        let baseline_path = |plan: &RunPlan, j: usize, k: usize| {
+            self.dir
+                .join(names.baseline(&plan.enabled[j].name, &plan.enabled[k].name))
+        };
+        // A set that already holds rows belongs to somebody else's run; reusing
+        // its tag would interleave two processes' rows. An empty file is a
+        // half-created set from a failed attempt: reuse it.
+        let (j0, k0) = self
+            .plan
+            .baseline_pairs()
+            .first()
+            .copied()
+            .unwrap_or((0, 0));
+        let probe = baseline_path(&self.plan, j0, k0);
         if let Ok(m) = std::fs::metadata(&probe) {
             if m.len() > 0 {
                 bail!(
-                    "{} already holds {} bytes: the prefix {prefix} is in use",
+                    "{} already holds {} bytes: the set tag {} is in use",
                     probe.display(),
-                    m.len()
+                    m.len(),
+                    names.tag()
                 );
             }
         }
 
         let mut baselines = Vec::with_capacity(self.n_baseline);
-        for (idx, (j, k)) in self.plan.baseline_pairs().iter().enumerate() {
-            let p = name(&baseline_file_name(idx, *j, *k));
+        let pairs = self.plan.baseline_pairs();
+        for (j, k) in pairs.iter() {
+            let p = baseline_path(&self.plan, *j, *k);
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
@@ -611,35 +713,38 @@ impl Writer {
                 .with_context(|| format!("creating {}", p.display()))?;
             baselines.push(f);
         }
+        let time_bin_path = self.dir.join(names.time_bin());
+        let time_txt_path = self.dir.join(names.time_txt());
+        let blocks_path = self.dir.join(names.blocks());
         let ms_bin = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(name("rows_ms.bin"))
-            .with_context(|| format!("creating {}", name("rows_ms.bin").display()))?;
+            .open(&time_bin_path)
+            .with_context(|| format!("creating {}", time_bin_path.display()))?;
         let ms_txt = BufWriter::new(
             OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(name("rows_ms.txt"))
-                .with_context(|| format!("creating {}", name("rows_ms.txt").display()))?,
+                .open(&time_txt_path)
+                .with_context(|| format!("creating {}", time_txt_path.display()))?,
         );
         let blocks_file = BufWriter::new(
             OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(name("blocks.csv"))
-                .with_context(|| format!("creating {}", name("blocks.csv").display()))?,
+                .open(&blocks_path)
+                .with_context(|| format!("creating {}", blocks_path.display()))?,
         );
 
         write_metadata(
-            &name("metadata.yaml"),
+            &self.dir.join(names.metadata()),
             &self.plan,
             &self.cfg,
             &self.config_hash,
-            prefix,
+            names,
             day,
             kind,
             continuation.as_deref(),
@@ -647,7 +752,7 @@ impl Writer {
             0,
         )?;
 
-        self.prefix = prefix.to_string();
+        self.prefix = names.tag();
         self.set_day = Some(day.to_string());
         self.set_kind = kind;
         self.set_continuation_of = continuation;
@@ -886,13 +991,16 @@ pub fn decide(current_day: Option<&str>, row_day: &str) -> Decision {
 
 /// Every set already present in `dir`, from their metadata and file lengths.
 ///
-/// A set is recognised by the presence of baseline 0 under a prefix, and its day
-/// comes from that set's own metadata rather than from parsing the prefix: the
-/// prefix format is configurable, so parsing it would be a second, drifting
-/// definition of what the name means.
+/// Every file set in `dir`, sorted by tag, with the naming read back from each
+/// set's own metadata.
+///
+/// A set is recognised by its `<tag>-blocks.csv`, and the two halves its file
+/// names are built from (`file_prefix` and `stamp`) come from that set's
+/// metadata rather than from parsing the tag: a prefix is free text that may
+/// itself contain the separator, so parsing would be a second, drifting
+/// definition of what a name means. A set whose metadata predates this layout is
+/// skipped -- this binary would open files that are not there.
 pub fn discover_sets(dir: &Path, plan: &RunPlan) -> Result<Vec<FoundSet>> {
-    let (j0, k0) = plan.baseline_pairs().first().copied().unwrap_or((0, 0));
-    let suffix = baseline_file_name(0, j0, k0);
     let per_baseline_row = baseline_row_bytes(plan.n_freq) as u64;
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -903,35 +1011,39 @@ pub fn discover_sets(dir: &Path, plan: &RunPlan) -> Result<Vec<FoundSet>> {
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(prefix) = name.strip_suffix(&suffix).filter(|p| !p.is_empty()) else {
-            continue; // the legacy unprefixed layout, or another file
+        let Some(tag) = name.strip_suffix("-blocks.csv") else {
+            continue;
         };
-        let prefix = prefix.to_string();
-        let meta = dir.join(format!("{prefix}metadata.yaml"));
+        let meta = dir.join(format!("{tag}-metadata.yaml"));
+        let Some(stamp) = read_metadata_field(&meta, "stamp") else {
+            continue; // laid out before the names changed; not ours to resume
+        };
+        let names = SetNames::new(
+            &read_metadata_field(&meta, "file_prefix").unwrap_or_default(),
+            &stamp,
+        );
         let day = read_metadata_field(&meta, "set_day").unwrap_or_default();
         let kind = read_metadata_field(&meta, "set_kind").unwrap_or_default();
         // Complete rows: the shortest of the set's own files, as on resume.
         let mut rows = u64::MAX;
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = dir.join(format!("{prefix}{}", baseline_file_name(idx, *j, *k)));
+        for (j, k) in plan.baseline_pairs().iter() {
+            let p = dir.join(names.baseline(&plan.enabled[*j].name, &plan.enabled[*k].name));
             let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
             rows = rows.min(len / per_baseline_row.max(1));
         }
-        let ms_rows = file_len(&dir.join(format!("{prefix}rows_ms.bin")))? / 8;
-        let block_rows =
-            count_csv_rows(&dir.join(format!("{prefix}blocks.csv")))? / plan.n_station.max(1) as u64;
         if rows == u64::MAX {
             rows = 0;
         }
+        let time_rows = file_len(&dir.join(names.time_bin()))? / 8;
+        let block_rows =
+            count_csv_rows(&dir.join(names.blocks()))? / plan.n_station.max(1) as u64;
         out.push(FoundSet {
-            next_frame_id: read_last_block_first_frame(
-                &dir.join(format!("{prefix}blocks.csv")),
-                plan.n_cum,
-            )?,
-            prefix,
+            next_frame_id: read_last_block_first_frame(&dir.join(names.blocks()), plan.n_cum)?,
+            prefix: tag.to_string(),
+            names,
             day,
             kind,
-            rows_written: rows.min(ms_rows).min(block_rows),
+            rows_written: rows.min(time_rows).min(block_rows),
         });
     }
     out.sort_by(|a, b| a.prefix.cmp(&b.prefix));
@@ -1067,7 +1179,7 @@ fn write_metadata(
     plan: &RunPlan,
     cfg: &Config,
     hash: &str,
-    prefix: &str,
+    names: &SetNames,
     day: &str,
     kind: SetKind,
     continuation_of: Option<&str>,
@@ -1106,8 +1218,15 @@ fn write_metadata(
     let _ = writeln!(s, "baseline_row_bytes: {}", baseline_row_bytes(plan.n_freq));
 
     // --- this set's identity ---
+    //
+    // `file_prefix` and `stamp` are the two halves the *file names* are built
+    // from, written separately because they cannot be told apart once joined: a
+    // prefix is free text and may contain the separator. A reader needs them to
+    // reconstruct a baseline's name, which no longer starts with the tag.
     let _ = writeln!(s, "# --- the file set this metadata belongs to ---");
-    let _ = writeln!(s, "set_prefix: {prefix}");
+    let _ = writeln!(s, "set_prefix: {}", names.tag());
+    let _ = writeln!(s, "file_prefix: {}", names.file_prefix);
+    let _ = writeln!(s, "stamp: {}", names.stamp);
     let _ = writeln!(s, "set_day: {day}");
     let _ = writeln!(s, "set_kind: {}", kind.as_str());
     if let Some(prev) = continuation_of {
@@ -1143,16 +1262,17 @@ fn write_metadata(
             cfg.stations[st.cfg_index].board
         );
     }
+    // Each baseline's actual file name, so a reader never has to reconstruct the
+    // naming rule: the writer is the only thing that knows it for certain.
     let _ = writeln!(s, "baselines:");
     for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
         let _ = writeln!(
             s,
-            "  - {{index: {}, j: {}, k: {}, file: {}{}}}",
+            "  - {{index: {}, j: {}, k: {}, file: {}}}",
             idx,
             j,
             k,
-            prefix,
-            baseline_file_name(idx, *j, *k)
+            names.baseline(&plan.enabled[*j].name, &plan.enabled[*k].name)
         );
     }
     std::fs::write(p, s).with_context(|| format!("writing {}", p.display()))?;
@@ -1213,9 +1333,9 @@ mod tests {
         (cfg, plan)
     }
 
-    /// Every set in `dir`, by prefix, with its (rows_ms.bin length, blocks rows).
+    /// Every set in `dir`, by tag, with its (time.bin length, blocks rows).
     ///
-    /// `rows_ms.bin` is an unbuffered file, so its length is exact at any moment.
+    /// `time.bin` is an unbuffered file, so its length is exact at any moment.
     /// `blocks.csv` goes through a `BufWriter` and is only flushed when the set is
     /// closed or the fsync cadence comes round, so for a set still being written
     /// the second number lags by up to a buffer -- which is why the assertions
@@ -1224,15 +1344,15 @@ mod tests {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir).unwrap() {
             let name = entry.unwrap().file_name().to_string_lossy().into_owned();
-            let Some(prefix) = name.strip_suffix("rows_ms.bin") else {
+            let Some(tag) = name.strip_suffix("-blocks.csv") else {
                 continue;
             };
-            let prefix = prefix.to_string();
-            let ms = std::fs::metadata(dir.join(format!("{prefix}rows_ms.bin")))
+            let prefix = tag.to_string();
+            let ms = std::fs::metadata(dir.join(format!("{tag}-time.bin")))
                 .map(|m| m.len())
                 .unwrap_or(0)
                 / 8;
-            let blocks = std::fs::read_to_string(dir.join(format!("{prefix}blocks.csv")))
+            let blocks = std::fs::read_to_string(dir.join(format!("{tag}-blocks.csv")))
                 .map(|s| s.lines().count() as u64)
                 .unwrap_or(0)
                 / plan.n_station.max(1) as u64;
@@ -1242,13 +1362,68 @@ mod tests {
         out
     }
 
-    fn baseline_paths(dir: &Path, plan: &RunPlan, prefix: &str) -> Vec<PathBuf> {
-        plan.baseline_pairs()
-            .iter()
-            .enumerate()
-            .map(|(i, (j, k))| dir.join(format!("{prefix}{}", baseline_file_name(i, *j, *k))))
+    /// The naming a set with this tag was written with, read from its metadata.
+    fn names_for(dir: &Path, tag: &str) -> SetNames {
+        let meta = dir.join(format!("{tag}-metadata.yaml"));
+        SetNames::new(
+            &read_metadata_field(&meta, "file_prefix").unwrap_or_default(),
+            &read_metadata_field(&meta, "stamp").expect("stamp is in the metadata"),
+        )
+    }
+
+    /// The tag of the only set in `dir` (the tests here write one).
+    fn only_tag(dir: &Path) -> String {
+        let mut tags: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.strip_suffix("-metadata.yaml").map(str::to_string)
+            })
+            .collect();
+        tags.sort();
+        assert_eq!(tags.len(), 1, "expected one set in {}, found {tags:?}", dir.display());
+        tags.pop().unwrap()
+    }
+
+    fn names_of(dir: &Path) -> SetNames {
+        names_for(dir, &only_tag(dir))
+    }
+
+    /// One baseline's file, by index into `plan.baseline_pairs()`.
+    fn baseline_path(dir: &Path, plan: &RunPlan, idx: usize) -> PathBuf {
+        let (j, k) = plan.baseline_pairs()[idx];
+        dir.join(names_of(dir).baseline(&plan.enabled[j].name, &plan.enabled[k].name))
+    }
+
+    fn time_bin_path(dir: &Path) -> PathBuf {
+        dir.join(names_of(dir).time_bin())
+    }
+
+    fn time_txt_path(dir: &Path) -> PathBuf {
+        dir.join(names_of(dir).time_txt())
+    }
+
+    fn blocks_path(dir: &Path) -> PathBuf {
+        dir.join(names_of(dir).blocks())
+    }
+
+    fn metadata_path(dir: &Path) -> PathBuf {
+        dir.join(names_of(dir).metadata())
+    }
+
+/// One baseline of a named set, for the tests that write two sets in one run.
+    fn baseline_path_for_tag(dir: &Path, plan: &RunPlan, tag: &str, idx: usize) -> PathBuf {
+        let (j, k) = plan.baseline_pairs()[idx];
+        dir.join(names_for(dir, tag).baseline(&plan.enabled[j].name, &plan.enabled[k].name))
+    }
+
+    fn baseline_paths_for_tag(dir: &Path, plan: &RunPlan, tag: &str) -> Vec<PathBuf> {
+        (0..plan.n_baseline)
+            .map(|i| baseline_path_for_tag(dir, plan, tag, i))
             .collect()
     }
+
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -1348,14 +1523,14 @@ mod tests {
         let p1 = w.set_prefix().to_string();
         let fmt = cfg.storage.file_prefix_format.clone();
         assert_eq!(p1, local_stamp_at(t0, &fmt), "prefix is the first row's local time");
-        let meta1 = d.path().join(format!("{p1}metadata.yaml"));
+        let meta1 = d.path().join(format!("{p1}-metadata.yaml"));
         assert_eq!(read_metadata_field(&meta1, "set_day").as_deref(), Some(local_day_at(t0).as_str()));
         assert_eq!(read_metadata_field(&meta1, "set_kind").as_deref(), Some("start"));
         assert_eq!(read_metadata_field(&meta1, "set_prefix").as_deref(), Some(p1.as_str()));
         assert_eq!(read_metadata_field(&meta1, "first_row_index").as_deref(), Some("0"));
         assert_eq!(read_metadata_field(&meta1, "first_frame_id").as_deref(), Some("0"));
         // Every baseline file of the set exists with exactly one row in it.
-        for p in baseline_paths(d.path(), &plan, &p1) {
+        for p in baseline_paths_for_tag(d.path(), &plan, &p1) {
             assert_eq!(
                 std::fs::metadata(&p).unwrap().len(),
                 baseline_row_bytes(plan.n_freq) as u64,
@@ -1392,7 +1567,7 @@ mod tests {
         let s2 = sets.iter().find(|(p, _, _)| *p == p2).unwrap();
         assert_eq!((s2.1, s2.2), (1, 1), "and its sidecars agree once flushed");
 
-        let meta2 = d.path().join(format!("{p2}metadata.yaml"));
+        let meta2 = d.path().join(format!("{p2}-metadata.yaml"));
         assert_eq!(read_metadata_field(&meta2, "set_kind").as_deref(), Some("rollover"));
         assert_eq!(
             read_metadata_field(&meta2, "set_continuation_of").as_deref(),
@@ -1404,7 +1579,7 @@ mod tests {
             Some((2 * plan.n_cum as u64).to_string().as_str())
         );
         // row_index must not restart per set: it is the global grid.
-        let b2 = std::fs::read_to_string(d.path().join(format!("{p2}blocks.csv"))).unwrap();
+        let b2 = std::fs::read_to_string(d.path().join(format!("{p2}-blocks.csv"))).unwrap();
         assert!(b2.starts_with("2,0,"), "row_index continues across sets: {b2:?}");
         // ... and the first row of the new set is on the new local day.
         assert_eq!(local_day_at(t1), local_day_at(t0 + 24 * 3600 * 1000 + 60_000));
@@ -1438,7 +1613,7 @@ mod tests {
         let s = sets_on_disk(d.path(), &plan);
         assert_eq!((s[0].1, s[0].2), (3, 3), "the row was appended, not written over");
         // Appending must not rewrite the set's origin.
-        let meta = d.path().join(format!("{p1}metadata.yaml"));
+        let meta = d.path().join(format!("{p1}-metadata.yaml"));
         assert_eq!(read_metadata_field(&meta, "set_kind").as_deref(), Some("start"));
         assert_eq!(read_metadata_field(&meta, "first_row_index").as_deref(), Some("0"));
     }
@@ -1470,7 +1645,7 @@ mod tests {
         w2.write_row(&make_row(&plan, 0), t0 + 1000, &blocks_for(&plan, 0, plan.n_cum as u64))
             .unwrap();
         assert_ne!(w2.set_prefix(), p1);
-        let meta2 = d.path().join(format!("{}metadata.yaml", w2.set_prefix()));
+        let meta2 = d.path().join(format!("{}-metadata.yaml", w2.set_prefix()));
         assert_eq!(read_metadata_field(&meta2, "set_kind").as_deref(), Some("second_set"));
         assert_eq!(sets_on_disk(d.path(), &plan).len(), 2);
 
@@ -1519,21 +1694,21 @@ mod tests {
 
         // Every baseline file holds exactly three rows.
         let row_bytes = baseline_row_bytes(plan.n_freq) as u64;
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = d.path().join(baseline_file_name(idx, *j, *k));
+        for idx in 0..plan.n_baseline {
+            let p = baseline_path(d.path(), &plan, idx);
             assert_eq!(std::fs::metadata(&p).unwrap().len(), 3 * row_bytes, "{}", p.display());
         }
-        assert_eq!(file_len(&d.path().join("rows_ms.bin")).unwrap(), 3 * 8);
+        assert_eq!(file_len(&time_bin_path(d.path())).unwrap(), 3 * 8);
         // One line per station per row.
         assert_eq!(
-            count_csv_rows(&d.path().join("blocks.csv")).unwrap(),
+            count_csv_rows(&blocks_path(d.path())).unwrap(),
             3 * plan.n_station as u64
         );
-        assert!(d.path().join("metadata.yaml").exists());
+        assert!(metadata_path(d.path()).exists());
 
         // The content is what we wrote, baseline-major and row by row.
         let mut buf = Vec::new();
-        File::open(d.path().join(baseline_file_name(0, 0, 0)))
+        File::open(baseline_path(d.path(), &plan, 0))
             .unwrap()
             .read_to_end(&mut buf)
             .unwrap();
@@ -1576,7 +1751,7 @@ mod tests {
         }
         // Simulate a crash halfway through the third row, and after the spectrum
         // was flushed but before the sidecars caught up.
-        let p0 = d.path().join(baseline_file_name(0, 0, 0));
+        let p0 = baseline_path(d.path(), &plan, 0);
         let f = OpenOptions::new().write(true).open(&p0).unwrap();
         f.set_len(2 * row_bytes + row_bytes / 2).unwrap();
         drop(f);
@@ -1604,8 +1779,8 @@ mod tests {
         }
         // Cut every baseline file back to a single row, as a crash mid-write would.
         let row_bytes = baseline_row_bytes(plan.n_freq) as u64;
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = d.path().join(baseline_file_name(idx, *j, *k));
+        for idx in 0..plan.n_baseline {
+            let p = baseline_path(d.path(), &plan, idx);
             let f = OpenOptions::new().write(true).open(&p).unwrap();
             f.set_len(row_bytes).unwrap();
         }
@@ -1613,9 +1788,9 @@ mod tests {
         let (_w, st) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
         assert_eq!(st.rows_written, 1, "the data files are the truth");
         assert_eq!(st.truncated_rows, 0, "the data file was already short");
-        assert_eq!(file_len(&d.path().join("rows_ms.bin")).unwrap(), 8);
+        assert_eq!(file_len(&time_bin_path(d.path())).unwrap(), 8);
         assert_eq!(
-            count_csv_rows(&d.path().join("blocks.csv")).unwrap(),
+            count_csv_rows(&blocks_path(d.path())).unwrap(),
             plan.n_station as u64
         );
     }
@@ -1648,7 +1823,7 @@ mod tests {
             w.finish().unwrap();
         }
 
-        let ms = std::fs::read(d.path().join("rows_ms.bin")).unwrap();
+        let ms = std::fs::read(time_bin_path(d.path())).unwrap();
         assert_eq!(ms.len(), 5 * 8, "five timestamps, not three");
         let stamps: Vec<i64> = ms
             .chunks_exact(8)
@@ -1656,17 +1831,17 @@ mod tests {
             .collect();
         assert_eq!(stamps, vec![1000, 1001, 1002, 2003, 2004], "the old rows survive");
 
-        let txt = std::fs::read_to_string(d.path().join("rows_ms.txt")).unwrap();
+        let txt = std::fs::read_to_string(time_txt_path(d.path())).unwrap();
         assert_eq!(txt.lines().count(), 5);
         assert!(txt.lines().next().unwrap().starts_with("0 1000"));
 
         assert_eq!(
-            count_csv_rows(&d.path().join("blocks.csv")).unwrap(),
+            count_csv_rows(&blocks_path(d.path())).unwrap(),
             5 * plan.n_station as u64
         );
         let row_bytes = baseline_row_bytes(plan.n_freq) as u64;
-        for (idx, (j, k)) in plan.baseline_pairs().iter().enumerate() {
-            let p = d.path().join(baseline_file_name(idx, *j, *k));
+        for idx in 0..plan.n_baseline {
+            let p = baseline_path(d.path(), &plan, idx);
             assert_eq!(std::fs::metadata(&p).unwrap().len(), 5 * row_bytes);
         }
     }
@@ -1710,7 +1885,7 @@ mod tests {
         w.write_row(&make_row(&plan, 0), 4242, &blocks_for(&plan, 0, valid)).unwrap();
         w.finish().unwrap();
 
-        let s = std::fs::read_to_string(d.path().join("blocks.csv")).unwrap();
+        let s = std::fs::read_to_string(blocks_path(d.path())).unwrap();
         let lines: Vec<&str> = s.lines().filter(|l| !l.starts_with('#')).collect();
         assert_eq!(lines.len(), plan.n_station, "one line per station");
         let f: Vec<&str> = lines[0].split(',').collect();
@@ -1721,9 +1896,9 @@ mod tests {
         assert_eq!(f[4], valid.to_string(), "valid frames");
         assert_eq!(f[5], "7", "zero filled frames");
 
-        let ms = std::fs::read(d.path().join("rows_ms.bin")).unwrap();
+        let ms = std::fs::read(time_bin_path(d.path())).unwrap();
         assert_eq!(i64::from_le_bytes(ms[..8].try_into().unwrap()), 4242);
-        let txt = std::fs::read_to_string(d.path().join("rows_ms.txt")).unwrap();
+        let txt = std::fs::read_to_string(time_txt_path(d.path())).unwrap();
         assert_eq!(txt.trim(), "0 4242");
     }
 }

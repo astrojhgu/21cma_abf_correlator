@@ -216,10 +216,40 @@ pub struct StorageCfg {
     /// docs/DESIGN-daily-files.md.
     #[serde(default = "default_daily_files")]
     pub daily_files: bool,
-    /// strftime format for a file set's prefix. Must contain at least one `%`
-    /// directive and must not contain a path separator -- both are validated,
-    /// because a format that produces the same name every day would collide at
-    /// the first boundary.
+    /// A prefix put verbatim at the front of every file name of a set, with no
+    /// path component and no strftime directive in it.
+    ///
+    /// It is the run-level half of a name; the other half is the local time of
+    /// the set's first row, formatted with `file_prefix_format`. So a set looks
+    /// like
+    ///
+    ///   <file_prefix><station_j><station_k>-<stamp>.bin   one file per baseline
+    ///   <file_prefix><stamp>-time.txt                     per-row wall clock
+    ///   <file_prefix><stamp>-time.bin                     the same, int64 LE
+    ///   <file_prefix><stamp>-blocks.csv                   per-row validity
+    ///   <file_prefix><stamp>-metadata.yaml                how to read the above
+    ///
+    /// Nothing is inserted between the halves, so whatever separators a name
+    /// should have belong in this string. With the default empty prefix:
+    ///
+    ///   S01W17-20260918-144142.bin
+    ///   20260918-144142-time.txt
+    ///
+    /// and with `file_prefix: "corr24-"`:
+    ///
+    ///   corr24-S01W17-20260918-144142.bin
+    ///   corr24-20260918-144142-time.txt
+    ///
+    /// Empty is the default, because a name is read far more often than it is
+    /// written and the station pair plus the time already identify a file. Use it
+    /// to tell runs apart when several land in one directory (see
+    /// `docs/DESIGN-daily-files.md`).
+    #[serde(default)]
+    pub file_prefix: String,
+    /// strftime format for the local time a file set is named after: the local
+    /// time of that set's first row. Must contain at least one `%` directive and
+    /// must not contain a path separator -- both are validated, because a format
+    /// that produces the same name every day would collide at the first boundary.
     #[serde(default = "default_file_prefix_format")]
     pub file_prefix_format: String,
 }
@@ -529,9 +559,18 @@ impl RunPlan {
 // Loading and compiling
 // ---------------------------------------------------------------------------
 
-/// Default strftime format for a daily file set's prefix, and for the run
-/// directory name: the local day, then the local time of the set's first row.
-pub const DEFAULT_FILE_PREFIX_FORMAT: &str = "%Y%m%d_%H%M%S";
+/// Default strftime format for the local time in a file set's *file names*:
+/// `20260918-144142`.
+pub const DEFAULT_FILE_PREFIX_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// Default stamp for a run *directory* name: the same instant, in the older
+/// underscore layout (`corr_20260918_144142`).
+///
+/// Separate from the file-name format on purpose: the directory is created once
+/// per run and referred to by hand, and renaming it would orphan every path in
+/// the project's notes, while the file names inside it are the ones a reader has
+/// to parse.
+pub const DEFAULT_RUN_NAME_FORMAT: &str = "%Y%m%d_%H%M%S";
 
 /// Current UTC time as `YYYYmmdd_HHMMSS`.
 ///
@@ -632,7 +671,7 @@ impl Config {
         if self.run.name.as_deref().map_or(true, str::is_empty) {
             self.run.name = Some(format!(
                 "corr_{}",
-                local_stamp_at(crate::sched::system_ms(), DEFAULT_FILE_PREFIX_FORMAT)
+                local_stamp_at(crate::sched::system_ms(), DEFAULT_RUN_NAME_FORMAT)
             ));
         }
     }
@@ -817,6 +856,13 @@ impl Config {
         }
         // Only checked when the feature is on: a junk format in a config that has
         // daily files switched off is not a reason to refuse the run.
+        if self.storage.file_prefix.contains('/') {
+            bail!(
+                "storage.file_prefix={:?} contains a path separator; it is put verbatim at the \
+                 front of every file name, so a directory belongs in run.output_dir",
+                self.storage.file_prefix
+            );
+        }
         if self.storage.daily_files {
             let fmt = &self.storage.file_prefix_format;
             if fmt.is_empty() {

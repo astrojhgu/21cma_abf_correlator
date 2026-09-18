@@ -43,12 +43,19 @@ def wrap_deg(v):
 # File sets
 # ---------------------------------------------------------------------------
 #
-# A run directory holds one *set* per local day: `<prefix>baseline_*.bin`,
-# `<prefix>rows_ms.bin`, `<prefix>rows_ms.txt`, `<prefix>blocks.csv`,
-# `<prefix>metadata.yaml` (docs/DESIGN-daily-files.md). With
-# `storage.daily_files: false` the prefix is empty and there is exactly one set,
-# which is what every tool here used to assume. Reading a day therefore means
-# naming the set; reading "the run" means reading them in order.
+# A run directory holds one *set* per local day (docs/DESIGN-daily-files.md).
+# Since 2026-09-18 a set looks like
+#
+#   <file_prefix><station_j><station_k>-<stamp>.bin   one per baseline
+#   <tag>-time.bin / <tag>-time.txt                   per-row wall clock
+#   <tag>-blocks.csv                                  per-row validity
+#   <tag>-metadata.yaml                               how to read the above
+#
+# with `<tag>` = `<file_prefix>-<stamp>` (just `<stamp>` when no prefix is
+# configured) and `<stamp>` the local time of the set's first row. Sets written
+# before that -- `<prefix>baseline_0000_j00_k00.bin`, `<prefix>rows_ms.*` -- are
+# still read; `find_sets` tags each set with the layout it found. Reading a day
+# means naming the set; reading "the run" means reading them in order.
 
 import os
 import re
@@ -58,11 +65,20 @@ BASELINE_RE = re.compile(r"^baseline_(\d{4})_j(\d{2})_k(\d{2})\.bin$")
 
 
 def find_sets(run_dir, require=None):
-    """Every file set in `run_dir`, sorted by prefix (oldest first).
+    """Every file set in `run_dir`, sorted by tag (oldest first).
 
-    A set is recognised by its `blocks.csv`; the prefix is whatever precedes that
-    name. `require` is an optional filename to insist each set contains (e.g.
-    `metadata.yaml`), which also filters out half-created sets.
+    Two layouts are recognised, because the file names changed once (2026-09-18)
+    and the archives from before it are still read:
+
+    * **named** -- `<tag>-blocks.csv` plus `<tag>-time.bin`, `<tag>-time.txt` and
+      `<tag>-metadata.yaml`, with one `<file_prefix><station_j><station_k>-<stamp>.bin`
+      per baseline. `tag` is the set's identity and is what `--set` takes.
+    * **legacy** -- `<prefix>blocks.csv` plus `<prefix>rows_ms.bin`,
+      `<prefix>rows_ms.txt`, `<prefix>metadata.yaml` and
+      `<prefix>baseline_0000_j00_k00.bin`.
+
+    Every set is tagged with the layout it was found in, so callers that need a
+    file the two layouts name differently (`rows_ms` below) do not have to care.
     """
     out = []
     try:
@@ -70,31 +86,41 @@ def find_sets(run_dir, require=None):
     except FileNotFoundError:
         sys.exit(f"{run_dir}: no such directory")
     for name in names:
-        if not name.endswith("blocks.csv"):
-            continue
-        prefix = name[: -len("blocks.csv")]
-        if require and not os.path.exists(os.path.join(run_dir, prefix + require)):
-            continue
-        out.append(
-            {
-                "dir": run_dir,
-                "prefix": prefix,
+        if name.endswith("-blocks.csv"):
+            tag = name[: -len("-blocks.csv")]
+            layout = "named"
+            files = {
                 "blocks": os.path.join(run_dir, name),
-                "rows_ms": os.path.join(run_dir, prefix + "rows_ms.bin"),
-                "rows_ms_txt": os.path.join(run_dir, prefix + "rows_ms.txt"),
-                "metadata": os.path.join(run_dir, prefix + "metadata.yaml"),
+                "rows_ms": os.path.join(run_dir, f"{tag}-time.bin"),
+                "rows_ms_txt": os.path.join(run_dir, f"{tag}-time.txt"),
+                "metadata": os.path.join(run_dir, f"{tag}-metadata.yaml"),
             }
-        )
+        elif name.endswith("blocks.csv"):
+            tag = name[: -len("blocks.csv")]
+            layout = "legacy"
+            files = {
+                "blocks": os.path.join(run_dir, name),
+                "rows_ms": os.path.join(run_dir, tag + "rows_ms.bin"),
+                "rows_ms_txt": os.path.join(run_dir, tag + "rows_ms.txt"),
+                "metadata": os.path.join(run_dir, tag + "metadata.yaml"),
+            }
+        else:
+            continue
+        if require and not os.path.exists(files["metadata"]):
+            continue
+        out.append(dict(dir=run_dir, prefix=tag, tag=tag, layout=layout, **files))
     if not out and not require:
-        # A directory with no blocks.csv at all: report it as one empty set so the
-        # caller's error message names the path rather than an empty list.
+        # A directory with no set at all: report one empty set so the caller's
+        # error message names the path rather than an empty list.
         out.append(
             {
                 "dir": run_dir,
                 "prefix": "",
+                "tag": "",
+                "layout": "named",
                 "blocks": os.path.join(run_dir, "blocks.csv"),
-                "rows_ms": os.path.join(run_dir, "rows_ms.bin"),
-                "rows_ms_txt": os.path.join(run_dir, "rows_ms.txt"),
+                "rows_ms": os.path.join(run_dir, "time.bin"),
+                "rows_ms_txt": os.path.join(run_dir, "time.txt"),
                 "metadata": os.path.join(run_dir, "metadata.yaml"),
             }
         )
@@ -117,18 +143,62 @@ def pick_set(run_dir, prefix=None):
             + ", ".join(repr(s["prefix"]) for s in sets)
         )
     if not sets:
-        sys.exit(f"{run_dir}: no file set (no <prefix>metadata.yaml)")
+        sys.exit(f"{run_dir}: no file set (no *-metadata.yaml and no *metadata.yaml)")
     return sets[-1]
+
+
+def baseline_files(set_info):
+    """`[(index, j, k, filename)]` from the set's metadata.
+
+    The writer records every baseline's file name, so a reader never has to
+    reconstruct the naming rule -- which changed once already (the station pair
+    and the stamp moved into the name on 2026-09-18) and is not worth
+    reconstructing twice. A set written before that has `file:` values in the old
+    shape and is read the same way.
+    """
+    out = []
+    try:
+        fh = open(set_info["metadata"])
+    except OSError:
+        return out
+    with fh:
+        inside = False
+        for line in fh:
+            if line.startswith("baselines:"):
+                inside = True
+                continue
+            if not inside:
+                continue
+            if not line.startswith("  - "):
+                break
+            fields = dict(re.findall(r"(\w+): ([^,}]+)", line))
+            if "file" in fields:
+                out.append(
+                    (
+                        int(fields["index"]),
+                        int(fields["j"]),
+                        int(fields["k"]),
+                        fields["file"].strip(),
+                    )
+                )
+    return out
 
 
 def set_baselines(run_dir, plan_files=None, prefix=None):
     """`(index, j, k, path)` for every baseline file of the chosen set.
 
-    `plan_files` is ignored; it exists so a caller that already listed the
-    directory can pass what it has and still get the unprefixed layout right.
+    The names come from the set's own metadata, so both layouts are handled the
+    same way; the regex below is only a fallback for a set whose metadata predates
+    the `baselines:` list.
     """
     s = pick_set(run_dir, prefix)
     out = []
+    for idx, j, k, fname in baseline_files(s):
+        p = os.path.join(run_dir, fname)
+        if os.path.exists(p):
+            out.append((idx, j, k, p))
+    if out:
+        return sorted(out)
     for name in os.listdir(run_dir):
         if not name.startswith(s["prefix"]):
             continue

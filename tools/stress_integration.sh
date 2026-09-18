@@ -66,15 +66,19 @@ import glob, os, sys
 d, wall, n_cum = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
 fps = 800_000_000 / 8192
 period = n_cum / fps
-fs = sorted(glob.glob(os.path.join(d, "baseline_*.bin")))
+sys.path.insert(0, "tools")
+import corr_common as cc
+_b = cc.set_baselines(d)
+fs = [p for _, _, _, p in _b]
 if not fs:
     print("  没有写出任何文件"); raise SystemExit
 sizes = {os.path.getsize(f) for f in fs}
 rows = min(sizes) // 32768
 total = sum(os.path.getsize(f) for f in fs)
-ms = os.path.getsize(os.path.join(d, "rows_ms.bin")) if os.path.exists(os.path.join(d, "rows_ms.bin")) else 0
+_set = cc.pick_set(d)
+ms = os.path.getsize(_set["rows_ms"]) if os.path.exists(_set["rows_ms"]) else 0
 blocks = 0; n_station = 0
-bp = os.path.join(d, "blocks.csv")
+bp = _set["blocks"]
 if os.path.exists(bp):
     for line in open(bp):
         if not line.strip():

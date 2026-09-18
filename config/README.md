@@ -18,9 +18,9 @@
 2. **`recv_buffer_bytes` 与 `gpu.ring_lead` 必须配对**：socket 能积压的量 ≤ 环允许领先的量，
    否则积压只能涨不能消（见 `docs/ARCHITECTURE.md` §3.2）。
 3. **输出按本地日期分文件集，默认对所有档案生效**（`storage.daily_files: true`，前缀
-   `storage.file_prefix_format: "%Y%m%d_%H%M%S"`）：跨本地零点自动换一套
-   `<前缀>baseline_*.bin` / `blocks.csv` / `rows_ms.*` / `metadata.yaml`，名字取该套第一条
-   行的本地时刻。要续写当日那套，两次进程必须给同一个 `run.name`（默认按时间戳命名，
+   `storage.file_prefix_format: "%Y%m%d-%H%M%S"` + `storage.file_prefix: ""`）：跨本地零点
+   自动换一套 `<前缀><站j><站k>-<时刻>.bin` / `<前缀><时刻>-time.{bin,txt}` /
+   `-blocks.csv` / `-metadata.yaml`，名字里的时刻取该套第一条行的本地时刻。要续写当日那套，两次进程必须给同一个 `run.name`（默认按时间戳命名，
    每次都是新目录）。设计、代价与两条被接受的风险见 `docs/DESIGN-daily-files.md`；
    端到端判据 `tools/daily_rollover_test.sh`。要退回老的无前缀布局：
    `storage.daily_files: false`。

@@ -12,16 +12,24 @@ sidecar，共 304 个文件，同一个前缀。**套前缀** = `%Y%m%d_%H%M%S`�
    关闭当前套、按新的一天建新的一套。每套：
 
    ```text
-   <prefix>baseline_0000_j00_k00.bin   complex64[ntime][n_freq]
+   <file_prefix><站j><站k>-<stamp>.bin   complex64[ntime][n_freq]，每个 baseline 一个
    ...
-   <prefix>rows_ms.bin                 int64 LE Unix 毫秒，每行一条
-   <prefix>rows_ms.txt                 "<row_index> <ms>" 每行一条（派生视图）
-   <prefix>blocks.csv                  row_index, station, first_frame_id, n_cum, valid, zero_filled
-   <prefix>metadata.yaml               自描述：配置 + 几何 + config_hash + 本套起始行号/帧号 + 时区 + 类型
+   <file_prefix><stamp>-time.bin         int64 LE Unix 毫秒，每行一条
+   <file_prefix><stamp>-time.txt         "<row_index> <ms>" 每行一条（派生视图）
+   <file_prefix><stamp>-blocks.csv       row_index, station, first_frame_id, n_cum, valid, zero_filled
+   <file_prefix><stamp>-metadata.yaml    自描述：配置 + 几何 + config_hash + 套起始行号/帧号 + 时区 + 类型 + 每个 baseline 的文件名
    ```
 
-2. **套前缀 = 该套第一条行的起始时刻**，按本地时区格式化：日期与时间取自**同一个时刻**
-   （即 `rows_ms` 里那条，也就是该行第一个帧的墙钟），所以名字与内容不可能自相矛盾。
+   `stamp` = **该套第一条行的本地时刻**（`storage.file_prefix_format`，默认
+   `"%Y%m%d-%H%M%S"`）；`file_prefix` = 配置里新增的**静态前缀**（`storage.file_prefix`，
+   默认空，不含路径）。两者直接拼接、中间不加任何隐式分隔符——要分隔符就写进
+   `file_prefix`（如 `corr24-`）。于是默认档案下名字是
+   `T01T02-20260918-151311.bin`、`20260918-151311-time.txt`；配 `file_prefix: "corr24-"` 则是
+   `corr24-T01T02-20260918-151311.bin`、`corr24-20260918-151311-time.txt`。
+   套的**标签**（`--set` 用它、metadata 的 `set_prefix` 也是它）= `file_prefix + stamp`。
+
+2. **名字里的时刻 = 该套第一条行的起始时刻**，按本地时区格式化：日期与时间取自**同一个时刻**
+   （即 `time.bin` 里那条，也就是该行第一个帧的墙钟），所以名字与内容不可能自相矛盾。
    因此每套的 `HHMMSS` 不固定：跨零点那套可能是 `000000`、`000001`，进程当天启动的那套
    是启动后第一条行的时刻。实测跨零点那次叫 `20260917_000000`，而启动那套叫
    `20260916_235907`。
@@ -118,7 +126,9 @@ sidecar，共 304 个文件，同一个前缀。**套前缀** = `%Y%m%d_%H%M%S`�
 
 16. **`daily_files` 默认开，对所有运行生效**（回放与短跑同样按日命名），可关：
     `storage.daily_files: false` 回到"目录里只有不带前缀的文件"的老行为；
-    前缀格式可配 `storage.file_prefix_format`（默认 `"%Y%m%d_%H%M%S"`）。
+    时刻格式可配 `storage.file_prefix_format`（默认 `"%Y%m%d-%H%M%S"`），静态前缀可配
+   `storage.file_prefix`（默认空）。关掉 `daily_files` 时仍然带 `file_prefix` 与一个时刻
+   （取 writer 打开目录的时刻），只是不再按日切套。
 
 ## 5. 验收判据
 
@@ -126,9 +136,9 @@ sidecar，共 304 个文件，同一个前缀。**套前缀** = `%Y%m%d_%H%M%S`�
 （例：`TZ="UTC-14:57"` 表示 UTC+14:57，可以把"现在"映射到本地 23:58:30），跑真跨零点
 5–10 分钟，然后逐条检查：
 
-1. **套数与名字**：跨零点后目录里出现第二套，且两套前缀的日期不同；每套前缀的日期与
-   `HHMMSS` = 该套 `metadata.yaml` 的 `first_row_index` 那一行在 `rows_ms.bin` 里的本地
-   时间（逐字节对照，不是"看起来对"）。
+1. **套数与名字**：跨零点后目录里出现第二套，且两套 `set_day` 不同；每套的 `stamp`
+   = 该套 `first_row_index` 那一行在 `time.bin` 里的本地时间（逐字节对照，不是"看起来对"），
+   且标签 = `file_prefix + stamp`。
 2. **行不丢不重**：两套的 `blocks.csv` 行数之和 = 运行的 `rows closed` 数 = 进程报告的
    总行数；`row_index` 跨套连续且不回零。
 3. **帧网格连续**：第二套的 `first_frame_id` = 第一套最后一行 `first_frame_id + n_cum`。
