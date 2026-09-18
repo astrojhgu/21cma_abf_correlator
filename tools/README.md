@@ -239,8 +239,9 @@ counter 都在按 ~197 k/s 前进（=195 kpps/组，标称值），于是问题�
 24 路 × 16384 档在 4.7 Mpps 下，补零变多时 `loss_attribution.py` 给出的答案是"网卡 RX
 队列（硬件）"：`rx_prio0_discards` 的增量与 corr 的 `lost` 增量**逐个相等**，而软中断
 dropped、我们自己的 socket drops、等环全都是 0。根因是 RX ring 只有 **1024**（硬件上限
-8192）：4.7 Mpps 下这点描述符只有约 **0.2 ms** 的缓冲，任何 0.2 ms 量级的处理抖动
-（中断被推迟、CPU 被抢占）就直接丢包。改它需要 root：
+8192）：4.7 Mpps 摊到 32 个 RSS 队列时每队列 147 kpps ≈ **7 ms** 的缓冲，看似够 ——
+但实测突发会集中到少数队列与 CPU（5 s 窗口里 mlx5 中断压在 cpu18/19/20 上，各 2.1–2.3
+万次），那时的**有效**缓冲掉到亚毫秒，任何中断被推迟就直接丢包。改它需要 root：
 
 ```bash
 sudo ethtool -G ens2f0np0 rx 8192      # 临时生效，重启失效；持久化见 NetworkManager dispatcher
