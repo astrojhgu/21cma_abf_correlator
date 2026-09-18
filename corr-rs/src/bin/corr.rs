@@ -88,8 +88,8 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
-    /// Stop after this many seconds. Without it a dry run continues until
-    /// interrupted.
+    /// Stop after this many seconds. Without it the run continues until it is
+    /// interrupted (Ctrl-C), whatever the mode.
     #[arg(long)]
     duration: Option<f64>,
 }

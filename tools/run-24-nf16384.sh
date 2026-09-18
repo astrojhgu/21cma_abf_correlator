@@ -16,11 +16,11 @@
 #   4. **判读按逐行 `blocks.csv`**，不看运行报告的 per-station 汇总（汇总会把
 #      "每行涓流丢一点"藏成一个很小的数）。跑完自动跑 `longrun_report.py`。
 #
-# 用法（默认就是异步后端，24 个 worker，300 s）：
+# 用法（默认就是异步后端，24 个 worker，**一直跑到 Ctrl-C**）：
 #
-#   tools/run-24-nf16384.sh                  # 异步，300 s
-#   DUR=60 tools/run-24-nf16384.sh           # 异步，60 s
-#   DUR=0  tools/run-24-nf16384.sh           # 一直跑到 Ctrl-C（会打印报告再退出）
+#   tools/run-24-nf16384.sh                  # 异步，跑到 Ctrl-C（会打印报告再退出）
+#   DUR=300 tools/run-24-nf16384.sh          # 只跑 300 s 然后自己收尾
+#   DUR=60  tools/run-24-nf16384.sh          # 短腿：注意起跑那一下的缺口会占很大比例
 #   MODE=sync tools/run-24-nf16384.sh        # 对照腿：线程后端
 #   WORKERS=12 tools/run-24-nf16384.sh       # 收包 worker 数（异步腿）
 #   NEW_SET=1 tools/run-24-nf16384.sh        # 今天已有套时另起一套，不续写
@@ -35,7 +35,11 @@ cd "$(dirname "$0")/.."
 
 CFG=${CFG:-config/correlator-24-nf16384-manual.yaml}
 MODE=${MODE:-async}                 # async | sync
-DUR=${DUR:-300}                     # 秒；0 = 不加 --duration，跑到 Ctrl-C
+# 秒；**0（默认）= 不加 --duration，一直跑到 Ctrl-C**。默认不设上限是因为这条命令
+# 就是"把相关机跑起来"：观察、看实时曲线、等一个事件，都由人来决定什么时候停。要固定
+# 时长就显式给 DUR=<秒>。注意默认值下它会一直占着网卡与四张卡 —— 别忘了 Ctrl-C 一次
+# （一次就够，它的收尾报告要读一遍 blocks.csv，需要一两秒）。
+DUR=${DUR:-0}
 # 异步腿的 worker 数。**按到达速率定，不是按核数定**：这台前端 24 路是
 # 24414.0625 帧/s × 8 包/帧 × 24 站 ≈ 4.7 Mpps，而单个 worker 的实测上限在
 # 0.4–0.45 Mpps 附近 —— W 给小了会直接崩，而且崩得很吵：2026-09-18 用 WORKERS=4
