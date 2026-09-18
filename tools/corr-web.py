@@ -39,12 +39,21 @@ corr 的地址**只定义一处**：配置里的 `monitoring.http.bind`。本程
 
 import argparse
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# 网卡层的计数与判读只有一处实现：`loss_attribution.py`。这里直接借用它的取样函数，
+# 而不是再写一遍 —— 这台机器上"补零"跟"网卡硬件队列丢包"经常是同一件事，两边口径
+# 必须一致。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import loss_attribution as la
 
 # 取数地址会先试配置里的 `monitoring.http.bind`（见 `read_bind`），因为端口只该在
 # 一处定义；这两个常量是读不到时的退路。
@@ -109,12 +118,17 @@ SERIES = [
 class Collector(threading.Thread):
     """每秒取一次 corr 的状态快照，留一份历史。"""
 
-    def __init__(self, url, spectra_url, interval, spectra_interval, history):
+    def __init__(self, url, spectra_url, interval, spectra_interval, history,
+                 nic="", nic_interval=5.0):
         super().__init__(daemon=True, name="corr-web-collector")
         self.url = url
         self.spectra_url = spectra_url
         self.interval = interval
         self.spectra_interval = spectra_interval
+        self.nic = nic
+        self.nic_interval = nic_interval
+        self.nic_prev = None
+        self.nic_now = None
         self.lock = threading.Lock()
         self.samples = deque(maxlen=history)
         self.latest = None
@@ -131,10 +145,40 @@ class Collector(threading.Thread):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _poll_nic(self, now):
+        """网卡层：硬件队列丢弃 / 软中断丢弃 / 我们发出的流控。见 loss_attribution.py。"""
+        counters, err = la.nic_counters(self.nic)
+        if err:
+            self.nic_now = {"error": err}
+            return
+        dropped, squeeze, _per_cpu = la.softnet()
+        cur = {"t": now, "counters": counters, "softnet_dropped": dropped,
+               "softnet_squeeze": squeeze}
+        prev = self.nic_prev
+        self.nic_prev = cur
+        if prev is None:
+            self.nic_now = {"error": None, "warmup": True}
+            return
+        dt = max(cur["t"] - prev["t"], 1e-6)
+        d = lambda k: (cur["counters"].get(k, 0) - prev["counters"].get(k, 0))  # noqa: E731
+        self.nic_now = {
+            "error": None,
+            "dt_s": dt,
+            "discards_per_s": d("rx_prio0_discards") / dt,
+            "phy_discards_per_s": d("rx_discards_phy") / dt,
+            "out_of_buffer_per_s": d("rx_out_of_buffer") / dt,
+            "pause_per_s": d("tx_global_pause") / dt,
+            "crc_per_s": d("rx_crc_errors_phy") / dt,
+            "mpps": d("rx_packets_phy") / dt / 1e6,
+            "softnet_dropped_per_s": (cur["softnet_dropped"] - prev["softnet_dropped"]) / dt,
+            "softnet_squeeze_per_s": (cur["softnet_squeeze"] - prev["softnet_squeeze"]) / dt,
+        }
+
     def run(self):
         # Two endpoints, one thread: the page asks for both and they are cheap, and a
         # second thread would only add a second thing to shut down.
         last_spectra = 0.0
+        last_nic = 0.0
         while not self.stop.is_set():
             started = time.monotonic()
             try:
@@ -149,6 +193,9 @@ class Collector(threading.Thread):
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 with self.lock:
                     self.error = f"{type(exc).__name__}: {exc}"
+            if self.nic and (started - last_nic) >= self.nic_interval:
+                last_nic = started
+                self._poll_nic(started)
             if self.spectra_interval > 0 and (started - last_spectra) >= self.spectra_interval:
                 last_spectra = started
                 try:
@@ -162,6 +209,10 @@ class Collector(threading.Thread):
                     with self.lock:
                         self.spectra_error = f"{type(exc).__name__}: {exc}"
             self.stop.wait(max(0.0, self.interval - (time.monotonic() - started)))
+
+    def nic_state(self):
+        with self.lock:
+            return self.nic_now
 
     def spectra_state(self):
         with self.lock:
@@ -206,6 +257,7 @@ class Collector(threading.Thread):
             "latest": latest,
             "history": history,
             "series": [{"key": k, "title": t, "unit": u, "max": m} for k, t, u, m in SERIES],
+            "nic": self.nic_state(),
             "url": self.url,
         }
 
@@ -229,7 +281,9 @@ main { padding:14px 18px 40px; }
 .card .k { color:var(--dim); font-size:11px; letter-spacing:.04em; text-transform:uppercase; }
 .card .v { font-size:20px; margin-top:4px; }
 .card .s { color:var(--dim); font-size:11px; margin-top:2px; }
-#verdict.ok { color:var(--ok); } #verdict.warn { color:var(--warn); } #verdict.bad { color:var(--bad); }
+#verdict.ok, .card .v.ok { color:var(--ok); }
+#verdict.warn, .card .v.warn { color:var(--warn); }
+#verdict.bad, .card .v.bad { color:var(--bad); }
 section { margin-top:18px; }
 h2 { font-size:13px; color:var(--dim); font-weight:600; margin:0 0 8px;
      letter-spacing:.05em; text-transform:uppercase; }
@@ -277,6 +331,8 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
       <div class="s" id="load">–</div></div>
     <div class="card"><div class="k">capacity</div><div class="v" id="verdict">–</div>
       <div class="s" id="limits">–</div></div>
+    <div class="card"><div class="k">网卡层（硬件队列）</div><div class="v" id="nic">–</div>
+      <div class="s" id="nicsub">–</div></div>
   </div>
 
   <section><h2>曲线（本程序自己攒的）</h2><div class="charts" id="charts"></div></section>
@@ -371,6 +427,31 @@ function render(s) {
   document.getElementById("cpu").textContent =
       `${fmt(snap.host.cpu_cores, 1)}/${snap.host.cores_online}`;
   document.getElementById("load").textContent = `load1 ${fmt(snap.host.load1, 1)}`;
+
+  // 网卡层：补零变多时，先在这里看是不是硬件队列丢的（应用侧那几项可能全是干净的）。
+  const nic = s.nic || null;
+  const nv = document.getElementById("nic");
+  const ns = document.getElementById("nicsub");
+  if (!nic) {
+    nv.textContent = "–"; nv.className = "v";
+    ns.textContent = "未采样";
+  } else if (nic.error) {
+    nv.textContent = "?"; nv.className = "v warn";
+    ns.textContent = nic.error;
+  } else if (nic.warmup) {
+    nv.textContent = "…"; nv.className = "v";
+    ns.textContent = "需要两次采样才能算增量";
+  } else if (nic.discards_per_s > 0) {
+    nv.textContent = `${nic.discards_per_s.toFixed(0)}/s`; nv.className = "v bad";
+    nv.title = "包在网卡 RX 队列就被扔了：ring 太小或中断被推迟，与接收程序无关";
+    ns.textContent = `到达 ${nic.mpps.toFixed(2)} Mpps · prio0 硬件丢弃 · `
+      + `发 pause ${nic.pause_per_s.toFixed(0)}/s · 软中断丢 ${nic.softnet_dropped_per_s.toFixed(0)}/s`;
+  } else {
+    nv.textContent = "0/s"; nv.className = "v ok";
+    nv.title = "网卡三层（硬件队列 / 软中断 / 流控）都没有丢弃";
+    ns.textContent = `到达 ${nic.mpps.toFixed(2)} Mpps · 无硬件丢弃 · `
+      + `软中断丢 ${nic.softnet_dropped_per_s.toFixed(0)}/s`;
+  }
 
   const v = document.getElementById("verdict");
   v.textContent = snap.capacity.bottleneck;
@@ -529,6 +610,10 @@ def main():
     ap.add_argument("--history", type=int, default=3600, help="内存里保留多少个样本")
     ap.add_argument("--spectra-interval", type=float, default=5.0,
                     help="自相关谱的取数间隔秒，0 = 不取（默认 5）")
+    ap.add_argument("--nic", default="ens2f0np0",
+                    help="采样的网卡（硬件队列丢弃 / 软中断 / 流控）；空字符串 = 不采样")
+    ap.add_argument("--nic-interval", type=float, default=5.0,
+                    help="网卡层采样间隔秒（默认 5）")
     args = ap.parse_args()
 
     url, source = args.url, "--url"
@@ -540,7 +625,8 @@ def main():
         url, source = DEFAULT_URL, "默认值（没读到配置）"
     # The two endpoints sit next to each other on the same server.
     spectra_url = url.rsplit("/", 1)[0] + "/autospectra.json"
-    collector = Collector(url, spectra_url, args.interval, args.spectra_interval, args.history)
+    collector = Collector(url, spectra_url, args.interval, args.spectra_interval, args.history,
+                          nic=args.nic, nic_interval=args.nic_interval)
     collector.start()
     host, port = split_bind(args.bind)
     Handler.collector = collector
@@ -550,6 +636,9 @@ def main():
     if args.spectra_interval > 0:
         print(f"corr-web: 自相关谱取 {spectra_url}，每 {args.spectra_interval}s 一次",
               flush=True)
+    if args.nic:
+        print(f"corr-web: 网卡层采样 {args.nic}，每 {args.nic_interval}s 一次"
+              f"（硬件队列丢弃 / 软中断 / 流控；只读）", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

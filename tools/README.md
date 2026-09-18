@@ -234,6 +234,23 @@ counter 都在按 ~197 k/s 前进（=195 kpps/组，标称值），于是问题�
 | `compare_runs.py` | 两次运行的逐基线对比（按 `first_frame_id` 对齐），用于"改了配置之后数据是否一致"。 |
 | `mk_dataflow.py` | 画数据流图（`dataflow.svg/png`）。 |
 | `loss_attribution.py` | 补零的包**丢在哪一层**：把网卡（`rx_prio0_discards` / `rx_discards_phy` / `rx_out_of_buffer`）、内核软中断（`/proc/net/softnet_stat` 的 dropped / time_squeeze）、我们自己的 socket（corr 的 `socket_drops`）、corr 的 `lost` 四层增量并排打成一行，末尾一句责任判定；顺带指出 mlx5 中断与 squeeze 集中在**哪些核**（无 root 时这是唯一能看的线索）。**只读、不 join 组播**，所以别的 corr 正在跑时也能用 —— `doctor.py` 不行，它会收包。 |
+**网卡层丢包：现状与那条改不动的命令（2026-09-18 实测）**
+
+24 路 × 16384 档在 4.7 Mpps 下，补零变多时 `loss_attribution.py` 给出的答案是"网卡 RX
+队列（硬件）"：`rx_prio0_discards` 的增量与 corr 的 `lost` 增量**逐个相等**，而软中断
+dropped、我们自己的 socket drops、等环全都是 0。根因是 RX ring 只有 **1024**（硬件上限
+8192）：4.7 Mpps 下这点描述符只有约 **0.2 ms** 的缓冲，任何 0.2 ms 量级的处理抖动
+（中断被推迟、CPU 被抢占）就直接丢包。改它需要 root：
+
+```bash
+sudo ethtool -G ens2f0np0 rx 8192      # 临时生效，重启失效；持久化见 NetworkManager dispatcher
+```
+
+本机拿不到 root（`SO_BUSY_POLL` 是 EPERM、`AF_PACKET` 也是 EPERM，所以连"应用态大 ring"
+这条绕行路都没有），所以这条命令只能留档，等有权限的人执行。在此之前，
+`tools/corr-web.py` 页面的"网卡层"卡片与 `loss_attribution.py` 是同一份口径：**应用侧
+全干净、网卡层在丢**就是当前这种局面的特征。
+
 | `corr-web.py` | 独立运行的**状态监测界面**：轮询 corr 的两个只读端点——每秒取 `GET /status.json`（运行状态，自己攒历史画曲线），每 5 s 取 `GET /autospectra.json`（最新那一行的自相关谱，每路一格 dB 曲线）；页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库，**不读 NFS**（谱由写盘端记录，不是读回来的——这台机器上被测的就是写盘那条路径）；corr 停了也不崩，显示"断开 N 秒"并继续展示最后一份。接口契约见 `docs/DESIGN-status-http.md`。 |
 
 **三条使用纪律**（都是踩出来的）：
