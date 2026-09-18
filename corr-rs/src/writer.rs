@@ -52,7 +52,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
@@ -248,197 +251,66 @@ pub struct RowBlock {
     pub valid_frames_per_station: Vec<u64>,
 }
 
-/// Writes one run's output, one file set at a time.
-pub struct Writer {
+/// One row on its way to the writer thread.
+enum Job {
+    Row {
+        buf: Vec<u8>,
+        row_ms: i64,
+        blocks: RowBlock,
+    },
+    /// Wait until every queued row has been written (not fsynced), and answer.
+    /// A point where the files on disk are what the caller expects, without
+    /// stopping the thread.
+    Sync(std::sync::mpsc::Sender<Result<u64, String>>),
+    /// Flush and fsync everything, answer with the total row count, and stop.
+    Finish(std::sync::mpsc::Sender<Result<u64, String>>),
+}
+
+/// The writing state: the open set, where the next one would go, and the geometry
+/// to size it. Owned by the writer thread; the handle next to it only queues rows.
+///
+/// Split out from [`Writer`] because the two objects answer different questions:
+/// this one owns the files and the durability, the handle owns the queue and the
+/// backpressure. `docs/DESIGN-writer-thread.md` has the measurements behind that.
+struct SetState {
     dir: PathBuf,
-    /// Prefix of the set being written, without which every file name is formed.
-    /// Empty until the first set exists, and empty for ever when daily files are
-    /// off.
-    prefix: String,
-    /// Whether rows are grouped into per-day sets at all.
-    daily: bool,
-    /// Kept so a new set can be opened mid-run: the geometry to size the files
-    /// and the config to describe them.
     plan: RunPlan,
     cfg: Config,
     config_hash: String,
-    /// Local day of the current set. `None` until a set exists: the first set's
-    /// name has to come from its first row's timestamp, so it cannot be created
-    /// before that row is in hand.
+    fsync_every: u64,
+    daily: bool,
+
+    /// Prefix of the set being written; empty until a set exists.
+    prefix: String,
+    /// Local day of the current set; `None` until a set exists (its name has to
+    /// come from its first row's timestamp, so it cannot exist before that row).
     set_day: Option<String>,
     set_kind: SetKind,
     set_first_row: Option<(u64, u64)>,
     set_continuation_of: Option<String>,
-    rows_at_open: u64,
-    /// Rows written into the current set (the run's own total is `rows_written`).
     rows_in_set: u64,
-    /// A backwards wall-clock step is reported once, not once per row.
     backward_warned: bool,
 
     n_baseline: usize,
-    /// Bytes of one baseline's row: the unit every raw file is made of. Each
-    /// baseline file grows by exactly this much per integration row.
     per_baseline_row: usize,
     n_station: usize,
-    /// Bytes of a whole integration row across all baselines: what
-    /// `corr_rows_fetch` hands over and what `write_row` expects.
     row_bytes: usize,
-
-    /// `None` when no set is open yet (daily files, before the first row).
     files: Option<SetFiles>,
-
-    rows_written: u64,
-    fsync_every: u64,
+    /// Rows this process has written, across every set it has opened.
+    rows_total: u64,
 }
 
-/// The state an operator needs in a log line, without the open file handles
-/// (`File` has no `Debug`, and printing a set's handles would say nothing useful).
-impl std::fmt::Debug for Writer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Writer")
-            .field("dir", &self.dir)
-            .field("set_prefix", &self.prefix)
-            .field("set_day", &self.set_day)
-            .field("set_open", &self.files.is_some())
-            .field("rows_written", &self.rows_written)
-            .finish()
-    }
-}
-
-impl Writer {
-    /// Create or resume a run directory, appending to today's set if there is one.
-    pub fn open(
-        dir: &Path,
-        plan: &RunPlan,
-        cfg: &Config,
-        config_hash: &str,
-        fsync_every: u64,
-    ) -> Result<(Self, ResumeState)> {
-        Self::open_with(dir, plan, cfg, config_hash, fsync_every, &SetPolicy::Auto)
-    }
-
-    /// As [`Writer::open`], with an explicit policy for which set to use.
+impl SetState {
+    /// Attach to an existing set, creating it if it is not there yet, and report
+    /// where the run should resume.
     ///
-    /// `cfg` is written to each set's metadata.yaml and hashed into it; on resume
-    /// the hash must match, because the geometry being different would silently
-    /// misread every existing row.
-    pub fn open_with(
-        dir: &Path,
-        plan: &RunPlan,
-        cfg: &Config,
-        config_hash: &str,
-        fsync_every: u64,
-        policy: &SetPolicy,
-    ) -> Result<(Self, ResumeState)> {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("creating the run directory {}", dir.display()))?;
-
-        let daily = cfg.storage.daily_files;
-        let empty = ResumeState {
-            rows_written: 0,
-            next_frame_id: None,
-            truncated_rows: 0,
-        };
-        if !daily {
-            // No per-day splitting: one set for the whole run, stamped with the
-            // local time the writer opened it. The files still carry the station
-            // pair and a time, so a name stays self-describing; what is gone is
-            // the rollover at the local midnight (docs/DESIGN-daily-files.md).
-            let names = SetNames::new(
-                &cfg.storage.file_prefix,
-                &local_stamp_at(crate::sched::system_ms(), &cfg.storage.file_prefix_format),
-            );
-            let (w, st) = Self::open_set(dir, plan, cfg, config_hash, fsync_every, &names, None)?;
-            return Ok((w, st));
-        }
-
-        let today = local_day_at(crate::sched::system_ms());
-        let found = discover_sets(dir, plan)?;
-        if std::env::var_os("CORR_SET_DEBUG").is_some() {
-            eprintln!("writer: daily sets in {}: {found:?}", dir.display());
-        }
-
-        // Which set to append to?
-        let chosen: Option<FoundSet> = match policy {
-            SetPolicy::Explicit(prefix) => {
-                let hit = found.iter().find(|s| s.prefix == *prefix).cloned();
-                match hit {
-                    Some(s) => Some(s),
-                    None => bail!(
-                        "no file set with prefix {prefix:?} in {}; the sets there are {:?}",
-                        dir.display(),
-                        found.iter().map(|s| s.prefix.as_str()).collect::<Vec<_>>()
-                    ),
-                }
-            }
-            SetPolicy::NewSet => None,
-            SetPolicy::Auto => found
-                .iter()
-                .filter(|s| s.day == today)
-                .min_by(|a, b| a.prefix.cmp(&b.prefix))
-                .cloned(),
-        };
-
-        let Some(set) = chosen else {
-            // No set to append to: the first row will name one. The writer is a
-            // valid object with no files yet, which is the state `write_row`
-            // resolves.
-            let second = found.iter().any(|s| s.day == today);
-            return Ok((
-                Writer {
-                    dir: dir.to_path_buf(),
-                    prefix: String::new(),
-                    daily: true,
-                    plan: plan.clone(),
-                    cfg: cfg.clone(),
-                    config_hash: config_hash.to_string(),
-                    set_day: None,
-                    set_kind: if second { SetKind::SecondSet } else { SetKind::Start },
-                    set_first_row: None,
-                    set_continuation_of: None,
-                    rows_at_open: 0,
-                    rows_in_set: 0,
-                    backward_warned: false,
-                    n_baseline: plan.n_baseline,
-                    per_baseline_row: baseline_row_bytes(plan.n_freq),
-                    n_station: plan.n_station,
-                    row_bytes: baseline_row_bytes(plan.n_freq) * plan.n_baseline,
-                    files: None,
-                    rows_written: 0,
-                    fsync_every: fsync_every.max(1),
-                },
-                empty,
-            ));
-        };
-
-        // Appending to an existing set: the config hash has to agree, or the two
-        // geometries would be mixed into one file set. The message names the way
-        // out, because the alternative is an operator guessing.
-        let (mut w, st) =
-            Self::open_set(dir, plan, cfg, config_hash, fsync_every, &set.names, Some(&set))
-            .map_err(|e| {
-                if matches!(policy, SetPolicy::Auto) {
-                    e.context(format!(
-                        "appending to today's set {}: if the configuration changed on purpose, \
-                         either pass --set <prefix> to choose a set explicitly or \
-                         --allow-second-set to start another set for today",
-                        set.prefix
-                    ))
-                } else {
-                    e
-                }
-            })?;
-        w.set_day = Some(set.day.clone());
-        w.set_kind = SetKind::Resume;
-        w.rows_at_open = st.rows_written;
-        Ok((w, st))
-    }
-
-    /// Open one set, whose naming has already been decided.
+    /// `names` decides every file name in the set; `found` is that set's discovered
+    /// metadata when it already exists, and `None` means it is being created now.
     ///
-    /// `found` is the discovered metadata of that set when it already exists;
-    /// `None` means "this set is being created now".
-    fn open_set(
+    /// Runs on the calling thread at startup, before any socket is open: the run
+    /// needs `ResumeState` to fix its row grid, and a failure here should stop the
+    /// process before it starts receiving.
+    fn attach(
         dir: &Path,
         plan: &RunPlan,
         cfg: &Config,
@@ -560,10 +432,10 @@ impl Writer {
         // only description available.
         let meta_path = dir.join(names.metadata());
         let created_now = rows_written == 0 || !meta_path.exists();
+        let day = found
+            .map(|s| s.day.clone())
+            .unwrap_or_else(|| local_day_at(crate::sched::system_ms()));
         if created_now {
-            let day = found
-                .map(|s| s.day.clone())
-                .unwrap_or_else(|| local_day_at(crate::sched::system_ms()));
             write_metadata(
                 &meta_path,
                 plan,
@@ -586,24 +458,18 @@ impl Writer {
             truncated_rows,
         };
         Ok((
-            Writer {
+            SetState {
                 dir: dir.to_path_buf(),
                 prefix: names.tag(),
-                daily: cfg.storage.daily_files,
                 plan: plan.clone(),
                 cfg: cfg.clone(),
                 config_hash: config_hash.to_string(),
-                set_day: Some(if created_now {
-                    found
-                        .map(|s| s.day.clone())
-                        .unwrap_or_else(|| local_day_at(crate::sched::system_ms()))
-                } else {
-                    found.map(|s| s.day.clone()).unwrap_or_default()
-                }),
+                fsync_every: fsync_every.max(1),
+                daily: cfg.storage.daily_files,
+                set_day: Some(day),
                 set_kind: if created_now { SetKind::Start } else { SetKind::Resume },
                 set_first_row: None,
                 set_continuation_of: None,
-                rows_at_open: rows_written,
                 rows_in_set: rows_written,
                 backward_warned: false,
                 n_baseline,
@@ -616,11 +482,98 @@ impl Writer {
                     ms_txt,
                     blocks,
                 }),
-                rows_written,
-                fsync_every: fsync_every.max(1),
+                rows_total: rows_written,
             },
             state,
         ))
+    }
+
+    /// A state with no set yet: the first row's local day names the first set.
+    fn unopened(
+        dir: &Path,
+        plan: &RunPlan,
+        cfg: &Config,
+        config_hash: &str,
+        fsync_every: u64,
+        first_kind: SetKind,
+    ) -> Self {
+        SetState {
+            dir: dir.to_path_buf(),
+            plan: plan.clone(),
+            cfg: cfg.clone(),
+            config_hash: config_hash.to_string(),
+            fsync_every: fsync_every.max(1),
+            daily: cfg.storage.daily_files,
+            prefix: String::new(),
+            set_day: None,
+            set_kind: first_kind,
+            set_first_row: None,
+            set_continuation_of: None,
+            rows_in_set: 0,
+            backward_warned: false,
+            n_baseline: plan.n_baseline,
+            per_baseline_row: baseline_row_bytes(plan.n_freq),
+            n_station: plan.n_station,
+            row_bytes: baseline_row_bytes(plan.n_freq) * plan.n_baseline,
+            files: None,
+            rows_total: 0,
+        }
+    }
+
+    /// Make sure the row about to be written has a set, opening or rolling one as
+    /// the row's own local day requires.
+    ///
+    /// The decision is a pure function of (current set's day, this row's day) --
+    /// see [`decide`] -- so it is unit-testable without a timezone, and the
+    /// timezone itself is read per row rather than cached, which is what makes a
+    /// daylight-saving day come out right.
+    fn ensure_set_for(&mut self, row_ms: i64, blocks: &RowBlock) -> Result<()> {
+        if !self.daily {
+            if self.files.is_none() {
+                bail!("no output set is open and daily files are off; this is a writer bug");
+            }
+            return Ok(());
+        }
+        let day = local_day_at(row_ms);
+        match decide(self.set_day.as_deref(), &day) {
+            Decision::Open => {
+                // `set_kind` was decided when the state was built: a day that
+                // already had a set but was not appended to (a changed
+                // configuration, `--allow-second-set`) opens a second one.
+                let kind = self.set_kind;
+                self.create_set(&day, row_ms, blocks, kind, None)
+            }
+            Decision::Keep => Ok(()),
+            Decision::Roll => {
+                let rows = self.rows_in_set;
+                let from_day = self.set_day.clone().unwrap_or_default();
+                let from = self.close_set()?;
+                self.create_set(&day, row_ms, blocks, SetKind::Rollover, Some(from.clone()))?;
+                // Loud, because this is the one event the daily layout exists for
+                // and a multi-day run's log is the only place it can be seen while
+                // it happens; the prefix is not knowable in advance (it is this
+                // row's own local time), so it has to be printed.
+                eprintln!(
+                    "writer: local day changed {from_day} -> {day}: closed set {from} \
+                     ({rows} rows) and opened {}",
+                    self.prefix
+                );
+                Ok(())
+            }
+            Decision::WarnBackwards => {
+                if !self.backward_warned {
+                    self.backward_warned = true;
+                    eprintln!(
+                        "writer: the local day went backwards ({} -> {day}) with the wall clock; \
+                         keeping the current set {} and not opening another, because the row \
+                         index is monotonic and a set is never reopened once left",
+                        self.set_day.as_deref().unwrap_or("?"),
+                        self.prefix
+                    );
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Open a new set whose prefix is the local time of `row_ms`, retrying a few
@@ -648,7 +601,16 @@ impl Writer {
         let mut last: Option<anyhow::Error> = None;
         for attempt in 1..=3 {
             match self.try_create_set(&names, day, kind, continuation.clone(), blocks) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    if kind != SetKind::Rollover {
+                        eprintln!(
+                            "writer: opened file set {} for local day {day} ({})",
+                            names.tag(),
+                            kind.as_str()
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     eprintln!(
                         "writer: opening file set {} for local day {day} failed \
@@ -757,7 +719,6 @@ impl Writer {
         self.set_kind = kind;
         self.set_continuation_of = continuation;
         self.set_first_row = Some((blocks.row_index, blocks.first_frame_id));
-        self.rows_at_open = 0;
         self.rows_in_set = 0;
         self.files = Some(SetFiles {
             baselines,
@@ -774,117 +735,18 @@ impl Writer {
     /// why this is not optional: whatever `fsync_every_rows` says, a set that is
     /// about to be closed is one whose rows have to be on the platter.
     fn close_set(&mut self) -> Result<String> {
-        self.finish()?;
+        self.finish_set()?;
         let closed = self.prefix.clone();
         self.files = None;
         Ok(closed)
     }
 
-    /// Make sure the row about to be written has a set, opening or rolling one as
-    /// the row's own local day requires.
-    ///
-    /// The decision is a pure function of (current set's day, this row's day) --
-    /// see [`decide`] -- so it is unit-testable without a timezone, and the
-    /// timezone itself is read per row rather than cached, which is what makes a
-    /// daylight-saving day come out right.
-    fn ensure_set_for(&mut self, row_ms: i64, blocks: &RowBlock) -> Result<()> {
-        if !self.daily {
-            if self.files.is_none() {
-                bail!("no output set is open and daily files are off; this is a writer bug");
-            }
-            return Ok(());
-        }
-        let day = local_day_at(row_ms);
-        match decide(self.set_day.as_deref(), &day) {
-            Decision::Open => {
-                // `set_kind` was decided when the writer was built: a day that
-                // already had a set but was not appended to (a changed
-                // configuration, `--allow-second-set`) opens a second one.
-                self.create_set(&day, row_ms, blocks, self.set_kind, None)
-            }
-            Decision::Keep => Ok(()),
-            Decision::Roll => {
-                let rows = self.rows_in_set;
-                let from_day = self.set_day.clone().unwrap_or_default();
-                let from = self.close_set()?;
-                self.create_set(&day, row_ms, blocks, SetKind::Rollover, Some(from.clone()))?;
-                // Loud, because this is the one event this feature exists for and a
-                // multi-day run's log is the only place it can be seen while it
-                // happens; the prefix is not knowable in advance (it is this row's
-                // own local time), so it has to be printed rather than documented.
-                eprintln!(
-                    "writer: local day changed {from_day} -> {day}: closed set {from} \
-                     ({rows} rows) and opened {}",
-                    self.prefix
-                );
-                Ok(())
-            }
-            Decision::WarnBackwards => {
-                if !self.backward_warned {
-                    self.backward_warned = true;
-                    eprintln!(
-                        "writer: the local day went backwards ({} -> {day}) with the wall clock; \
-                         keeping the current set {} and not opening another, because the row \
-                         index is monotonic and a set is never reopened once left",
-                        self.set_day.as_deref().unwrap_or("?"),
-                        self.prefix
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// The set currently being written: prefix and local day.
-    pub fn set_prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub fn set_day(&self) -> Option<&str> {
-        self.set_day.as_deref()
-    }
-
-    pub fn set_kind(&self) -> SetKind {
-        self.set_kind
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    pub fn rows_written(&self) -> u64 {
-        self.rows_written
-    }
-
-    /// Append one integration row, opening or rolling the file set first if this
-    /// row belongs to a different local day than the set being written.
-    ///
-    /// `spectrum` is `n_baseline * n_freq` complex64, baseline major -- the whole
-    /// row across every baseline, which is exactly what `corr_rows_fetch` returns
-    /// for one row. `write_row` splits it into one write per baseline file.
-    /// `blocks` carries one entry per station. `row_ms` is the wall
-    /// clock of the row's first frame. `blocks` carries the per-row frame
-    /// accounting.
+    /// Append one integration row to the open set.
     ///
     /// The spectrum goes to disk first and is flushed; the sidecars follow. That
     /// order is the whole reason a crash can only cost a row and never produce an
     /// unreadable one.
-    pub fn write_row(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
-        if spectrum.len() != self.row_bytes {
-            bail!(
-                "write_row got {} bytes but one row is {} bytes",
-                spectrum.len(),
-                self.row_bytes
-            );
-        }
-        if blocks.valid_frames_per_station.len() != self.n_station {
-            bail!(
-                "write_row got {} per-station records but there are {} stations",
-                blocks.valid_frames_per_station.len(),
-                self.n_station
-            );
-        }
-
+    fn write_one(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
         self.ensure_set_for(row_ms, blocks)?;
 
         let files = self
@@ -902,10 +764,10 @@ impl Writer {
             // One write per baseline, of exactly one row. Not write_all in a loop:
             // a partially applied row is what we are trying to avoid.
             f.write_all(&spectrum[start..start + self.per_baseline_row])
-                .with_context(|| format!("writing row {} baseline {idx}", self.rows_written))?;
+                .with_context(|| format!("writing row {} baseline {idx}", self.rows_total))?;
         }
 
-        if self.rows_written % self.fsync_every == 0 {
+        if self.rows_total % self.fsync_every == 0 {
             // Flush the data before the sidecars claim it exists.
             for f in files.baselines.iter_mut() {
                 f.flush()?;
@@ -919,7 +781,7 @@ impl Writer {
             .ms_bin
             .write_all(&row_ms.to_le_bytes())
             .context("writing rows_ms.bin")?;
-        writeln!(files.ms_txt, "{} {}", self.rows_written, row_ms).context("writing rows_ms.txt")?;
+        writeln!(files.ms_txt, "{} {}", self.rows_total, row_ms).context("writing rows_ms.txt")?;
 
         for (station, valid) in blocks.valid_frames_per_station.iter().enumerate() {
             writeln!(
@@ -935,13 +797,23 @@ impl Writer {
             .context("writing blocks.csv")?;
         }
 
-        self.rows_written += 1;
+        self.rows_total += 1;
         self.rows_in_set += 1;
         Ok(())
     }
 
-    /// Flush and fsync everything in the current set. Called on a clean stop.
-    pub fn finish(&mut self) -> Result<()> {
+    /// Push the buffered sidecars to the OS. Not a durability point: `rows_ms.bin`
+    /// is written directly, `blocks.csv` and `rows_ms.txt` go through a `BufWriter`.
+    fn flush_sidecars(&mut self) -> Result<()> {
+        if let Some(files) = self.files.as_mut() {
+            files.ms_txt.flush()?;
+            files.blocks.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Flush and fsync everything in the current set.
+    fn finish_set(&mut self) -> Result<()> {
         let Some(files) = self.files.as_mut() else {
             return Ok(()); // never had a set: nothing was written
         };
@@ -959,6 +831,472 @@ impl Writer {
         Ok(())
     }
 }
+
+/// The writer thread: take one row at a time off the queue, write it, hand the
+/// buffer back, and never touch anything the pipeline thread owns.
+fn run_writer_thread(
+    mut state: SetState,
+    rx: std::sync::mpsc::Receiver<Job>,
+    free: std::sync::mpsc::Sender<Vec<u8>>,
+    rows: Arc<AtomicU64>,
+    first_error: Arc<Mutex<Option<anyhow::Error>>>,
+) {
+    let started = Instant::now();
+    let mut busy = Duration::ZERO;
+    let mut written = 0u64;
+    while let Ok(job) = rx.recv() {
+        match job {
+            Job::Row {
+                buf,
+                row_ms,
+                blocks,
+            } => {
+                let t0 = std::time::Instant::now();
+                let r = state.write_one(&buf, row_ms, &blocks);
+                busy += t0.elapsed();
+                match r {
+                    Ok(()) => {
+                        written += 1;
+                        rows.store(state.rows_total, Ordering::Release);
+                        let _ = free.send(buf);
+                    }
+                    Err(e) => {
+                        *first_error.lock().expect("not poisoned") = Some(e);
+                        break;
+                    }
+                }
+            }
+            Job::Sync(ack) => {
+                let r = state
+                    .flush_sidecars()
+                    .map(|_| state.rows_total)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = ack.send(r);
+            }
+            Job::Finish(ack) => {
+                let r = state
+                    .finish_set()
+                    .map(|_| state.rows_total)
+                    .map_err(|e| format!("{e:#}"));
+                let _ = ack.send(r);
+                break;
+            }
+        }
+    }
+    // What only the thread knows: how long a row really costs it. If the busy
+    // figure approaches the row period the writer cannot keep up at this rate --
+    // the pipeline is then held by the queue, which the handle's own
+    // `max_outstanding` line reports, not something the thread can see.
+    let per_row = |d: Duration| {
+        if written > 0 {
+            1000.0 * d.as_secs_f64() / written as f64
+        } else {
+            0.0
+        }
+    };
+    eprintln!(
+        "writer: thread wrote {written} rows, {:.0} ms/row of its own time \
+         ({:.0} ms/row of wall clock since it started)",
+        per_row(busy),
+        per_row(started.elapsed())
+    );
+}
+
+/// Handle to the writer thread: hand it a row and do not wait for the disk.
+///
+/// The pipeline thread used to write the rows itself, which meant every `fsync`
+/// (300 of them per row at one per baseline file) was time it was not releasing
+/// staging slots. Measured at nch=16384 that cost 142 ms of a 1007 ms row period
+/// on the pipeline thread, and because the GPU pipeline has no headroom at that
+/// channel count it turned into 28-29% of frames zero filled. Here the row is
+/// copied into a pooled buffer and queued; the queue is bounded by
+/// `storage.queue_bytes`, so a writer that falls behind blocks the pipeline --
+/// which is the old behaviour, kept as the honest fallback -- and a writer that
+/// merely pauses costs nothing.
+pub struct Writer {
+    dir: PathBuf,
+    row_bytes: usize,
+    n_station: usize,
+    /// The set this process starts on, for the startup line. Later sets (a day
+    /// boundary) are announced by the thread, which is where they happen.
+    prefix: String,
+    set_day: Option<String>,
+    set_kind: SetKind,
+
+    tx: std::sync::mpsc::SyncSender<Job>,
+    rx_free: std::sync::mpsc::Receiver<Vec<u8>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    rows: Arc<AtomicU64>,
+    first_error: Arc<Mutex<Option<anyhow::Error>>>,
+    pool: Vec<Vec<u8>>,
+    /// Rows that may be in flight, from `storage.queue_bytes`.
+    queue_depth: usize,
+    pool_cap: usize,
+    /// Rows this process has handed to the thread, and the reader count it
+    /// started from. The queue length is their difference against what the
+    /// thread has finished -- counting buffers instead would drift, because a
+    /// buffer is taken at two different places but only ever given back once.
+    sent: u64,
+    rows_at_open: u64,
+    max_outstanding: u64,
+    finished: bool,
+    rows_final: u64,
+}
+
+/// The state an operator needs in a log line, without the open file handles.
+impl std::fmt::Debug for Writer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writer")
+            .field("dir", &self.dir)
+            .field("set_prefix", &self.prefix)
+            .field("set_day", &self.set_day)
+            .field("rows_written", &self.rows_written())
+            .field("queued", &self.queued())
+            .finish()
+    }
+}
+
+impl Writer {
+    /// Create or resume a run directory, appending to today's set if there is one.
+    pub fn open(
+        dir: &Path,
+        plan: &RunPlan,
+        cfg: &Config,
+        config_hash: &str,
+        fsync_every: u64,
+    ) -> Result<(Self, ResumeState)> {
+        Self::open_with(dir, plan, cfg, config_hash, fsync_every, &SetPolicy::Auto)
+    }
+
+    /// As [`Writer::open`], with an explicit policy for which set to use.
+    pub fn open_with(
+        dir: &Path,
+        plan: &RunPlan,
+        cfg: &Config,
+        config_hash: &str,
+        fsync_every: u64,
+        policy: &SetPolicy,
+    ) -> Result<(Self, ResumeState)> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating the run directory {}", dir.display()))?;
+
+        let daily = cfg.storage.daily_files;
+        let empty = ResumeState {
+            rows_written: 0,
+            next_frame_id: None,
+            truncated_rows: 0,
+        };
+        let (state, resume) = if !daily {
+            // No per-day splitting: one set for the whole run, stamped with the
+            // local time the writer opened it. The files still carry the station
+            // pair and a time, so a name stays self-describing; what is gone is
+            // the rollover at the local midnight (docs/DESIGN-daily-files.md).
+            SetState::attach(
+                dir,
+                plan,
+                cfg,
+                config_hash,
+                fsync_every,
+                &SetNames::new(
+                    &cfg.storage.file_prefix,
+                    &local_stamp_at(crate::sched::system_ms(), &cfg.storage.file_prefix_format),
+                ),
+                None,
+            )?
+        } else {
+            let today = local_day_at(crate::sched::system_ms());
+            let found = discover_sets(dir, plan)?;
+            if std::env::var_os("CORR_SET_DEBUG").is_some() {
+                eprintln!("writer: daily sets in {}: {found:?}", dir.display());
+            }
+            // Which set to append to?
+            let chosen: Option<FoundSet> = match policy {
+                SetPolicy::Explicit(prefix) => {
+                    let hit = found.iter().find(|s| s.prefix == *prefix).cloned();
+                    match hit {
+                        Some(s) => Some(s),
+                        None => bail!(
+                            "no file set with prefix {prefix:?} in {}; the sets there are {:?}",
+                            dir.display(),
+                            found.iter().map(|s| s.prefix.as_str()).collect::<Vec<_>>()
+                        ),
+                    }
+                }
+                SetPolicy::NewSet => None,
+                SetPolicy::Auto => found
+                    .iter()
+                    .filter(|s| s.day == today)
+                    .min_by(|a, b| a.prefix.cmp(&b.prefix))
+                    .cloned(),
+            };
+            match chosen {
+                Some(set) => {
+                    // Appending to an existing set: the config hash has to agree,
+                    // or two geometries would be mixed into one file set. The
+                    // message names the way out, because the alternative is an
+                    // operator guessing.
+                    SetState::attach(
+                        dir,
+                        plan,
+                        cfg,
+                        config_hash,
+                        fsync_every,
+                        &set.names,
+                        Some(&set),
+                    )
+                    .map_err(|e| {
+                        if matches!(policy, SetPolicy::Auto) {
+                            e.context(format!(
+                                "appending to today's set {}: if the configuration changed on \
+                                 purpose, either pass --set <prefix> to choose a set explicitly \
+                                 or --allow-second-set to start another set for today",
+                                set.prefix
+                            ))
+                        } else {
+                            e
+                        }
+                    })?
+                }
+                None => {
+                    // No set to append to: the first row will name one.
+                    let second = found.iter().any(|s| s.day == today);
+                    let kind = if second { SetKind::SecondSet } else { SetKind::Start };
+                    (
+                        SetState::unopened(dir, plan, cfg, config_hash, fsync_every, kind),
+                        empty,
+                    )
+                }
+            }
+        };
+
+        let row_bytes = state.row_bytes;
+        let n_station = state.n_station;
+        let prefix = state.prefix.clone();
+        let set_day = state.set_day.clone();
+        let set_kind = state.set_kind;
+        let rows_at_open = resume.rows_written;
+
+        // How many rows may be in flight. `storage.queue_bytes` was in the schema
+        // and validated from the start but never used; this is what it was for.
+        // Capped, because the point is to absorb a hiccup, not to buffer a minute
+        // of data in RAM: the writer needs ~150 ms per row and has ~1000 ms.
+        let depth = (cfg.storage.queue_bytes as usize / row_bytes.max(1)).clamp(2, 8);
+        let (tx, rx) = std::sync::mpsc::sync_channel(depth);
+        let (free_tx, rx_free) = std::sync::mpsc::channel();
+        let rows = Arc::new(AtomicU64::new(rows_at_open));
+        let first_error: Arc<Mutex<Option<anyhow::Error>>> = Arc::new(Mutex::new(None));
+        let handle = {
+            let rows = rows.clone();
+            let first_error = first_error.clone();
+            std::thread::Builder::new()
+                .name("corr-writer".to_string())
+                .spawn(move || run_writer_thread(state, rx, free_tx, rows, first_error))
+                .context("spawning the writer thread")?
+        };
+
+        Ok((
+            Writer {
+                dir: dir.to_path_buf(),
+                row_bytes,
+                n_station,
+                prefix,
+                set_day,
+                set_kind,
+                tx,
+                rx_free,
+                handle: Some(handle),
+                rows,
+                first_error,
+                pool: Vec::new(),
+                queue_depth: depth,
+                pool_cap: depth + 2,
+                sent: 0,
+                rows_at_open,
+                max_outstanding: 0,
+                finished: false,
+                rows_final: rows_at_open,
+            },
+            resume,
+        ))
+    }
+
+    /// Take an error the writer thread hit, if any.
+    ///
+    /// One row late at most: the thread records the first failure and stops, and
+    /// the next call here (a `write_row` or `finish`) returns it. That is the
+    /// price of not making the pipeline thread wait for the disk, and at a 1 s
+    /// integration it is at most one second of extra rows in flight.
+    fn take_error(&mut self) -> Result<()> {
+        let mut slot = self.first_error.lock().expect("not poisoned");
+        match slot.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The set this process *starts* on: prefix and local day, for the startup
+    /// line. It is fixed at open and never updated by the writer thread, so with
+    /// `storage.daily_files` on and no set to resume it is empty until the thread
+    /// names the set after the first row's timestamp -- and it stays the startup
+    /// value across a day boundary. The sets a run actually produced are the ones
+    /// in the directory; read those (and their metadata) instead of this.
+    pub fn set_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// The local day of the set this process starts on; `None` when the first
+    /// row has yet to name it. See [`Writer::set_prefix`].
+    pub fn set_day(&self) -> Option<&str> {
+        self.set_day.as_deref()
+    }
+
+    /// How this process starts on that set. See [`Writer::set_prefix`].
+    pub fn set_kind(&self) -> SetKind {
+        self.set_kind
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Rows the writer has finished with. Exact after [`Writer::finish`].
+    pub fn rows_written(&self) -> u64 {
+        self.rows.load(Ordering::Acquire).max(self.rows_final)
+    }
+
+    /// Rows handed over but not yet written: the queue's length right now.
+    pub fn queued(&self) -> u64 {
+        self.sent
+            .saturating_sub(self.rows_written().saturating_sub(self.rows_at_open))
+    }
+
+    /// Queue one integration row. Returns as soon as the row is handed over.
+    ///
+    /// The length checks stay here rather than in the thread so a caller that
+    /// passes the wrong shape is told immediately, on its own stack.
+    pub fn write_row(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
+        if spectrum.len() != self.row_bytes {
+            bail!(
+                "write_row got {} bytes but one row is {} bytes",
+                spectrum.len(),
+                self.row_bytes
+            );
+        }
+        if blocks.valid_frames_per_station.len() != self.n_station {
+            bail!(
+                "write_row got {} per-station records but there are {} stations",
+                blocks.valid_frames_per_station.len(),
+                self.n_station
+            );
+        }
+        self.take_error()?;
+
+        let mut buf = match self.pool.pop().or_else(|| self.rx_free.try_recv().ok()) {
+            Some(mut b) => {
+                b.clear();
+                b
+            }
+            None => Vec::with_capacity(self.row_bytes),
+        };
+        buf.extend_from_slice(spectrum);
+        if self
+            .tx
+            .send(Job::Row {
+                buf,
+                row_ms,
+                blocks: blocks.clone(),
+            })
+            .is_err()
+        {
+            // The thread stopped between the check above and this send. Its own
+            // error is the reason whenever it recorded one: a bare "the thread
+            // stopped" here would lose the type the pipeline needs (a failed day
+            // rollover is a `RolloverFailed`, and the report names it).
+            self.take_error()?;
+            bail!("the writer thread has stopped without reporting a reason");
+        }
+        self.sent += 1;
+        let queued = self.queued();
+        if queued > self.max_outstanding {
+            self.max_outstanding = queued;
+        }
+        while let Ok(b) = self.rx_free.try_recv() {
+            if self.pool.len() < self.pool_cap {
+                self.pool.push(b);
+            }
+        }
+        self.take_error()
+    }
+
+    /// Wait until every row handed over so far has been written to the files.
+    ///
+    /// Not a durability point (that is [`Writer::finish`]): it exists so a caller
+    /// that wants to look at the output while the run continues -- a test, a
+    /// monitoring job -- sees what it handed over, and so the row count is exact
+    /// at that moment.
+    pub fn sync(&mut self) -> Result<()> {
+        if self.finished {
+            return self.take_error();
+        }
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.tx.send(Job::Sync(ack_tx)).is_err() {
+            // A stopped thread answers nothing; whatever it recorded is the reason.
+            self.take_error()?;
+            bail!("the writer thread has stopped without reporting a reason");
+        }
+        match ack_rx.recv() {
+            Ok(Ok(n)) => self.rows_final = n.max(self.rows_final),
+            Ok(Err(msg)) => return Err(anyhow::anyhow!("{msg}")),
+            // The thread died instead of answering (it hit an error and stopped);
+            // `take_error` below turns that into the error it recorded.
+            Err(_) => {}
+        }
+        self.take_error()
+    }
+
+    /// Drain the queue, fsync everything and stop the thread.
+    pub fn finish(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        let mut ack_error: Option<anyhow::Error> = None;
+        if self.tx.send(Job::Finish(ack_tx)).is_ok() {
+            match ack_rx.recv() {
+                Ok(Ok(n)) => self.rows_final = n,
+                Ok(Err(msg)) => ack_error = Some(anyhow::anyhow!("{msg}")),
+                Err(_) => {} // the thread is gone; the stored error says why
+            }
+        }
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        eprintln!(
+            "writer: {} rows handed over, deepest queue {} of {} rows ({} MB); \
+             the pipeline thread never wrote or fsynced a row",
+            self.rows_written(),
+            self.max_outstanding,
+            self.queue_depth,
+            self.row_bytes * self.queue_depth / (1024 * 1024),
+        );
+        if let Some(e) = ack_error {
+            return Err(e);
+        }
+        self.take_error()
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // A run that ended without asking (an error on the way out) still has to
+        // close its files: an unflushed sidecar is a row nobody can interpret.
+        if !self.finished {
+            let _ = self.finish();
+        }
+    }
+}
+
 
 /// What to do with a row, given the day the current set belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1520,7 +1858,13 @@ mod tests {
         let t0 = midday_now();
         w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
             .unwrap();
-        let p1 = w.set_prefix().to_string();
+        // The set is opened by the writer thread now, so its name is read from the
+        // directory rather than from the handle: the files are the fact, and the
+        // handle's own copy is only the set this process started on.
+        w.sync().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        let p1 = sets[0].0.clone();
         let fmt = cfg.storage.file_prefix_format.clone();
         assert_eq!(p1, local_stamp_at(t0, &fmt), "prefix is the first row's local time");
         let meta1 = d.path().join(format!("{p1}-metadata.yaml"));
@@ -1542,8 +1886,10 @@ mod tests {
         // A second row on the same local day stays in the same set.
         w.write_row(&make_row(&plan, 1), t0 + 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
             .unwrap();
-        assert_eq!(w.set_prefix(), p1);
-        assert_eq!(sets_on_disk(d.path(), &plan).len(), 1);
+        w.sync().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "same day, same set: {sets:?}");
+        assert_eq!(sets[0].0, p1, "and the set keeps its name");
 
         // A row on the next local day opens a second set, and closes the first.
         let t1 = t0 + 24 * 3600 * 1000 + 60_000;
@@ -1553,7 +1899,13 @@ mod tests {
         }
         w.write_row(&make_row(&plan, 2), t1, &blocks_for(&plan, 2, plan.n_cum as u64))
             .unwrap();
-        let p2 = w.set_prefix().to_string();
+        w.sync().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        let p2 = sets
+            .iter()
+            .map(|(p, _, _)| p.clone())
+            .find(|p| *p != p1)
+            .expect("the new day opened a second set");
         assert_ne!(p1, p2);
         assert_eq!(p2, local_stamp_at(t1, &fmt));
         let sets = sets_on_disk(d.path(), &plan);
@@ -1586,6 +1938,59 @@ mod tests {
     }
 
     #[test]
+    fn a_rollover_that_cannot_open_its_set_stops_with_that_reason() {
+        // The day boundary now happens in the writer thread, so this is the path
+        // that has to keep its *type* across the thread boundary: the pipeline
+        // downcasts `RolloverFailed` to stop the run with a reason the report
+        // carries, and a stringified error would end the run without saying why.
+        let (cfg, plan) = test_plan_and_cfg_daily();
+        let d = TempDir::new("daily-roll-fail");
+        let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        let t0 = midday_now();
+        w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
+            .unwrap();
+        w.sync().unwrap();
+        let p1 = sets_on_disk(d.path(), &plan)[0].0.clone();
+
+        let t1 = t0 + 24 * 3600 * 1000 + 60_000;
+        if local_day_at(t1) == local_day_at(t0) {
+            return; // pathological timezone, as in the rollover test above
+        }
+        // The new day's set cannot be created: something already owns that name.
+        let next = local_stamp_at(t1, &cfg.storage.file_prefix_format);
+        let names = SetNames::new(&cfg.storage.file_prefix, &next);
+        // The name the new day's set would take, so the squatter is exactly the
+        // file the rollover probes for.
+        let (j0, k0) = plan.baseline_pairs().first().copied().unwrap_or((0, 0));
+        let squatter = d
+            .path()
+            .join(names.baseline(&plan.enabled[j0].name, &plan.enabled[k0].name));
+        std::fs::write(&squatter, b"not ours").unwrap();
+
+        // The thread hits it on the row that crosses the boundary, so that row is
+        // not written; the caller is told at the next `write_row` (or here, at
+        // `finish`, which waits for the thread and then reports what it hit --
+        // that join is what makes this test deterministic rather than a race
+        // against the thread).
+        w.write_row(&make_row(&plan, 1), t1, &blocks_for(&plan, 1, plan.n_cum as u64))
+            .unwrap();
+        let err = w.finish().unwrap_err();
+        let rf = err
+            .downcast_ref::<RolloverFailed>()
+            .unwrap_or_else(|| panic!("typed, not a string: {err:#}"));
+        assert_eq!(rf.prefix, names.tag());
+        assert!(rf.detail.contains("already holds"), "{:?}", rf.detail);
+
+        // And the set that was left is closed cleanly, with the rows it did get:
+        // the boundary is not a reason to lose the day that ended.
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!(sets[0].0, p1);
+        assert_eq!((sets[0].1, sets[0].2), (1, 1), "the crossing row was not written");
+        assert_eq!(std::fs::read(&squatter).unwrap(), b"not ours");
+    }
+
+    #[test]
     fn a_restart_appends_to_the_days_set_instead_of_opening_a_second() {
         let (cfg, plan) = test_plan_and_cfg_daily();
         let d = TempDir::new("daily-resume");
@@ -1597,8 +2002,8 @@ mod tests {
                 .unwrap();
             w.write_row(&make_row(&plan, 1), t0 + 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
                 .unwrap();
-            p1 = w.set_prefix().to_string();
             w.finish().unwrap();
+            p1 = sets_on_disk(d.path(), &plan)[0].0.clone();
         }
         // A new process on the same day finds that set and appends.
         let (mut w2, st2) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
@@ -1628,7 +2033,8 @@ mod tests {
             let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
             w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
                 .unwrap();
-            p1 = w.set_prefix().to_string();
+            w.sync().unwrap();
+            p1 = sets_on_disk(d.path(), &plan)[0].0.clone();
         }
         // Same day, different geometry: appending would mix two geometries into
         // one set, so it is refused -- with the two ways out in the message.
@@ -1644,10 +2050,17 @@ mod tests {
         assert_eq!(st2.rows_written, 0);
         w2.write_row(&make_row(&plan, 0), t0 + 1000, &blocks_for(&plan, 0, plan.n_cum as u64))
             .unwrap();
-        assert_ne!(w2.set_prefix(), p1);
-        let meta2 = d.path().join(format!("{}-metadata.yaml", w2.set_prefix()));
+        assert_ne!(w2.set_prefix(), p1.as_str());
+        w2.sync().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 2, "{sets:?}");
+        let p2 = sets
+            .iter()
+            .map(|(p, _, _)| p.clone())
+            .find(|p| *p != p1)
+            .expect("the second set has the other prefix");
+        let meta2 = d.path().join(format!("{p2}-metadata.yaml"));
         assert_eq!(read_metadata_field(&meta2, "set_kind").as_deref(), Some("second_set"));
-        assert_eq!(sets_on_disk(d.path(), &plan).len(), 2);
 
         // --set <prefix> appends to the named set instead.
         let (w3, st3) =
@@ -1665,12 +2078,18 @@ mod tests {
         let t0 = midday_now();
         w.write_row(&make_row(&plan, 0), t0, &blocks_for(&plan, 0, plan.n_cum as u64))
             .unwrap();
-        let p1 = w.set_prefix().to_string();
+        // The name comes from the first row's timestamp and is decided in the
+        // writer thread, so it is read back from the directory.
+        w.sync().unwrap();
+        let p1 = sets_on_disk(d.path(), &plan)[0].0.clone();
         // A row stamped a day earlier (NTP step, timezone change) must not reopen
         // a set that has been left.
         w.write_row(&make_row(&plan, 1), t0 - 24 * 3600 * 1000, &blocks_for(&plan, 1, plan.n_cum as u64))
             .unwrap();
-        assert_eq!(w.set_prefix(), p1);
+        w.sync().unwrap();
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "the earlier stamp opened nothing: {sets:?}");
+        assert_eq!(sets[0].0, p1, "and the row stayed in the current set");
         w.finish().unwrap();
         let sets = sets_on_disk(d.path(), &plan);
         assert_eq!(sets.len(), 1);
