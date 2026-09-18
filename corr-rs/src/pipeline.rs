@@ -219,11 +219,16 @@ impl<'a> Pipeline<'a> {
                     // Printed from here because this is the one thread that is idle
                     // by construction, and because both receivers reach it.
                     if let Some(m) = self.monitor.as_mut() {
+                        // The set tag is read live rather than captured once: the
+                        // thread opens the next set at a day boundary, and a monitor
+                        // showing the previous set's name is worse than none.
+                        let set_tag = self.writer.as_ref().map(|w| w.current_set_tag());
                         m.tick(
                             &self.sched,
                             self.progress,
                             self.ring.as_ref(),
                             self.gpu.as_ref(),
+                            set_tag.as_deref(),
                             now,
                         );
                     }

@@ -37,6 +37,11 @@
    我们 socket 的内核丢包增量，最后一段 `capacity:` 指出**当前先顶到上限的是谁**
    （socket 丢包 / 环 / GPU 链路 / 整机 / 本进程 CPU）。设 `0` 关闭。同段的
    `stats_csv` 仍是**已接受但未实现**的字段（配置里写了它不会报错，但也不会写文件）。
+6. **`monitoring.http` 是只读状态接口**（默认 `enabled: false`，要显式打开）：
+   `GET /status.json` 返回与上面那行**同一份**样本的 JSON，由 corr 的一个独立线程
+   serve；页面在独立运行的 `tools/corr-web.py` 里。它不在数据通路上（bind 失败只告警、
+   不停跑），编译期可以整体去掉（`--no-default-features` 或只关 `status-http`）。
+   字段表、契约与"为什么可以放进生产进程"见 `docs/DESIGN-status-http.md`。
 
 4. **改完先跑 `tools/doctor.py --config <cfg>`**：它检查 IRQ 撞核、RX 环大小、backlog、
    `SO_BUSY_POLL` 权限、以及是否有别的进程占着前端的组。

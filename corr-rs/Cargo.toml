@@ -15,8 +15,14 @@ publish = false
 # thread-per-station pair alone with `--no-default-features` -- that also keeps
 # `tokio` out of the dependency tree entirely, which is what the production host
 # wants when it has no use for the second backend.
-default = ["async-recv"]
+default = ["async-recv", "status-http"]
 async-recv = ["dep:tokio"]
+# The read-only status endpoint (`monitoring.http`, `GET /status.json`). On by
+# default, but the endpoint itself is **off unless the configuration asks for
+# it**: the feature only decides whether the code exists, so
+# `--no-default-features` keeps HTTP and JSON out of a production build
+# entirely, exactly like `async-recv` keeps tokio out.
+status-http = ["dep:serde_json"]
 
 [dependencies]
 anyhow = "1"
@@ -24,6 +30,10 @@ clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+# Only with `status-http`: the serialisation half of the status endpoint. The
+# snapshot type itself is plain `serde`-derivable data in `monitor.rs`, so the
+# sampler does not depend on this.
+serde_json = { version = "1", optional = true }
 # Only with `async-recv` (on unless `--no-default-features`): the per-worker runtimes that multiplex the
 # stations' sockets (`rt`), the `select!` that waits on a socket and on the
 # scheduler's request at once (`macros`), the epoll reactor with `AsyncFd` (`net`),

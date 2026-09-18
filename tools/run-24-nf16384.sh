@@ -36,7 +36,12 @@ cd "$(dirname "$0")/.."
 CFG=${CFG:-config/correlator-24-nf16384-manual.yaml}
 MODE=${MODE:-async}                 # async | sync
 DUR=${DUR:-300}                     # 秒；0 = 不加 --duration，跑到 Ctrl-C
-WORKERS=${WORKERS:-24}              # 异步腿的 worker 数；结论：按负载定，别照抄核数
+# 异步腿的 worker 数。**按到达速率定，不是按核数定**：这台前端 24 路是
+# 24414.0625 帧/s × 8 包/帧 × 24 站 ≈ 4.7 Mpps，而单个 worker 的实测上限在
+# 0.4–0.45 Mpps 附近 —— W 给小了会直接崩，而且崩得很吵：2026-09-18 用 WORKERS=4
+# 跑 120 s，socket 每秒被内核丢掉约 400 万个包、补零 85%（同一配置 WORKERS=24
+# 是干净的）。要比性能就先给足 worker，否则比的是"谁更早把缓冲填满"。
+WORKERS=${WORKERS:-24}
 NEW_SET=${NEW_SET:-0}
 DOCTOR=${DOCTOR:-0}
 TREND=${TREND:-0}

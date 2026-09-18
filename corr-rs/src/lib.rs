@@ -53,6 +53,10 @@ pub mod receiver;
 pub mod report;
 pub mod run;
 pub mod sched;
+/// The read-only status endpoint: `GET /status.json`, off unless
+/// `monitoring.http.enabled` says otherwise. Compiled only with `status-http`.
+#[cfg(feature = "status-http")]
+pub(crate) mod status;
 pub mod stop;
 pub mod writer;
 

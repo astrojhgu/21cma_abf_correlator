@@ -460,6 +460,21 @@ pub(crate) fn run_receive_with(
         Instant::now(),
     );
 
+    // The status endpoint's cell: the one slot the sampler publishes into. It
+    // exists only when the endpoint is configured on, because publishing to
+    // nobody would be work for nothing.
+    let status_cell = if cfg.monitoring.http.enabled {
+        Some(crate::monitor::Cell::new())
+    } else {
+        None
+    };
+    // The endpoint itself, on a thread of its own (feature `status-http`, on by
+    // default; `--no-default-features` keeps it out of the build entirely). A bind
+    // that fails is a warning and a run that carries on: receiving is the point,
+    // monitoring is not.
+    #[cfg(feature = "status-http")]
+    let _ = crate::status::serve(&cfg.monitoring.http, status_cell.clone());
+
     // Everything the loop owns lives in `Pipeline`; naming it here, once, is the
     // whole of what this function has to know about the loop's state.
     let mut pipeline = Pipeline {
@@ -487,7 +502,7 @@ pub(crate) fn run_receive_with(
         prev_zf: 0,
         t0: Instant::now(),
         elapsed: Duration::ZERO,
-        monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, plan),
+        monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, status_cell, plan),
     };
     pipeline.run()?;
     let elapsed = pipeline.elapsed;

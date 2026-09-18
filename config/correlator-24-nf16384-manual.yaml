@@ -263,10 +263,22 @@ cpu:
 # 监控
 # ---------------------------------------------------------------------------
 monitoring:
-  # 每行 JSON 输出到 stderr 的间隔。
+  # 每 interval_ms 打印一行实时状态到 stderr（字段含义见 corr-rs/src/monitor.rs 顶部
+  # 的表，以及 docs/DESIGN-status-http.md）。0 = 不打这一行。
   interval_ms: 1000
   # 同时追加写到 <output_dir>/<run_name>/stats.csv。
   stats_csv: true
+  # 只读状态接口：`GET /status.json` 返回上面同一份样本的 JSON，由本进程的一个
+  # 独立线程 serve；独立运行的监测界面（tools/corr-web.py）从这里取数。
+  #
+  # **默认关**（这里显式打开）：生产跑不该因为一个默认值就开监听端口。
+  # 接口只 serve JSON，没有 HTML；它不在数据通路上，启不来（端口被占）只打一行
+  # 告警然后继续跑 —— 详见 docs/DESIGN-status-http.md。
+  http:
+    enabled: true
+    # 只监听回环：监测程序与 corr 在同一台机器上。
+    # 本机 3080 已被 DSH web GUI 占用，所以默认用 3081。
+    bind: "127.0.0.1:3081"
 
 # ---------------------------------------------------------------------------
 # station 表

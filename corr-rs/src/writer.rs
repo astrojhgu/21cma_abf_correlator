@@ -282,6 +282,10 @@ struct SetState {
 
     /// Prefix of the set being written; empty until a set exists.
     prefix: String,
+    /// The same tag, shared with the handle. A day boundary opens the next set in
+    /// *this* thread, so [`Writer::current_set_tag`] can only answer "which set now"
+    /// from a slot both sides can see.
+    tag: Arc<Mutex<String>>,
     /// Local day of the current set; `None` until a set exists (its name has to
     /// come from its first row's timestamp, so it cannot exist before that row).
     set_day: Option<String>,
@@ -300,6 +304,17 @@ struct SetState {
     rows_total: u64,
 }
 
+/// Put `tag` where [`Writer::current_set_tag`] reads it.
+///
+/// Shared between the thread that opens sets and the handle that reports them. A
+/// `Mutex` is enough: it is written once per set and read once per status sample.
+fn publish_tag(slot: &Arc<Mutex<String>>, tag: String) {
+    match slot.lock() {
+        Ok(mut slot) => *slot = tag,
+        Err(poisoned) => *poisoned.into_inner() = tag,
+    }
+}
+
 impl SetState {
     /// Attach to an existing set, creating it if it is not there yet, and report
     /// where the run should resume.
@@ -310,6 +325,10 @@ impl SetState {
     /// Runs on the calling thread at startup, before any socket is open: the run
     /// needs `ResumeState` to fix its row grid, and a failure here should stop the
     /// process before it starts receiving.
+    // Eight arguments, every one of them this constructor's own input: the run's
+    // shape, the set's naming, the metadata it is checked against, and the slot the
+    // tag is published into. A parameter struct would only move the list elsewhere.
+    #[allow(clippy::too_many_arguments)]
     fn attach(
         dir: &Path,
         plan: &RunPlan,
@@ -318,6 +337,7 @@ impl SetState {
         fsync_every: u64,
         names: &SetNames,
         found: Option<&FoundSet>,
+        tag: Arc<Mutex<String>>,
     ) -> Result<(Self, ResumeState)> {
         // One file per baseline, named by the two stations it correlates.
         let baseline_path = |j: usize, k: usize| {
@@ -457,10 +477,14 @@ impl SetState {
             next_frame_id,
             truncated_rows,
         };
+        // Publish it now: on resume this is the set the rows go into, and a
+        // rollover republishes from `try_create_set`.
+        publish_tag(&tag, names.tag());
         Ok((
             SetState {
                 dir: dir.to_path_buf(),
                 prefix: names.tag(),
+                tag,
                 plan: plan.clone(),
                 cfg: cfg.clone(),
                 config_hash: config_hash.to_string(),
@@ -496,6 +520,7 @@ impl SetState {
         config_hash: &str,
         fsync_every: u64,
         first_kind: SetKind,
+        tag: Arc<Mutex<String>>,
     ) -> Self {
         SetState {
             dir: dir.to_path_buf(),
@@ -505,6 +530,7 @@ impl SetState {
             fsync_every: fsync_every.max(1),
             daily: cfg.storage.daily_files,
             prefix: String::new(),
+            tag,
             set_day: None,
             set_kind: first_kind,
             set_first_row: None,
@@ -714,7 +740,9 @@ impl SetState {
             0,
         )?;
 
-        self.prefix = names.tag();
+        let tag = names.tag();
+        self.prefix = tag.clone();
+        publish_tag(&self.tag, tag);
         self.set_day = Some(day.to_string());
         self.set_kind = kind;
         self.set_continuation_of = continuation;
@@ -920,6 +948,9 @@ pub struct Writer {
     /// The set this process starts on, for the startup line. Later sets (a day
     /// boundary) are announced by the thread, which is where they happen.
     prefix: String,
+    /// The set being written right now, shared with that thread. See
+    /// [`Writer::current_set_tag`].
+    tag: Arc<Mutex<String>>,
     set_day: Option<String>,
     set_kind: SetKind,
 
@@ -981,6 +1012,9 @@ impl Writer {
             .with_context(|| format!("creating the run directory {}", dir.display()))?;
 
         let daily = cfg.storage.daily_files;
+        // The shared slot for "which set is being written right now", empty until a
+        // set exists. Created before the first attach so that both paths fill it.
+        let tag: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let empty = ResumeState {
             rows_written: 0,
             next_frame_id: None,
@@ -1002,6 +1036,7 @@ impl Writer {
                     &local_stamp_at(crate::sched::system_ms(), &cfg.storage.file_prefix_format),
                 ),
                 None,
+                tag.clone(),
             )?
         } else {
             let today = local_day_at(crate::sched::system_ms());
@@ -1043,6 +1078,7 @@ impl Writer {
                         fsync_every,
                         &set.names,
                         Some(&set),
+                        tag.clone(),
                     )
                     .map_err(|e| {
                         if matches!(policy, SetPolicy::Auto) {
@@ -1062,7 +1098,15 @@ impl Writer {
                     let second = found.iter().any(|s| s.day == today);
                     let kind = if second { SetKind::SecondSet } else { SetKind::Start };
                     (
-                        SetState::unopened(dir, plan, cfg, config_hash, fsync_every, kind),
+                        SetState::unopened(
+                            dir,
+                            plan,
+                            cfg,
+                            config_hash,
+                            fsync_every,
+                            kind,
+                            tag.clone(),
+                        ),
                         empty,
                     )
                 }
@@ -1072,6 +1116,7 @@ impl Writer {
         let row_bytes = state.row_bytes;
         let n_station = state.n_station;
         let prefix = state.prefix.clone();
+        let live_tag = state.tag.clone();
         let set_day = state.set_day.clone();
         let set_kind = state.set_kind;
         let rows_at_open = resume.rows_written;
@@ -1100,6 +1145,7 @@ impl Writer {
                 row_bytes,
                 n_station,
                 prefix,
+                tag: live_tag,
                 set_day,
                 set_kind,
                 tx,
@@ -1139,9 +1185,22 @@ impl Writer {
     /// `storage.daily_files` on and no set to resume it is empty until the thread
     /// names the set after the first row's timestamp -- and it stays the startup
     /// value across a day boundary. The sets a run actually produced are the ones
-    /// in the directory; read those (and their metadata) instead of this.
+    /// in the directory; read those (and their metadata) instead of this --
+    /// [`Writer::current_set_tag`] is the one that follows the thread.
     pub fn set_prefix(&self) -> &str {
         &self.prefix
+    }
+
+    /// The set being written *right now*, which is what a monitor wants: before a
+    /// set exists, and again after a local-midnight rollover, this differs from
+    /// [`Writer::set_prefix`] -- that one is fixed at open, by design.
+    ///
+    /// Empty until the first row (or a resume) has named a set.
+    pub fn current_set_tag(&self) -> String {
+        match self.tag.lock() {
+            Ok(tag) => tag.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     /// The local day of the set this process starts on; `None` when the first
@@ -1853,6 +1912,10 @@ mod tests {
         // The name has to come from the first row's timestamp, so no set can exist
         // before that row is in hand.
         assert!(w.set_prefix().is_empty(), "no set before the first row");
+        assert!(
+            w.current_set_tag().is_empty(),
+            "and nothing is being written yet"
+        );
         assert!(sets_on_disk(d.path(), &plan).is_empty());
 
         let t0 = midday_now();
@@ -1867,6 +1930,10 @@ mod tests {
         let p1 = sets[0].0.clone();
         let fmt = cfg.storage.file_prefix_format.clone();
         assert_eq!(p1, local_stamp_at(t0, &fmt), "prefix is the first row's local time");
+        // The handle follows the thread, which is what the live status reads: this
+        // is the accessor that answers "which set is being written now", as opposed
+        // to `set_prefix`, which is fixed at open.
+        assert_eq!(w.current_set_tag(), p1);
         let meta1 = d.path().join(format!("{p1}-metadata.yaml"));
         assert_eq!(read_metadata_field(&meta1, "set_day").as_deref(), Some(local_day_at(t0).as_str()));
         assert_eq!(read_metadata_field(&meta1, "set_kind").as_deref(), Some("start"));
@@ -1908,6 +1975,9 @@ mod tests {
             .expect("the new day opened a second set");
         assert_ne!(p1, p2);
         assert_eq!(p2, local_stamp_at(t1, &fmt));
+        // The rollover happened in the writer thread; the handle reports the new set
+        // without the caller doing anything about it.
+        assert_eq!(w.current_set_tag(), p2);
         let sets = sets_on_disk(d.path(), &plan);
         assert_eq!(sets.len(), 2, "{sets:?}");
         let s1 = sets.iter().find(|(p, _, _)| *p == p1).unwrap();

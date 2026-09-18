@@ -405,6 +405,46 @@ pub struct MonitoringCfg {
     /// configuration written for it does not silently mean something else. The
     /// line on stderr is the live view; the run report is the record.
     pub stats_csv: bool,
+    /// The read-only status endpoint, for a monitor that runs as its own program
+    /// (`tools/corr-web.py` is one): `GET /status.json` returns one JSON object,
+    /// rendered per request from the sampler's latest snapshot.
+    ///
+    /// **Off unless this says `enabled: true`**: a production run should not open
+    /// a listening socket because of a default. Nothing in the data path reads
+    /// this -- the sampler publishes whether or not anybody is listening, and the
+    /// endpoint is served from a thread of its own
+    /// (`docs/DESIGN-status-http.md`).
+    #[serde(default)]
+    pub http: HttpCfg,
+}
+
+/// The status endpoint's configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpCfg {
+    /// Serve `GET /status.json` for as long as the run is up.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `IP:port` to listen on; the loopback by default.
+    ///
+    /// Validated while the configuration is loaded rather than when the socket is
+    /// bound, so a typo stops the run at startup instead of leaving an operator
+    /// waiting for a monitor page that never appears.
+    #[serde(default = "default_http_bind")]
+    pub bind: String,
+}
+
+impl Default for HttpCfg {
+    fn default() -> Self {
+        HttpCfg {
+            enabled: false,
+            bind: default_http_bind(),
+        }
+    }
+}
+
+fn default_http_bind() -> String {
+    DEFAULT_HTTP_BIND.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -586,6 +626,12 @@ pub const DEFAULT_FILE_PREFIX_FORMAT: &str = "%Y%m%d-%H%M%S";
 /// the project's notes, while the file names inside it are the ones a reader has
 /// to parse.
 pub const DEFAULT_RUN_NAME_FORMAT: &str = "%Y%m%d_%H%M%S";
+
+/// Default address for the status endpoint: the loopback, so that turning it on
+/// exposes a run to this host and not to the network.
+///
+/// 3081 rather than 3080, which this machine's DSH web GUI already holds.
+pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:3081";
 
 /// Current UTC time as `YYYYmmdd_HHMMSS`.
 ///
@@ -857,6 +903,21 @@ impl Config {
         }
         if self.receiver.interface_ip.is_unspecified() {
             bail!("receiver.interface_ip must be set; it is the IP_ADD_MEMBERSHIP interface");
+        }
+
+        // --- monitoring ---------------------------------------------------
+        // Only checked when the endpoint is on: a `bind` nobody asked to listen on
+        // is not a reason to refuse a run, the same way a junk prefix format is not
+        // when daily files are off.
+        if self.monitoring.http.enabled
+            && self.monitoring.http.bind.parse::<std::net::SocketAddr>().is_err()
+        {
+            bail!(
+                "monitoring.http.bind={:?} is not an `IP:port` address (the default is \
+                 {DEFAULT_HTTP_BIND}); a host name would have to be resolved, and a run should \
+                 not fail later because DNS answered differently",
+                self.monitoring.http.bind
+            );
         }
 
         // --- storage -----------------------------------------------------
