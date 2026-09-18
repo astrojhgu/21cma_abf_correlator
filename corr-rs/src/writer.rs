@@ -1058,10 +1058,17 @@ impl Writer {
                     }
                 }
                 SetPolicy::NewSet => None,
+                // The *latest* set of the day, not the earliest. When a day has more
+                // than one set -- `--allow-second-set` opened it because the
+                // configuration changed -- the older ones are exactly the sets whose
+                // config hash no longer matches, so picking the earliest guarantees
+                // "resuming would misinterpret every existing row" on every later
+                // run. Measured: with two sets of one day, `Auto` kept choosing the
+                // 15:57 one over the 16:35 one and refused to start.
                 SetPolicy::Auto => found
                     .iter()
                     .filter(|s| s.day == today)
-                    .min_by(|a, b| a.prefix.cmp(&b.prefix))
+                    .max_by(|a, b| a.prefix.cmp(&b.prefix))
                     .cloned(),
             };
             match chosen {
@@ -2138,6 +2145,17 @@ mod tests {
                 .unwrap();
         assert_eq!(st3.rows_written, 1);
         assert_eq!(w3.set_prefix(), p1);
+
+        // Auto appends to the *latest* set of the day, and it has to: the older one
+        // is the set the changed configuration replaced, so its hash is the one that
+        // no longer matches. Choosing the earliest made every run after a
+        // `--allow-second-set` fail with "resuming would misinterpret existing rows".
+        drop(w3);
+        drop(w2);
+        let (w4, st4) =
+            Writer::open_with(d.path(), &plan, &cfg, "hash-b", 1, &SetPolicy::Auto).unwrap();
+        assert_eq!(st4.rows_written, 1, "the second set is the one being written");
+        assert_eq!(w4.current_set_tag(), p2);
     }
 
     #[test]
