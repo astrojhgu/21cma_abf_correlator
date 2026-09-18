@@ -24,6 +24,7 @@
 #   MODE=sync tools/run-24-nf16384.sh        # 对照腿：线程后端
 #   WORKERS=12 tools/run-24-nf16384.sh       # 收包 worker 数（异步腿）
 #   NEW_SET=1 tools/run-24-nf16384.sh        # 今天已有套时另起一套，不续写
+#   CHK_NIC=0 tools/run-24-nf16384.sh        # 跳过起跑前那 20 s 的网卡层静默检查
 #   DOCTOR=1 tools/run-24-nf16384.sh         # 起跑前先跑 tools/doctor.py（慢，但值得）
 #   TREND=1  tools/run-24-nf16384.sh         # 收尾再打一份逐行明细
 #   DRY=1    tools/run-24-nf16384.sh         # 只打印将要执行的命令，不动机器
@@ -103,6 +104,53 @@ cuda=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 if [ -n "$cuda" ]; then
   echo "注意：卡上已有 CUDA 进程，H2D 会被拖慢（接收侧因此更容易被拒槽）：" >&2
   echo "$cuda" | sed 's/^/  /' >&2
+fi
+
+# 网卡层静默检查。补零变多的主因是网卡 RX 队列丢弃（RX ring 只有 1024，硬件上限 8192，
+# 改它需要 root —— 见 tools/README.md），它随机器上的扰动变化：实测同一配置、同一
+# 二进制、同一 4.7 Mpps，安静窗口累计补零 0.0015%，扰动窗口 0.0266%，差别全在这一层。
+# 所以起跑前花 20 s 看一眼：已经在丢就说清楚，让人自己决定要不要等一个安静窗口，
+# 而不是事后争论这腿的数字算不算数。CHK_NIC=0 跳过，NIC=xxx 指定网卡。
+if [ "${CHK_NIC:-1}" = "1" ] && command -v ethtool >/dev/null 2>&1; then
+  python3 - "$CFG" "${NIC:-}" <<'NICCHK' || true
+import subprocess, sys, time
+import yaml
+
+cfg, nic_override = sys.argv[1], sys.argv[2]
+try:
+    nic = nic_override or yaml.safe_load(open(cfg))["receiver"]["interface"]
+except Exception:
+    nic = nic_override or "ens2f0np0"
+
+
+def prio0():
+    # `ethtool -S` 的行首有缩进，别用 startswith（踩过：它静默地返回 None，
+    # 于是整个检查"成功"地什么都没做）。
+    out = subprocess.run(["ethtool", "-S", nic], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        key, _, val = line.partition(":")
+        if key.strip() == "rx_prio0_discards":
+            try:
+                return int(val.strip())
+            except ValueError:
+                return None
+    return None
+
+
+a = prio0()
+if a is None:
+    sys.exit(0)
+print("网卡层静默检查（{}，20 s）...".format(nic), flush=True)
+time.sleep(20)
+d = (prio0() or a) - a
+if d > 0:
+    print("注意：这 20 s 内网卡 RX 队列丢了 {} 个包（{:.0f}/s）—— 包在网卡硬件队列就被扔了，"
+          "与接收程序无关，这腿的补零率会偏高。".format(d, d / 20.0), file=sys.stderr)
+    print("      判据：tools/loss_attribution.py；根因与那条改不动的命令：tools/README.md",
+          file=sys.stderr)
+else:
+    print("网卡层：安静（20 s 内无硬件队列丢弃）", flush=True)
+NICCHK
 fi
 if [ "$DOCTOR" = "1" ]; then
   echo "--- tools/doctor.py"
