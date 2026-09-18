@@ -64,6 +64,80 @@ const RING_BUSY_LIMIT: f64 = 0.20;
 const LINK_LIMIT: f64 = 0.95;
 const CPU_LIMIT: f64 = 0.85;
 
+/// The process's own footprint, read from `/proc/self`.
+///
+/// A run meant to last weeks has three things that must not creep: the pinned
+/// staging footprint is allocated once and never grows, the worker/pipeline/writer
+/// thread count is fixed at startup, and every file set is closed (and its 300
+/// descriptors released) at the day boundary. Watching these three is the whole
+/// check -- if any of them climbs, something in the run is accumulating.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Process {
+    pub rss_mib: f64,
+    /// High-water mark since startup: equal to `rss_mib` means the process has
+    /// never been larger than it is now.
+    pub peak_rss_mib: f64,
+    pub threads: u64,
+    pub fds: u64,
+    /// Seconds since the process started, from `/proc/self/stat`'s starttime.
+    pub uptime_s: f64,
+}
+
+fn process_stats() -> Process {
+    let mut p = Process {
+        rss_mib: 0.0,
+        peak_rss_mib: 0.0,
+        threads: 0,
+        fds: 0,
+        uptime_s: 0.0,
+    };
+    if let Ok(text) = std::fs::read_to_string("/proc/self/status") {
+        for line in text.lines() {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some("VmRSS:"), Some(kb)) => {
+                    p.rss_mib = kb.parse::<f64>().unwrap_or(0.0) / 1024.0
+                }
+                (Some("VmHWM:"), Some(kb)) => {
+                    p.peak_rss_mib = kb.parse::<f64>().unwrap_or(0.0) / 1024.0
+                }
+                (Some("Threads:"), Some(n)) => p.threads = n.parse().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    if let Ok(dir) = std::fs::read_dir("/proc/self/fd") {
+        p.fds = dir.count() as u64;
+    }
+    if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+        if let Some(i) = stat.rfind(')') {
+            let f: Vec<&str> = stat[i + 1..].split_whitespace().collect();
+            // starttime is field 22 of the line, i.e. 19 here, in clock ticks.
+            if let Some(start) = f.get(19).and_then(|v| v.parse::<u64>().ok()) {
+                let hz = ticks_per_second();
+                if hz > 0.0 {
+                    let uptime = uptime_ticks().saturating_sub(start) as f64 / hz;
+                    p.uptime_s = uptime;
+                }
+            }
+        }
+    }
+    p
+}
+
+/// Ticks since boot (`/proc/uptime`), the reference `starttime` is measured in.
+fn uptime_ticks() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/uptime") else {
+        return 0;
+    };
+    let secs: f64 = text
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    (secs * ticks_per_second()) as u64
+}
+
 /// Schema version of [`Snapshot`]. A reader should refuse what it does not know:
 /// adding a field is compatible, changing the meaning of one is not.
 pub(crate) const SCHEMA: u32 = 1;
@@ -94,6 +168,9 @@ pub(crate) struct Snapshot {
     pub host: Host,
     pub capacity: Capacity,
     pub stations: Vec<Station>,
+    /// What the process itself is using. Answers "can this run for weeks" from the
+    /// outside: resident memory, threads and descriptors all have to stay flat.
+    pub process: Process,
 }
 
 /// What is being run, so a monitor can say *which* run it is watching.
@@ -668,6 +745,7 @@ impl Monitor {
                     cpu: CPU_LIMIT * 100.0,
                 },
             },
+            process: process_stats(),
             stations,
         }
     }
@@ -895,6 +973,13 @@ pub(crate) mod tests {
                     link: LINK_LIMIT * 100.0,
                     cpu: CPU_LIMIT * 100.0,
                 },
+            },
+            process: Process {
+                rss_mib: 0.0,
+                peak_rss_mib: 0.0,
+                threads: 1,
+                fds: 1,
+                uptime_s: 0.0,
             },
             stations: vec![],
         }

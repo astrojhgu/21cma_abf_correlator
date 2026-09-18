@@ -314,6 +314,7 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
   <h1 id="run">corr 状态</h1>
   <span class="meta" id="conn"></span>
   <span class="meta" id="set"></span>
+  <span class="meta" id="proc"></span>
 </header>
 <main>
   <div class="cards">
@@ -400,6 +401,15 @@ function render(s) {
   conn.textContent = s.connected
       ? `已连接 · ${s.url} · 轮询 ${s.polls} 次`
       : `连接断开 ${age.toFixed(0)} s（${s.error || "无数据"}）· 显示最后一份快照`;
+
+  // 进程自身的占用：长期跑时这四个数字必须平。RSS 等于峰值意味着"从未比现在更大"；
+  // 线程与 fd 在跨本地日切套前后应当不变（切套会关掉旧套的 300 个句柄）。
+  const p = snap.process;
+  if (p) {
+    document.getElementById("proc").textContent =
+      `RSS ${(p.rss_mib / 1024).toFixed(2)} GiB（峰 ${(p.peak_rss_mib / 1024).toFixed(2)}）`
+      + ` · 线程 ${p.threads} · fd ${p.fds} · 已跑 ${(p.uptime_s / 3600).toFixed(2)} h`;
+  }
 
   const run = snap.run, cum = snap.cumulative, win = snap.window;
   document.getElementById("run").textContent = run.name + "  " + run.n_station + " 路";
