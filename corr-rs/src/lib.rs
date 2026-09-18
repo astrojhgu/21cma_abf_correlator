@@ -42,6 +42,7 @@ pub mod assemble;
 #[cfg(feature = "async-recv")]
 pub mod async_recv;
 pub(crate) mod backend;
+pub(crate) mod monitor;
 pub mod config;
 pub mod ffi;
 pub mod frame;

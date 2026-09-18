@@ -85,6 +85,15 @@ pub struct StationProgress {
     /// the receive thread can know this, and the timeline of it is what tells a
     /// burst loss apart from a steady shortfall.
     lost_packets: AtomicU64,
+    /// Cumulative nanoseconds this station spent waiting for the pipeline to
+    /// release a staging slot, published by whichever receiver owns it: the
+    /// thread path out of `wait_free`, the async path out of its park.
+    ///
+    /// The live monitor differences it, because "how much of this second was
+    /// spent not reading the socket" is the receive side's own measure of how
+    /// much jitter margin is left. Waiting is not loss; a run that waits a lot is
+    /// one whose socket buffers are the only thing between it and loss.
+    slot_wait_ns: AtomicU64,
 }
 
 impl StationProgress {
@@ -95,12 +104,22 @@ impl StationProgress {
             last_packet_ns: AtomicU64::new(now_ns()),
             zero_filled_frames: AtomicU64::new(0),
             lost_packets: AtomicU64::new(0),
+            slot_wait_ns: AtomicU64::new(0),
         }
     }
 
     /// Publish the assembler's cumulative lost-packet count.
     pub fn set_lost_packets(&self, n: u64) {
         self.lost_packets.store(n, Ordering::Release);
+    }
+
+    /// Publish the cumulative time spent waiting for a staging slot.
+    pub fn set_slot_wait_ns(&self, ns: u64) {
+        self.slot_wait_ns.store(ns, Ordering::Release);
+    }
+
+    pub fn slot_wait_ns(&self) -> u64 {
+        self.slot_wait_ns.load(Ordering::Acquire)
     }
 
     pub fn lost_packets(&self) -> u64 {

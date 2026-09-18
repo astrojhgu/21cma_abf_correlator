@@ -279,6 +279,9 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                 a.prog.set(asm.progress());
                 a.prog.set_zero_filled_frames(asm.stats().zero_filled_frames);
                 a.prog.set_lost_packets(asm.stats().lost_packets);
+                // The live monitor reads this to say how much of the last second
+                // this station spent waiting for the ring instead of reading.
+                a.prog.set_slot_wait_ns(asm.stats().ns_slot_wait);
                 if fatal_here {
                     break;
                 }

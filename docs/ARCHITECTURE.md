@@ -105,6 +105,11 @@ RFSoC 前端 24 路组播 UDP（4104 B = 8 B 小端计数器 + 4096 int8）
 
 ## 5. 怎么判读一次运行（按顺序）
 
+运行**中**先看实时行（`monitoring.interval_ms`，默认 1 s 一行到 stderr；跑 `corr-async`
+时被 `tools/run-24-nf16384.sh` 的 `tee` 一起收进日志）：它给出逐行补零率（累计与窗口）、
+接收侧等环占比、站间进度散布、本进程核数/机器 load、H2D 相对需求速率的百分比，并以
+`capacity:` 指明**先顶到上限的是谁**。跑完再按下面的顺序判读：
+
 ```bash
 tools/doctor.py --config <cfg>                     # 机器侧体检：IRQ 撞核/RX 环/backlog/权限/租户
 corr --config <cfg> --duration 300 --output-dir /scratch/xxx

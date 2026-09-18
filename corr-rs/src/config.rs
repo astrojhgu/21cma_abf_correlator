@@ -388,7 +388,22 @@ fn online_cpus() -> Option<Vec<u32>> {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MonitoringCfg {
+    /// How often the pipeline thread prints one line of live state to stderr:
+    /// rows closed and their rate, per-row zero fill (cumulative and over the
+    /// interval), packets the streams never delivered, how much of the interval
+    /// the receive side spent waiting for a staging slot, the host-to-device rate
+    /// against what the streams require, this process's cores against the cores
+    /// online, and the machine's load -- ending in `capacity:`, which names the
+    /// first resource that is at its ceiling.
+    ///
+    /// **0 disables it**, which is the right setting for a measurement whose
+    /// output is being parsed line by line.
     pub interval_ms: u64,
+    /// Append the same numbers to `<output_dir>/<run_name>/stats.csv`.
+    ///
+    /// **Not implemented yet**: the field is accepted and ignored, so that a
+    /// configuration written for it does not silently mean something else. The
+    /// line on stderr is the live view; the run report is the record.
     pub stats_csv: bool,
 }
 

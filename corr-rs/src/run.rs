@@ -487,6 +487,7 @@ pub(crate) fn run_receive_with(
         prev_zf: 0,
         t0: Instant::now(),
         elapsed: Duration::ZERO,
+        monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, plan),
     };
     pipeline.run()?;
     let elapsed = pipeline.elapsed;

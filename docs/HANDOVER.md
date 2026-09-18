@@ -66,6 +66,15 @@ tools/doctor.py --config ../config/correlator-24.yaml                 # 机器�
   同一窗口，只是面板放大到 1.05 in/150 dpi 以便阅读）。**两线版图的"斜率看着不同"只来自
   `--phase-window`**：每通道 0.021973°（fft_len = 2·nch = 16384），一格里铺 1536 个通道还是 384 个，
   决定它看着有多陡、画几圈；拟合值不受窗口影响。
+* **实时状态行（2026-09-18）**：`monitoring.interval_ms`（默认 1000，0 = 关）现在真的生效 ——
+  pipeline 线程每个间隔往 stderr 打一行：行数/行率、逐行补零率（累计 + 窗口）、计数缺口、
+  **接收侧等环占比**、站间进度散布（槽）、环阻塞事件增量、停滞恢复增量、本进程核数/机器 load、
+  H2D 相对"需求字节率"的百分比、pipeline 等设备归还槽的占比、我们 socket 的内核丢包增量，
+  末尾 `capacity:` 指出**先顶到上限的资源**（socket 丢包 → 环 → GPU 链路 → 整机 load → 本进程 CPU）。
+  为此 `StationProgress` 增 `slot_wait_ns`，两条腿各自发布（线程腿 `wait_free`、异步腿 park），
+  所以"这一秒有多少时间没在读 socket"两边同口径。`monitoring.stats_csv` 仍是接受但不实现的字段。
+  注意：**冷启动头十几秒**（cuFFT plan、首行对齐、建 304 个文件）等环占比会明显偏高，25 s 的短跑
+  不代表稳态 —— 稳态判据仍要用 300 s 的逐行 `blocks.csv`。
 * **输出命名（2026-09-18）**：文件名改成
   `<file_prefix><站j><站k>-<时刻>.bin`（每个 baseline 一个，站名直连）与
   `<file_prefix><时刻>-time.bin` / `-time.txt` / `-blocks.csv` / `-metadata.yaml`；

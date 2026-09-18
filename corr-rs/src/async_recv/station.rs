@@ -430,6 +430,7 @@ impl Station {
                             let ns = t_wait.elapsed().as_nanos() as u64;
                             self.ns_slot_wait += ns;
                             self.asm.note_slot_wait(ns);
+                            self.prog.set_slot_wait_ns(self.ns_slot_wait);
                             self.dbg.ring_wait_polls += ready.polls;
                         }
                     }

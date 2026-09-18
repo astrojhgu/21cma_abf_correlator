@@ -24,6 +24,7 @@ use crate::assemble::SlotRing;
 use crate::config::RunPlan;
 use crate::run::RunOptions;
 use crate::gpu::Correlator;
+use crate::monitor::Monitor;
 use crate::run::flush_rows;
 use crate::stop::{RunStop, StopReason};
 use crate::sched::{Action, RowScheduler, StationProgress};
@@ -62,6 +63,8 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) prev_zf: u64,
     pub(crate) t0: Instant,
     pub(crate) elapsed: Duration,
+    /// The live line. `None` when `monitoring.interval_ms` is 0.
+    pub(crate) monitor: Option<Monitor>,
 }
 
 impl<'a> Pipeline<'a> {
@@ -212,6 +215,18 @@ impl<'a> Pipeline<'a> {
                     // can lose it steadily or in cascades, and the difference decides
                     // the fix, so the self.timeline is printed rather than guessed at.
                     let now = Instant::now();
+                    // The live line, on its own interval (monitoring.interval_ms).
+                    // Printed from here because this is the one thread that is idle
+                    // by construction, and because both receivers reach it.
+                    if let Some(m) = self.monitor.as_mut() {
+                        m.tick(
+                            &self.sched,
+                            self.progress,
+                            self.ring.as_ref(),
+                            self.gpu.as_ref(),
+                            now,
+                        );
+                    }
                     if now.duration_since(self.last_sample).as_millis() >= 1000 {
                         self.last_sample = now;
                         let mut lost = 0u64;
