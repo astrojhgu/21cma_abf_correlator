@@ -241,6 +241,17 @@ pub(crate) struct Recv {
     /// `integration.max_spread_slots`, in slots. Non-zero means the scheduler is
     /// deliberately leaving a station behind, so its rows carry more zero fill.
     pub watermark_lift_slots: f64,
+    /// Every station's distance from the watermark, in slots, in station order:
+    /// positive is ahead of the watermark, negative is behind it. A station behind
+    /// it is the one whose frames are recorded as missing, so this is what says
+    /// *which* station is holding the run back.
+    pub stations_offset_slots: Vec<f64>,
+    /// Which station holds the watermark: the slowest one, unless the cap has
+    /// lifted it far enough that nobody is at the watermark at all.
+    pub watermark_station: Option<usize>,
+    /// `integration.max_spread_slots`, so a reader can draw the cap on the same
+    /// axis as the offsets. `None` means there is no cap.
+    pub max_spread_slots: Option<f64>,
 }
 
 /// The host-to-device link, which this profile's geometry is sized against.
@@ -430,6 +441,9 @@ struct Derived {
     load: f64,
     spread_slots: f64,
     watermark_lift_slots: f64,
+    station_offsets_slots: Vec<f64>,
+    watermark_station: Option<usize>,
+    max_spread_slots: Option<f64>,
     blocked_now: u64,
     verdict: Verdict,
 }
@@ -638,10 +652,18 @@ impl Monitor {
         } else {
             0.0
         };
-        let spread_slots = sched
-            .highest_progress()
-            .saturating_sub(sched.watermark()) as f64
-            / self.frames_per_slot.max(1) as f64;
+        let slots = self.frames_per_slot.max(1) as f64;
+        let spread_slots = sched.highest_progress().saturating_sub(sched.watermark()) as f64 / slots;
+        // Per-station distance from the watermark: `spread_slots` says how bad the
+        // gap is, this says which station owns it. Read in one tick with the
+        // watermark, so the numbers on the page add up.
+        let station_offsets_slots: Vec<f64> = sched
+            .progress_offsets()
+            .into_iter()
+            .map(|frames| frames as f64 / slots)
+            .collect();
+        let watermark_station = sched.watermark_station();
+        let max_spread_slots = sched.max_spread_frames().map(|f| f as f64 / slots);
 
         // The queue's occupancy is the early warning; `dropped_window` is what
         // happened. Both come from the same handle, read once per tick.
@@ -689,8 +711,10 @@ impl Monitor {
             spread_slots,
             // The ring counts leases in and out, so its reading is signed; a
             // count published to a reader cannot be negative, so clamp.
-            watermark_lift_slots: sched.watermark_lift() as f64
-                / self.frames_per_slot.max(1) as f64,
+            watermark_lift_slots: sched.watermark_lift() as f64 / slots,
+            station_offsets_slots,
+            watermark_station,
+            max_spread_slots,
             blocked_now: ring.blocked_now().max(0) as u64,
             verdict: verdict(
                 d_dropped,
@@ -839,6 +863,9 @@ impl Monitor {
                 blocked_now: d.blocked_now,
                 spread_slots: d.spread_slots,
                 watermark_lift_slots: d.watermark_lift_slots,
+                stations_offset_slots: d.station_offsets_slots.clone(),
+                watermark_station: d.watermark_station,
+                max_spread_slots: d.max_spread_slots,
             },
             gpu: Gpu {
                 h2d_gbs: d.h2d_gbs,
@@ -1083,6 +1110,9 @@ pub(crate) mod tests {
                 blocked_now: 0,
                 spread_slots: 0.0,
                 watermark_lift_slots: 0.0,
+                stations_offset_slots: Vec::new(),
+                watermark_station: None,
+                max_spread_slots: None,
             },
             gpu: Gpu {
                 h2d_gbs: 0.0,

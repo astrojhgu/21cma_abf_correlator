@@ -80,6 +80,9 @@ abort 整个进程 —— 所以 `status.rs` 里没有任何可达的 `unwrap`/`
 | | `zero_fill_pct`、`lost_packets`、`socket_drops`、… | 同一批量的**增量** |
 | `recv` | `wait_pct` | 站·秒里"等环"占的比例；等待不是丢数，但没有余量了 |
 | | `spread_slots`、`blocked_now` | 站间进度差（槽）、此刻被环挡住的站数 |
+| | `stations_offset_slots` | **每站**相对水位线的距离（槽，按站序，正 = 领先 / 负 = 落后于水位线）。落后于水位线的帧就是被记成 missing 的那些，所以这个数组回答"差在谁身上"，而 `spread_slots` 只回答"差多少" |
+| | `watermark_station` | 持有水位线的站号（最慢的那个） |
+| | `max_spread_slots`、`watermark_lift_slots` | 配置的落后上限（槽，`null` = 不设）与实际抬升量；两者与 `stations_offset_slots` 共用一根轴，界面据此画出"离被迫放弃还差多远" |
 | `gpu` | `h2d_gbs`、`required_gbs`、`link_pct`、`slot_free_pct` | 链路实际/需求、pipeline 等槽释放的比例 |
 | `host` | `cpu_cores`、`cores_online`、`load1` | 本进程核数 / 在线核数 / 整机 load |
 | `writer` | `set_tag`、`queue_depth`、`queued`、`queued_pct` | 写盘队列：**`queued_pct` 是丢弃之前的先行指标**（到 75% 以上就该看写盘速度了） |

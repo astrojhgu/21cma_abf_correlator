@@ -446,6 +446,26 @@ impl RowScheduler {
         self.watermark().saturating_sub(min)
     }
 
+    /// Every station's progress relative to the watermark, in frames and in station
+    /// order: positive is ahead of the watermark, negative is behind it.
+    ///
+    /// A station behind the watermark is the one whose frames are being recorded as
+    /// missing, so this is also the answer to "which station is holding the run
+    /// back" -- which `spread_slots` alone cannot say, because it is a distance
+    /// without a direction or a name.
+    pub fn progress_offsets(&self) -> Vec<i64> {
+        let wm = self.watermark();
+        self.progress
+            .iter()
+            .map(|p| p.get() as i64 - wm as i64)
+            .collect()
+    }
+
+    /// The configured cap in frames, for callers that report in staging slots.
+    pub fn max_spread_frames(&self) -> Option<u64> {
+        self.max_spread_frames
+    }
+
     /// Slowest and fastest station progress in one pass: this is on the hot path.
     fn progress_range(&self) -> (u64, u64) {
         let mut min = u64::MAX;
@@ -812,6 +832,45 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn progress_offsets_name_the_station_that_is_behind() {
+        let mut f = Fixture::new(3, 1);
+        f.advance_all(10 * N_CUM);
+        // One station pulls ahead, one drops back: the offsets must carry both the
+        // sign and the identity, which `spread_slots` cannot do on its own.
+        f.advance_one(1, 3 * FPS);
+        let back = f.stations[2].get() - 2 * FPS;
+        f.stations[2].set(back);
+
+        let offs = f.sched.progress_offsets();
+        assert_eq!(offs.len(), 3);
+        // Station 2 is the slowest, so it *is* the watermark and reads zero; the
+        // others read how far ahead of it they are. A station that had fallen behind
+        // the watermark would read negative, and that is the case the page colours.
+        assert_eq!(offs[2], 0, "the watermark is the zero of this scale");
+        assert_eq!(offs[0], 2 * FPS as i64);
+        assert_eq!(offs[1], 5 * FPS as i64);
+        assert_eq!(f.sched.watermark_station(), Some(2));
+        assert_eq!(f.sched.max_spread_frames(), None);
+    }
+
+    #[test]
+    fn a_capped_watermark_moves_the_scale_under_every_station() {
+        let mut f = Fixture::new(2, 1);
+        f.advance_all(10 * N_CUM);
+        f.advance_one(0, 5 * FPS);
+        f.sched.max_spread_frames = Some(2 * FPS);
+
+        // The watermark sits at `fastest - cap`, so the fast station reads +cap and
+        // the slow one reads exactly `-lift`: the two are the same fact seen from
+        // either end.
+        let offs = f.sched.progress_offsets();
+        assert_eq!(offs[0], 2 * FPS as i64);
+        assert_eq!(offs[1], -(3 * FPS as i64));
+        assert_eq!(f.sched.watermark_lift(), 3 * FPS);
+        assert_eq!(-offs[1], f.sched.watermark_lift() as i64);
     }
 
     /// Every station advances at the same rate, so the gap between them never closes
