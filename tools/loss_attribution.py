@@ -32,6 +32,11 @@ import urllib.request
 
 # 网卡上要跟的计数器（mlx5 的名字；别的驱动缺几个也不影响判读）。
 NIC_KEYS = (
+    # 缓冲类：ring 太小或中断被推迟时这些先动，而 drop 计数可能还是 0
+    "rx_buff_alloc_err",
+    "rx_prio0_buf_discard",
+    "rx_prio0_cong_discard",
+    "rx_buffer_passed_thres_phy",
     "rx_packets_phy",
     "rx_bytes_phy",
     "rx_prio0_discards",
@@ -62,6 +67,41 @@ def nic_counters(nic):
             except ValueError:
                 pass
     return d, None
+
+
+def nic_ring_depth(nic):
+    """RX ring 的当前与最大深度（描述符数）。
+
+    ring 是网卡侧唯一的缓冲：一个包进来没被驱动取走就占一个描述符，占满了就丢在网卡里
+    （`rx_out_of_buffer`），应用侧的 lost/sockdrop/udp drops 一个都看不到。所以"它多深、
+    相当于多少毫秒的到达量"是判断还能撑多久的输入。改它需要 root（ethtool -G）。
+    """
+    try:
+        out = subprocess.run(["ethtool", "-g", nic], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    current = maximum = None
+    section = None
+    for line in out.stdout.splitlines():
+        s = line.strip()
+        if s.startswith("Pre-set maximums"):
+            section = "max"
+        elif s.startswith("Current hardware settings"):
+            section = "cur"
+        elif s.startswith("RX:"):          # 不是 RX Mini / RX Jumbo
+            try:
+                value = int(s.split()[1])
+            except (IndexError, ValueError):
+                continue
+            if section == "max" and maximum is None:
+                maximum = value
+            elif section == "cur" and current is None:
+                current = value
+    if current is None:
+        return None
+    return {"rx_current": current, "rx_max": maximum}
 
 
 def softnet():

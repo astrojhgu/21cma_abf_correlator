@@ -141,6 +141,7 @@ class Collector(threading.Thread):
         self.spectra = None
         self.spectra_error = None
         self.spectra_updated = None
+        self.nic_ring = None   # ring 深度不会变，读一次即可
         self.stop = threading.Event()
 
     def _get(self, url, timeout):
@@ -148,12 +149,50 @@ class Collector(threading.Thread):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
+    def _udp_backlog(self):
+        """每个 UDP socket 的接收积压与丢弃。
+
+        积压是"读不过来"的**先行指标**，也是这次事故唯一早到的信号：实测里它涨到
+        420 MB 之后才开始丢包，早了几个小时，而在此期间 drops、零填充、等环全都是 0，
+        所以只盯 drops 的监控什么也看不见。这台机器 `net.core.rmem_max` 被设成 2 GB，
+        socket 越大就把问题掩盖得越久 —— 于是更要直接看积压本身。
+        """
+        rows = []
+        try:
+            with open("/proc/net/udp") as fh:
+                for line in fh.read().splitlines()[1:]:
+                    f = line.split()
+                    if len(f) < 13:
+                        continue
+                    try:
+                        port = int(f[1].split(":")[1], 16)
+                        rx_queue = int(f[4].split(":")[1], 16)
+                        drops = int(f[12])
+                    except (ValueError, IndexError):
+                        continue
+                    rows.append((port, rx_queue, drops))
+        except OSError:
+            return None
+        if not rows:
+            return None
+        worst = max(rows, key=lambda r: r[1])
+        return {
+            "sockets": len(rows),
+            "backlog_bytes_max": worst[1],
+            "backlog_bytes_total": sum(r[1] for r in rows),
+            "queued_sockets": sum(1 for r in rows if r[1] > 1_000_000),
+            "drops_total": sum(r[2] for r in rows),
+            "worst_port": worst[0],
+        }
+
     def _poll_nic(self, now):
         """网卡层：硬件队列丢弃 / 软中断丢弃 / 我们发出的流控。见 loss_attribution.py。"""
         counters, err = la.nic_counters(self.nic)
         if err:
             self.nic_now = {"error": err}
             return
+        if self.nic_ring is None:
+            self.nic_ring = la.nic_ring_depth(self.nic) or {}
         dropped, squeeze, _per_cpu = la.softnet()
         cur = {"t": now, "counters": counters, "softnet_dropped": dropped,
                "softnet_squeeze": squeeze}
@@ -164,9 +203,24 @@ class Collector(threading.Thread):
             return
         dt = max(cur["t"] - prev["t"], 1e-6)
         d = lambda k: (cur["counters"].get(k, 0) - prev["counters"].get(k, 0))  # noqa: E731
+        udp = self._udp_backlog() or {}
         self.nic_now = {
             "error": None,
             "dt_s": dt,
+            "udp_sockets": udp.get("sockets", 0),
+            "udp_backlog_bytes_max": udp.get("backlog_bytes_max", 0),
+            "udp_queued_sockets": udp.get("queued_sockets", 0),
+            "udp_drops_total": udp.get("drops_total", 0),
+            "udp_worst_port": udp.get("worst_port"),
+            "iface": self.nic,
+            # ring 是网卡侧唯一的缓冲：占满就把包丢在网卡里，应用侧一个计数都看不到
+            "ring_rx_current": self.nic_ring.get("rx_current"),
+            "ring_rx_max": self.nic_ring.get("rx_max"),
+            "passed_thres_per_s": d("rx_buffer_passed_thres_phy") / dt,
+            "prio0_buf_discard_per_s": d("rx_prio0_buf_discard") / dt,
+            "prio0_cong_discard_per_s": d("rx_prio0_cong_discard") / dt,
+            "steer_missed_per_s": d("rx_steer_missed_packets") / dt,
+            "buff_alloc_err_per_s": d("rx_buff_alloc_err") / dt,
             "discards_per_s": d("rx_prio0_discards") / dt,
             "phy_discards_per_s": d("rx_discards_phy") / dt,
             "out_of_buffer_per_s": d("rx_out_of_buffer") / dt,
@@ -357,6 +411,8 @@ th:last-child, td:last-child { width:44%; }
       <div class="s" id="load">–</div></div>
     <div class="card"><div class="k">写盘队列</div><div class="v" id="wq">–</div>
       <div class="s" id="wqsub">–</div></div>
+    <div class="card"><div class="k">网卡缓冲（RX ring）</div><div class="v" id="nicbuf">–</div>
+      <div class="s" id="nicbufsub">–</div></div>
     <div class="card"><div class="k">capacity</div><div class="v" id="verdict">–</div>
       <div class="s" id="limits">–</div></div>
     <div class="card"><div class="k">网卡层（ring 溢出）</div><div class="v" id="nic">–</div>
@@ -479,9 +535,11 @@ function nicCard(nic, zfWinPct) {
   const ring = nic.out_of_buffer_per_s || 0;
   const port = nic.discards_per_s || 0;
   const zfHot = (zfWinPct || 0) > 0;
+  const backlogMb = (nic.udp_backlog_bytes_max || 0) / 1e6;
+  const queued = nic.udp_queued_sockets || 0;
   const sub = `到达 ${(nic.mpps || 0).toFixed(2)} Mpps · ring 溢出 ${ring.toFixed(0)}/s`
-    + ` · 端口级丢弃 ${port.toFixed(0)}/s`
-    + ` · 发 pause ${(nic.pause_per_s || 0).toFixed(0)}/s`
+    + ` · UDP 积压 ${backlogMb < 0.05 ? "0" : backlogMb.toFixed(1)} MB（${queued} 个 socket >1 MB）`
+    + ` · 端口级丢弃 ${port.toFixed(0)}/s · pause ${(nic.pause_per_s || 0).toFixed(0)}/s`
     + ` · 软中断丢 ${(nic.softnet_dropped_per_s || 0).toFixed(0)}/s`;
 
   if (ring > 0) {
@@ -491,19 +549,76 @@ function nicCard(nic, zfWinPct) {
            + "都看不到它们——它们会直接变成零填充。调大 ring 才治这个（ethtool -G，需要 root）",
     };
   }
+  if (backlogMb >= 128) {
+    return {
+      v: `积压 ${backlogMb.toFixed(0)} MB`, cls: "v bad", sub,
+      title: "接收线程读不过来：socket 缓冲堆到了百 MB 级（实测事故里到过 420 MB）。此刻还没丢，"
+           + "但延迟已经是几十毫秒；等到追上产能就开始成片丢包，最慢的那几站还会把水位线拖住，"
+           + "把零填充摊到所有站上。先查谁的核被中断占了（这台机器 mlx5 的中断会落在全部 32 个核上）",
+    };
+  }
   if (port > 0 && zfHot) {
     return {
       v: `端口丢 ${port.toFixed(0)}/s`, cls: "v bad", sub,
       title: "端口级丢弃，而且这一窗口的零填充同时在涨：这次丢的里面确实有 corr 的包",
     };
   }
+  if (backlogMb >= 16) {
+    return {
+      v: `积压 ${backlogMb.toFixed(0)} MB`, cls: "v warn", sub,
+      title: "接收侧开始积压（还不是丢包）：读得比到得慢一点。这个数应当长期贴近 0",
+    };
+  }
   return {
     v: "0/s", cls: "v ok", sub,
     title: port > 0
-      ? "端口级丢弃是有的，但 ring 没溢出、零填充也没涨：这些包不是 corr 的"
-        + "（多为其它流量或未订阅的组播），应用侧三个计数仍是 0"
-      : "网卡三层（ring 溢出 / 硬中断 / 软中断）都没有丢弃",
+      ? "端口级丢弃是有的，但 ring 没溢出、零填充没涨、socket 也没积压：这些包不是 corr 的"
+      : "网卡三层（ring 溢出 / 中断 / 软中断）都没有丢弃，接收侧也没有积压",
   };
+}
+
+// 网卡缓冲卡片：ring 深度，以及它"相当于多少毫秒的到达量"。
+//
+// ring 是网卡侧唯一的缓冲：包进来没被驱动取走就占一个描述符，占满就丢在网卡里，应用侧的
+// lost / sockdrop / udp drops 一个都看不到 —— 所以深度和余量得自己算：深度 ÷ 到达速率。
+// 这台机器是 1024 个描述符配 4.7 Mpps，只有 0.22 ms，一次几百微秒的调度延迟就能填满。
+// 深度要 root 才能改（ethtool -G），而它出厂默认只有最大值的 1/8。
+function bufferCard(nic) {
+  if (!nic) return { v: "–", cls: "v", sub: "未采样", title: "" };
+  if (nic.error) return { v: "–", cls: "v", sub: nic.error, title: "" };
+  if (nic.warmup) return { v: "…", cls: "v", sub: "需要两次采样才能算增量", title: "" };
+
+  const cur = nic.ring_rx_current, max = nic.ring_rx_max;
+  const mpps = nic.mpps || 0;
+  const ms = (cur && mpps > 0) ? (cur / (mpps * 1e6)) * 1e3 : null;
+  const oob = nic.out_of_buffer_per_s || 0;
+  const thres = nic.passed_thres_per_s || 0;
+  const bufD = nic.prio0_buf_discard_per_s || 0;
+  const congD = nic.prio0_cong_discard_per_s || 0;
+  const miss = nic.steer_missed_per_s || 0;
+  const allocErr = nic.buff_alloc_err_per_s || 0;
+  const iface = nic.iface || "iface";
+
+  const v = (cur === null || cur === undefined) ? "–"
+      : `${cur}${max ? " / " + max : ""} 描述符`;
+  const sub = (ms === null ? "包率未知，无法换算成时间" : `≈ ${ms.toFixed(2)} ms 的到达量`)
+    + ` · 缓冲丢 ${bufD.toFixed(0)}/s · 拥塞丢 ${congD.toFixed(0)}/s`
+    + ` · 阈值外 ${thres.toFixed(0)}/s · 未命中 ${miss.toFixed(0)}/s`
+    + (allocErr > 0 ? ` · 分配失败 ${allocErr.toFixed(0)}/s` : "");
+
+  if (oob > 0) {
+    return { v, cls: "v bad", sub,
+      title: `ring 的 ${cur} 个描述符全占满了，包开始丢在网卡里（rx_out_of_buffer 在涨）。`
+           + `调大它：ethtool -G ${iface} rx ${max || 8192}（需要 root）` };
+  }
+  if (thres > 0 || bufD > 0 || congD > 0) {
+    return { v, cls: "v warn", sub,
+      title: "有包走到了缓冲阈值 / 优先级缓冲边界：ring 还没满，但余量在被消耗" };
+  }
+  return { v, cls: "v ok", sub,
+    title: `ring ${cur}/${max} 个描述符，没有缓冲类丢弃。当前深度是出厂默认（最大值的 1/8），`
+         + `按 ${mpps.toFixed(2)} Mpps 只有 ${ms === null ? "?" : ms.toFixed(2)} ms 余量；`
+         + `调大需要 root：ethtool -G ${iface} rx ${max || 8192}` };
 }
 
 function render(s) {
@@ -586,6 +701,13 @@ function render(s) {
       + ` · 累计丢 ${w.dropped_total} 行`
       + (dropping ? `（本窗口占 ${(w.dropped_pct_window || 0).toFixed(0)}% 的行）` : "");
   }
+
+  // 网卡缓冲：ring 深度与它的余量（判据见 bufferCard）
+  const bc = bufferCard(s.nic);
+  const nbv = document.getElementById("nicbuf");
+  const nbs = document.getElementById("nicbufsub");
+  nbv.textContent = bc.v; nbv.className = bc.cls; nbv.title = bc.title;
+  nbs.textContent = bc.sub;
 
   const v = document.getElementById("verdict");
   v.textContent = snap.capacity.bottleneck;

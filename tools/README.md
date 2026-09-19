@@ -262,3 +262,26 @@ sudo ethtool -G ens2f0np0 rx 8192      # 临时生效，重启失效；持久化
 - 判据用 `rows_trend.py` / `longrun_report.py` 的**逐行**数字，不要引用运行报告里的每站汇总量。
 - 长跑对比要**同一窗口内交错**（A/B/A/B，各 5–10 分钟）；这台共享机器的负载漂移是十分钟量级，块式对比会被淹没（实测同配置两次跑差 3.2 倍）。
 - 起跑前先 `doctor.py`；`pkill -f corr-replay` 会杀掉执行它的 shell 自己，用 `pkill -x`。
+
+### 待 root：把网卡中断收进它自己的 NUMA node（2026-09-19 事故的正解）
+
+`cpu.avoid_nic_interfaces` 只把网卡所在 NUMA node 的核从接收线程池里拿掉，**前提是中断确实
+待在那个 node 里**。这次它不是：`/sys/class/net/ens2f0np0/device/msi_irqs` 有 33 个向量，而
+每核的 `smp_affinity_list` 都分到 2 个 —— 等于没有绑定。于是 `ksoftirqd` 在 cpu18-21、26、27
+上忙，而 `auto_layout` 把 rx14–rx23 恰好放在这批核上：接收线程和软中断抢同一个核，socket
+积压一路涨到 **420 MB** 才丢包，而在此期间 `capacity` 报 `ok`、等环 0%、零填充 0% ——
+监控上什么都看不出来。等积压超过读取产能就开始成片丢：3 小时里 lost 3.47 亿、零填充
+10.12%，7 个站的数据报废（水位线被 cap 抬了 85 槽，才保住其余 17 站）。
+
+把中断绑回 NIC 自己的 node，两者就一致了（`avoid_nic_interfaces` 本来就在避 node 0）：
+
+    for f in /sys/class/net/ens2f0np0/device/msi_irqs/*; do
+        echo 0-3 > /proc/irq/$(basename "$f")/smp_affinity_list
+    done
+
+绑完 cpu4–31 是干净的 28 个核（24 接收 + pipeline + 2 writer + monitor，正好够用），而且
+`nic_irq_core_share()` 会看到区分度、自动把接收线程从最重的核上挪开（它在均匀时会明说
+"spread evenly ... left alone"，不假装做了优化）。
+
+注意：**手工指定 `recv_cpus` 解决不了这个问题**。按 24 站 + pipeline + 2 writer + monitor
+算需要 28 个核，而避开 node 0 与那 6 个忙核之后只剩 22 个，怎么排都会有 6 个核与中断共享。
