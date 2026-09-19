@@ -103,6 +103,29 @@ pub struct IntegrationCfg {
     ///
     /// 0 disables the cap, which is only sensible for short tests.
     pub zero_fill_limit_frames: u64,
+    /// How far behind the slowest station the scheduler is willing to wait, in
+    /// staging slots.
+    ///
+    /// The watermark is the lowest station progress, and every station advances at
+    /// the same rate (the frame rate), so the *gap* between stations never shrinks
+    /// by itself -- it is a ratchet. A station that falls behind therefore holds the
+    /// watermark back for ever: the ring's writable slots dry up, the receive side
+    /// is refused, and the sockets overflow. Measured 2026-09-19: one burst of loss
+    /// took the spread from 0.1 slots to 8-10 out of 11, and the run never came back
+    /// on its own -- only restarting the process did.
+    ///
+    /// Setting this to N makes the scheduler stop waiting for a station that is more
+    /// than N slots behind: the frames it is waiting for are declared missing (the
+    /// same path `block_timeout_ms` uses, and the same honest per-row record in
+    /// `blocks.csv`) and the watermark moves on. The cost is explicit -- that
+    /// station's rows get more zero fill -- and the alternative is every station's
+    /// data degrading together.
+    ///
+    /// `null` (the default) keeps the old behaviour: wait for every station for
+    /// ever. Must leave at least two slots for the pipeline and the receive side,
+    /// which `Config::validate` enforces.
+    #[serde(default)]
+    pub max_spread_slots: Option<u32>,
 }
 
 /// How the pair space is divided over `gpu.devices`.
@@ -961,6 +984,22 @@ impl Config {
                  not fail later because DNS answered differently",
                 self.monitoring.http.bind
             );
+        }
+
+        // --- integration --------------------------------------------------
+        // Only checked when it is set: waiting for ever is the historical
+        // behaviour, and it stays available.
+        if let Some(n) = self.integration.max_spread_slots {
+            let left = self.gpu.block_slots.saturating_sub(n);
+            if n == 0 || left < 2 {
+                bail!(
+                    "integration.max_spread_slots={n} would leave {left} staging slot(s) of \
+                     gpu.block_slots={}: the pipeline holds one and the receive side needs at \
+                     least one more, so this may be at most {}",
+                    self.gpu.block_slots,
+                    self.gpu.block_slots.saturating_sub(2)
+                );
+            }
         }
 
         // --- storage -----------------------------------------------------

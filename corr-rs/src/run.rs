@@ -456,6 +456,12 @@ pub(crate) fn run_receive_with(
             stall_timeout: Duration::from_millis(cfg.integration.block_timeout_ms),
             zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
             block_slots: plan.block_slots,
+            // Configured in slots, because that is the unit an operator reasons in
+            // ("leave me two writable slots"); the scheduler counts frames.
+            max_spread_frames: cfg
+                .integration
+                .max_spread_slots
+                .map(|slots| slots as u64 * frames_per_slot),
         },
         Instant::now(),
     );

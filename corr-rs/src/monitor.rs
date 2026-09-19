@@ -237,6 +237,10 @@ pub(crate) struct Recv {
     pub blocked_now: u64,
     /// `highest_progress - watermark`, in staging slots.
     pub spread_slots: f64,
+    /// How far the watermark was lifted above the slowest station by
+    /// `integration.max_spread_slots`, in slots. Non-zero means the scheduler is
+    /// deliberately leaving a station behind, so its rows carry more zero fill.
+    pub watermark_lift_slots: f64,
 }
 
 /// The host-to-device link, which this profile's geometry is sized against.
@@ -425,6 +429,7 @@ struct Derived {
     cores: f64,
     load: f64,
     spread_slots: f64,
+    watermark_lift_slots: f64,
     blocked_now: u64,
     verdict: Verdict,
 }
@@ -457,6 +462,9 @@ pub(crate) struct Monitor {
     station_names: Vec<String>,
     started_unix_ms: i64,
 
+    /// Set while the watermark is being lifted, so the fact is announced once
+    /// rather than every second.
+    lift_warned: bool,
     prev: Option<Snap>,
 }
 
@@ -491,6 +499,7 @@ impl Monitor {
             block_slots: plan.block_slots,
             station_names: plan.enabled.iter().map(|s| s.name.clone()).collect(),
             started_unix_ms: system_ms(),
+            lift_warned: false,
             prev: None,
         })
     }
@@ -680,6 +689,8 @@ impl Monitor {
             spread_slots,
             // The ring counts leases in and out, so its reading is signed; a
             // count published to a reader cannot be negative, so clamp.
+            watermark_lift_slots: sched.watermark_lift() as f64
+                / self.frames_per_slot.max(1) as f64,
             blocked_now: ring.blocked_now().max(0) as u64,
             verdict: verdict(
                 d_dropped,
@@ -691,6 +702,23 @@ impl Monitor {
                 load,
             ),
         };
+
+        // A station left behind on purpose is not an error, but it changes what the
+        // data means, so say it once when it starts and once when it stops.
+        if d.watermark_lift_slots > 0.0 {
+            if !self.lift_warned {
+                self.lift_warned = true;
+                eprintln!(
+                    "sched      : watermark lifted {:.1} slot(s) above the slowest station \
+                     (integration.max_spread_slots); its frames are recorded as missing in \
+                     blocks.csv, and the ring stays usable for everyone else",
+                    d.watermark_lift_slots
+                );
+            }
+        } else if self.lift_warned {
+            self.lift_warned = false;
+            eprintln!("sched      : watermark back to the slowest station (nobody is behind)");
+        }
 
         if self.print {
             if first {
@@ -810,6 +838,7 @@ impl Monitor {
                 wait_pct: d.wait_ratio * 100.0,
                 blocked_now: d.blocked_now,
                 spread_slots: d.spread_slots,
+                watermark_lift_slots: d.watermark_lift_slots,
             },
             gpu: Gpu {
                 h2d_gbs: d.h2d_gbs,
@@ -1053,6 +1082,7 @@ pub(crate) mod tests {
                 wait_pct: 0.0,
                 blocked_now: 0,
                 spread_slots: 0.0,
+                watermark_lift_slots: 0.0,
             },
             gpu: Gpu {
                 h2d_gbs: 0.0,

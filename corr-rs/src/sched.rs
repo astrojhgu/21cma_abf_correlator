@@ -287,6 +287,9 @@ pub struct RowScheduler {
     /// How long a station may deliver no packets at all before it is treated as
     /// having stopped. Purely physical time: no dependence on the data rate.
     stall_timeout: Duration,
+    /// See [`RowSchedulerParams::max_spread_frames`].
+    max_spread_frames: Option<u64>,
+
     /// Per station: last progress value seen, and when it changed.
     ///
     /// The stall detector is per station rather than global on purpose. A global
@@ -336,6 +339,13 @@ pub struct RowSchedulerParams {
     /// scheduler zero fill every other station too -- measured, 28 spurious
     /// recoveries and 3593 good frames discarded during a 1.5 s stall.
     pub block_slots: u32,
+    /// How far behind the slowest station the watermark may sit, in frames. `None`
+    /// means "wait for ever", which is what this did before the cap existed.
+    ///
+    /// See `integration.max_spread_slots` in the configuration: without a cap, a
+    /// station that falls behind can never be caught up with, because every station
+    /// advances at the same rate -- so the gap between them is a ratchet.
+    pub max_spread_frames: Option<u64>,
 }
 
 impl RowScheduler {
@@ -352,6 +362,7 @@ impl RowScheduler {
             stall_timeout,
             zero_fill_limit_frames: zero_fill_limit,
             block_slots,
+            max_spread_frames,
         } = p;
         let n = progress.len();
         assert!(!progress.is_empty(), "a scheduler with no stations");
@@ -389,6 +400,7 @@ impl RowScheduler {
             requested_frames: vec![0; n],
             block_slots,
             zero_fill_limit,
+            max_spread_frames,
             zero_fill_exceeded: None,
             // Sized up front: a scheduler indexes these by station on a hot path
             // and a default empty Vec would panic the first time it fires.
@@ -411,11 +423,43 @@ impl RowScheduler {
 
     /// Lowest station progress: the only frame id all stations have finalized.
     pub fn watermark(&self) -> u64 {
-        self.progress
-            .iter()
-            .map(|p| p.get())
-            .min()
-            .expect("non-empty by construction")
+        let (min, max) = self.progress_range();
+        match self.max_spread_frames {
+            // The cap: a station further behind than this stops being waited for. Its
+            // frames become missing frames -- the same outcome `stall_timeout`
+            // reaches, arrived at by distance instead of by silence.
+            Some(cap) => min.max(max.saturating_sub(cap)),
+            None => min,
+        }
+    }
+
+    /// How far the watermark was lifted above the slowest station, in frames.
+    ///
+    /// Zero unless the cap is doing something, and non-zero is worth reporting: it
+    /// says a station is being left behind *on purpose*, so its rows carry more zero
+    /// fill than the others and a reader of `blocks.csv` should know why.
+    pub fn watermark_lift(&self) -> u64 {
+        if self.max_spread_frames.is_none() {
+            return 0;
+        }
+        let (min, _) = self.progress_range();
+        self.watermark().saturating_sub(min)
+    }
+
+    /// Slowest and fastest station progress in one pass: this is on the hot path.
+    fn progress_range(&self) -> (u64, u64) {
+        let mut min = u64::MAX;
+        let mut max = 0;
+        for p in &self.progress {
+            let v = p.get();
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
+        }
+        (min, max)
     }
 
     /// Which station currently holds the watermark, for diagnostics.
@@ -693,6 +737,7 @@ mod tests {
                     stall_timeout: Duration::from_millis(TIMEOUT_MS),
                     zero_fill_limit_frames: 0,
                     block_slots: 3,
+                    max_spread_frames: None,
                 },
                 t,
             );
@@ -769,6 +814,29 @@ mod tests {
             .collect()
     }
 
+    /// Every station advances at the same rate, so the gap between them never closes
+    /// by itself. Without a cap, a station that falls behind holds the watermark for
+    /// ever -- and the ring's writable slots with it.
+    #[test]
+    fn the_watermark_stops_waiting_for_a_station_that_falls_too_far_behind() {
+        let mut f = Fixture::new(3, 1);
+        f.stations[0].progress.store(START + 10 * FPS, Ordering::Release);
+        f.stations[1].progress.store(START + 10 * FPS, Ordering::Release);
+        // No cap: the station still at START holds the watermark where it is.
+        assert_eq!(f.sched.watermark(), START);
+        assert_eq!(f.sched.watermark_lift(), 0, "nothing is being skipped");
+
+        // With a two-slot cap the scheduler stops waiting for it.
+        f.sched.max_spread_frames = Some(2 * FPS);
+        assert_eq!(f.sched.watermark(), START + 8 * FPS);
+        assert_eq!(f.sched.watermark_lift(), 8 * FPS);
+
+        // A cap wider than the actual spread changes nothing.
+        f.sched.max_spread_frames = Some(64 * FPS);
+        assert_eq!(f.sched.watermark(), START);
+        assert_eq!(f.sched.watermark_lift(), 0);
+    }
+
     #[test]
     fn a_row_spans_the_expected_number_of_slots() {
         assert_eq!(slots_per_row(1024, 256), 4);
@@ -819,6 +887,7 @@ mod tests {
                     stall_timeout: Duration::from_millis(TIMEOUT_MS),
                     zero_fill_limit_frames: 0,
                     block_slots: 3,
+                    max_spread_frames: None,
                 },
                 Instant::now(),
             )
@@ -996,6 +1065,7 @@ mod tests {
                 stall_timeout: Duration::from_millis(10),
                 zero_fill_limit_frames: N_CUM, // one row's worth of zero filling
                 block_slots: 3,
+                max_spread_frames: None,
             },
             t,
         );
