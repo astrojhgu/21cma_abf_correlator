@@ -313,24 +313,25 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
 .spec.quiet polyline { stroke:#6e7681; }
 .spec .axis { display:flex; justify-content:space-between; color:var(--dim); font-size:10px; }
 .spec .axis .mid { color:var(--dim); }
-/* 水位线：一行一站，0 处的竖线就是水位线，落在线左边的红条是"落后于水位线"的部分
-   ——那些帧会被记成 missing；cap 线画在同一根轴上，所以"离被迫放弃还差多远"是看
-   得见的，不用人去减两个数。轴是对称的，0 永远在正中，两次刷新之间位置可比。 */
-.wm { display:grid; gap:2px; }
-.wmrow { display:grid; grid-template-columns:30px 1fr 76px; align-items:center; gap:8px;
-         font-size:11px; font-variant-numeric:tabular-nums; }
-.wmrow .s { color:var(--dim); }
-.wmrow .s:last-child { text-align:right; }
-.wmtrack { position:relative; height:11px; background:var(--card); border:1px solid var(--line);
-           border-radius:3px; }
+/* 水位线：0 处的竖线就是水位线，落在线左边的红条是"落后于水位线"的部分——那些帧会被
+   记成 missing；cap 线画在同一根轴上，所以"离被迫放弃还差多远"是看得见的。轴是对称的，
+   0 永远在正中，两次刷新之间位置可比。这一列**并进「每站」表**：数值与条并排，一行同时
+   给出"哪一路"和"差多少"，不再单独占一张图。 */
+/* 最后一列要够宽，条才有分辨率：auto 布局会把富余空间分给别的列，结果条被压到几十
+   像素，"哪一路领先多少"就看不出来了。 */
+th:last-child, td:last-child { width:44%; }
+.wmcell { display:flex; align-items:center; gap:6px; }
+.wmcell .wmv { width:48px; flex:none; text-align:right; font-variant-numeric:tabular-nums; }
+.wmcell .wmv.lag { color:var(--bad); }
+.wmcell .wmv.lead { color:var(--ok); }
+.wmtrack { position:relative; flex:1; min-width:200px; height:11px; background:var(--card);
+           border:1px solid var(--line); border-radius:3px; }
 .wmtrack i { position:absolute; top:1px; bottom:1px; opacity:.85; }
 .wmtrack i.lag { background:var(--bad); }
 .wmtrack i.lead { background:var(--ok); }
 .wmtrack .zero, .wmtrack .cap { position:absolute; top:-1px; bottom:-1px; width:1px; }
 .wmtrack .zero { background:var(--fg); opacity:.7; }
 .wmtrack .cap { background:var(--warn); width:2px; opacity:.9; }
-td.lag { color:var(--bad); }
-td.lead { color:var(--ok); }
 </style></head><body>
 <header>
   <h1 id="run">corr 状态</h1>
@@ -369,19 +370,18 @@ td.lead { color:var(--ok); }
     <div class="specs" id="specs"></div>
   </section>
 
-  <section><h2>水位线（各站相对水位线，槽）</h2>
-    <div class="meta" id="wm-meta">等待第一份快照…</div>
-    <div class="wm" id="wm-rows"></div>
-  </section>
-
   <section><h2>每站</h2>
+    <div class="meta" id="wm-meta">等待第一份快照…</div>
     <table><thead><tr>
       <th>station</th><th>progress</th><th>zero-filled</th><th>lost</th>
-      <th>等环 ms</th><th>静默 s</th><th>相对水位线</th>
+      <th>等环 ms</th><th>静默 s</th><th>相对水位线（槽）</th>
     </tr></thead><tbody id="stations"></tbody></table>
   </section>
 </main>
 <script>
+// 首屏快照：服务端吐 HTML 时已经把最新一份 state 内联进来了，所以打开页面立刻就有数据，
+// 不必先看一秒空表（也让"截图那一刻"能看到真实内容）。之后 tick() 照常轮询覆盖它。
+const BOOT = __BOOT__;
 const fmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? "–" : v.toFixed(d);
 let chartsBuilt = false;
 
@@ -421,51 +421,46 @@ function drawSeries(s, hist) {
   line.setAttribute("points", pts.join(" "));
 }
 
-// 水位线：每站相对水位线的位置，一行一站。0 处的竖线是水位线；落在它左边（红）的站就是
-// "帧会被记成 missing"的那几个 —— 也就是把整环水位线按住不放的站。cap 线画在同一根轴上，
-// 于是"离被迫把它放弃还差多远"是看得见的。轴取对称量程，0 永远在正中。
-function drawWatermark(offs, capv, stations) {
-  const box = document.getElementById("wm-rows");
-  const meta = document.getElementById("wm-meta");
-  if (!box) return;
-  if (!offs || offs.length === 0) {
-    box.innerHTML = "";
-    meta.className = "meta stale";
-    meta.textContent = "还没有站进度：等第一行闭合";
-    return;
-  }
-  // 量程跟着数据走，**不**被 cap 撑开：cap 是"还差多远才被迫放弃"的参照，不是当前量程。
-  // 正常运行时站间差只有 0.0x 槽，若把 4 槽的 cap 一并画进轴里，24 个站会全挤在中线上，
-  // 这张图就等于没有（第一版就是这样）。cap 落在轴外时改在说明里点名。
-  const maxAbs = offs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+// 水位线：每站相对水位线的位置，画进「每站」表的最后一列（数值 + 条），不再单独成图。
+// 0 处的竖线是水位线；落在它左边（红）的站就是"帧会被记成 missing"的那几个 —— 也就是把
+// 整环水位线按住不放的站。cap 线画在同一根轴上，于是"离被迫把它放弃还差多远"是看得见的。
+// 轴取对称量程，0 永远在正中，两次刷新之间位置可比。
+//
+// 量程跟着数据走，**不**被 cap 撑开：cap 是"还差多远才被迫放弃"的参照，不是当前量程。正常
+// 运行时站间差只有 0.0x 槽，若把 4 槽的 cap 一并画进轴里，24 个站会全挤在中线上，这一列
+// 就等于没有（单独成图的第一版就是这样）。cap 落在轴外时在表头说明里点名。
+function watermarkScale(offs, capv) {
+  const maxAbs = (offs || []).reduce((m, v) => Math.max(m, Math.abs(v)), 0);
   const half = Math.max(maxAbs * 1.15, 0.05);
-  const capIn = capv !== null && capv !== undefined && capv <= half;
-  const at = v => ((v + half) / (2 * half)) * 100;
-  // 水位线本身读 0.00，不带符号：它不是"领先了一点点"。
-  const txt = v => Math.abs(v) < 0.005 ? "0.00" : (v > 0 ? "+" : "") + v.toFixed(2);
-  const slowest = offs.indexOf(Math.min(...offs));
-  let html = "";
-  for (let i = 0; i < offs.length; i++) {
-    const v = offs[i];
-    const a = Math.min(at(0), at(v));
-    const b = Math.max(at(0), at(v));
-    const name = stations && stations[i] ? stations[i].name : String(i);
-    const tag = (i === slowest && v < 0) ? " ← 最慢" : "";
-    html += `<div class="wmrow"><span class="s">${name}</span>`
-      + `<div class="wmtrack">`
-      + `<i class="${v < 0 ? "lag" : "lead"}" `
-      + `style="left:${a.toFixed(2)}%;width:${Math.max(b - a, 0.5).toFixed(2)}%"></i>`
-      + (capIn ? `<span class="cap" style="left:${at(-capv).toFixed(2)}%" `
-                 + `title="cap ${capv} 槽：再落后这么多就不再等它"></span>` : "")
-      + `<span class="zero" style="left:${at(0).toFixed(2)}%"></span>`
-      + `</div><span class="s">${txt(v)}${tag}</span></div>`;
+  return {
+    half,
+    capIn: capv !== null && capv !== undefined && capv <= half,
+    at: v => ((v + half) / (2 * half)) * 100,
+  };
+}
+
+// 水位线本身读 0.00，不带符号：它不是"领先了一点点"。
+const wmText = v => Math.abs(v) < 0.005 ? "0.00" : (v > 0 ? "+" : "") + v.toFixed(2);
+
+// 表格某一格的内容：数值 + 条。抽成独立函数是为了能在没有浏览器的环境里单独验它。
+function wmBar(off, sc, capv) {
+  if (off === null || off === undefined) {
+    return `<div class="wmcell"><span class="wmv">–</span></div>`;
   }
-  box.innerHTML = html;
-  meta.className = "meta";
-  meta.textContent = `轴 ±${half.toFixed(2)} 槽 · 竖线 = 水位线（0）· `
-    + ((capv === null || capv === undefined) ? "未设 cap · "
-        : (capIn ? `橙线 = cap ${capv} 槽 · ` : `cap ${capv} 槽在轴外（离得还远）· `))
-    + `绿 = 领先，红 = 落后于水位线（这些帧进 blocks.csv 时记成 missing）`;
+  const a = Math.min(sc.at(0), sc.at(off));
+  const b = Math.max(sc.at(0), sc.at(off));
+  const what = off < 0
+    ? `落后水位线 ${Math.abs(off).toFixed(2)} 槽（这些帧记成 missing）`
+    : `领先水位线 ${off.toFixed(2)} 槽`;
+  return `<div class="wmcell">`
+    + `<span class="wmv ${off < 0 ? "lag" : "lead"}">${wmText(off)}</span>`
+    + `<span class="wmtrack" title="${what}">`
+    + `<i class="${off < 0 ? "lag" : "lead"}" `
+    + `style="left:${a.toFixed(2)}%;width:${Math.max(b - a, 0.5).toFixed(2)}%"></i>`
+    + (sc.capIn ? `<span class="cap" style="left:${sc.at(-capv).toFixed(2)}%" `
+                 + `title="cap ${capv} 槽：再落后这么多就不再等它"></span>` : "")
+    + `<span class="zero" style="left:${sc.at(0).toFixed(2)}%"></span>`
+    + `</span></div>`;
 }
 
 function render(s) {
@@ -585,9 +580,14 @@ function render(s) {
   const capv = snap.recv ? snap.recv.max_spread_slots : null;
   const wmv = document.getElementById("wm");
   const wms = document.getElementById("wmsub");
+  const wmMeta = document.getElementById("wm-meta");
+  // 量程只算一次，表格每一行共用：同一张表里的条必须同一把尺子。
+  const sc = watermarkScale(offs, capv);
   if (offs.length === 0) {
     wmv.textContent = "–"; wmv.className = "v";
     wms.textContent = "还没有行闭合，各站进度尚未形成水位线";
+    wmMeta.className = "meta stale";
+    wmMeta.textContent = "末列的水位线条：等第一行闭合";
   } else {
     const lag = Math.max(0, -Math.min(...offs));
     const lead = Math.max(...offs);
@@ -600,8 +600,12 @@ function render(s) {
     wms.textContent = `最慢 #${slowName} · 最快 +${lead.toFixed(2)} · spread ${fmt(snap.recv.spread_slots, 2)}`
       + (capv ? ` · cap ${capv}` : " · 无 cap")
       + (lifted > 0 ? ` · 已抬 ${lifted.toFixed(2)} 槽` : "");
+    wmMeta.className = "meta";
+    wmMeta.textContent = `末列：每站相对水位线的位置（槽）——竖线 = 水位线（0），绿 = 领先、`
+      + `红 = 落后于水位线（落后部分的帧进 blocks.csv 时记成 missing）· 轴 ±${sc.half.toFixed(2)} 槽`
+      + ((capv === null || capv === undefined) ? " · 未设 cap"
+          : (sc.capIn ? ` · 橙线 = cap ${capv} 槽` : ` · cap ${capv} 槽在轴外（离得还远）`));
   }
-  drawWatermark(offs, capv, snap.stations);
 
   const tb = document.getElementById("stations");
   tb.innerHTML = "";
@@ -610,12 +614,10 @@ function render(s) {
     const off = offs.length > i ? offs[i] : null;
     const hot = st.silence_s > 2 || st.lost_packets > 0 && snap.recv.wait_pct > 50;
     tr.className = st.silence_s > 2 ? "hot" : (st.zero_filled_frames > 0 ? "warm" : "");
-    const offTxt = off === null ? "–"
-        : (Math.abs(off) < 0.005 ? "0.00" : (off > 0 ? "+" : "") + off.toFixed(2));
     tr.innerHTML = `<td>${st.name}</td><td>${st.progress_frames}</td>
       <td>${st.zero_filled_frames}</td><td>${st.lost_packets.toLocaleString()}</td>
       <td>${fmt(st.slot_wait_ms, 0)}</td><td>${fmt(st.silence_s, 1)}</td>
-      <td class="${off === null ? "" : (off < 0 ? "lag" : "lead")}">${offTxt}</td>`;
+      <td>${wmBar(off, sc, capv)}</td>`;
     if (hot) tr.title = "这一路的静默或等待明显偏高";
     if (off !== null && off < 0) {
       tr.title = (tr.title ? tr.title + "；" : "")
@@ -697,6 +699,7 @@ async function tickSpectra() {
   });
 }
 
+if (BOOT && BOOT.latest) render(BOOT);   // 首屏用内联快照，不等第一次轮询
 tick();
 setInterval(tick, 1000);
 tickSpectra();
@@ -713,7 +716,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler's naming)
         path = self.path.split("?", 1)[0]
         if path == "/":
-            body, ctype = PAGE.encode("utf-8"), "text/html; charset=utf-8"
+            # 内联最新一份快照：首屏不必先空一秒。`</` 必须转义，否则 JSON 里的字符串
+            # （运行名、输出目录这些）会提前结束 <script> 标签。
+            boot = json.dumps(self.collector.state()).replace("</", "<\\/")
+            body = PAGE.replace("__BOOT__", boot).encode("utf-8")
+            ctype = "text/html; charset=utf-8"
         elif path == "/api/state":
             body = json.dumps(self.collector.state()).encode("utf-8")
             ctype = "application/json"
