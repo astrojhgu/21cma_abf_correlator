@@ -126,6 +126,14 @@ pub struct IntegrationCfg {
     /// which `Config::validate` enforces.
     #[serde(default)]
     pub max_spread_slots: Option<u32>,
+    /// Stop the run once the watermark has been lifted for this many seconds.
+    ///
+    /// A lifted watermark means the scheduler has stopped waiting for a station, so its
+    /// frames are being recorded as missing -- and unlike a socket backlog, that does not
+    /// clear itself: every station advances at the same rate, so the gap is conserved and
+    /// only a restart closes it. Firing here stops the run while the damage is still small,
+    /// hours before `zero_fill_limit_frames` would. `null` disables it.
+    pub stop_after_lift_seconds: Option<u64>,
 }
 
 /// How the pair space is divided over `gpu.devices`.
@@ -1066,6 +1074,18 @@ impl Config {
                     self.gpu.block_slots.saturating_sub(2)
                 );
             }
+        }
+
+        // A stop condition that can never fire is worse than none: it looks like
+        // protection. With no cap the watermark is never lifted, so lift is always zero.
+        if self.integration.stop_after_lift_seconds.is_some()
+            && self.integration.max_spread_slots.is_none()
+        {
+            bail!(
+                "integration.stop_after_lift_seconds is set but integration.max_spread_slots is \
+                 null: with no cap the watermark is never lifted, so this could never stop the \
+                 run. Set max_spread_slots, or drop stop_after_lift_seconds"
+            );
         }
 
         // --- storage -----------------------------------------------------

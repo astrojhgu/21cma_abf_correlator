@@ -66,6 +66,8 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) prev_zf: u64,
     pub(crate) t0: Instant,
     pub(crate) elapsed: Duration,
+    /// Stop once the watermark has been lifted this long; `None` disables the check.
+    pub(crate) lift_stop_after: Option<Duration>,
     /// The live line. `None` when `monitoring.interval_ms` is 0.
     pub(crate) monitor: Option<Monitor>,
 }
@@ -219,6 +221,23 @@ impl<'a> Pipeline<'a> {
                     // can lose it steadily or in cascades, and the difference decides
                     // the fix, so the self.timeline is printed rather than guessed at.
                     let now = Instant::now();
+                    // A lifted watermark means a station is being left behind on purpose, and
+                    // its frames are going into blocks.csv as missing. Unlike a socket backlog
+                    // -- which drains once the machine quiets down -- this never clears itself,
+                    // so past the configured grace period the honest thing is to stop rather
+                    // than write more hours of data that is short on those frames.
+                    if let Some(limit) = self.lift_stop_after {
+                        let lifted = self.sched.note_lift(now);
+                        if lifted >= limit {
+                            let slots = self.sched.watermark_lift() as f64
+                                / self.sched.frames_per_slot().max(1) as f64;
+                            self.stop.stop(StopReason::LiftCap {
+                                seconds: lifted.as_secs(),
+                                slots_milli: (slots * 1000.0) as u64,
+                                station: self.sched.watermark_station().unwrap_or(0),
+                            });
+                        }
+                    }
                     // The live line, on its own interval (monitoring.interval_ms).
                     // Printed from here because this is the one thread that is idle
                     // by construction, and because both receivers reach it.

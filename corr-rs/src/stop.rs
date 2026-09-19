@@ -33,6 +33,23 @@ pub enum StopReason {
         fabricated: u64,
         limit: u64,
     },
+    /// The watermark stayed lifted for longer than the configuration allows.
+    ///
+    /// Earlier than a zero-fill cap, and for a different reason: `lift > 0` means the
+    /// scheduler has already stopped waiting for a station, so its frames are being
+    /// recorded as missing. A socket backlog can drain when the machine quiets down;
+    /// this cannot -- every station advances at the same rate, so the gap is conserved
+    /// and only a restart clears it.
+    LiftCap {
+        seconds: u64,
+        /// Slope in thousandths of a slot: `f64` would cost `Eq` on this type, and the
+        /// number is only ever formatted for a person.
+        slots_milli: u64,
+        /// Station index. The name is not available where this is raised -- the pipeline
+        /// holds the plan, not the station table -- and the per-station panel shows the
+        /// index beside the name.
+        station: usize,
+    },
     /// A receive thread hit an error it could not fix.
     Fatal { station: usize, message: String },
     /// The output file set for a new local day could not be opened. The run stops
@@ -57,6 +74,19 @@ impl StopReason {
                 "station {name} (index {station}) exceeded the zero-fill cap: {fabricated} \
                  frames requested, limit {limit}. The rows written so far record how many \
                  frames each one is missing, in blocks.csv"
+            ),
+            StopReason::LiftCap {
+                seconds,
+                slots_milli,
+                station,
+            } => format!(
+                "the watermark stayed lifted for {seconds}s: station index {station} has been \
+                 left behind by {:.2} slot(s), so its frames are recorded as missing. A \
+                 lifted watermark does not clear itself -- every station advances at the same \
+                 rate, so the gap only closes on a restart. Stopping now keeps the run from \
+                 writing hours of data that is short on those frames; blocks.csv carries the \
+                 per-row count for the rows already written",
+                *slots_milli as f64 / 1000.0
             ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
             StopReason::RolloverFailed { prefix, detail } => format!(
@@ -111,6 +141,14 @@ impl RunStop {
     }
 
     /// The zero-fill-cap wording the run report has always printed.
+    /// The lift-cap explanation, when that is what stopped the run.
+    pub fn lift_message(&self) -> Option<String> {
+        match self.reason() {
+            Some(r @ StopReason::LiftCap { .. }) => Some(r.describe()),
+            _ => None,
+        }
+    }
+
     pub fn zero_fill_message(&self) -> Option<String> {
         match self.reason() {
             Some(r @ StopReason::ZeroFillCap { .. }) => Some(r.describe()),

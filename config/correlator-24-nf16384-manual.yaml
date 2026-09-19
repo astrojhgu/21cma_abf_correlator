@@ -167,6 +167,11 @@ integration:
   # 的补零变多 —— 换整条环对所有人重新可用。留出 pipeline 一个槽 + 接收侧至少一个槽，
   # 所以最大 9（block_slots=11 时）；null = 旧行为（永远等）。
   max_spread_slots: 4
+  # 水位线被抬升（= 已经在放弃某个站）持续这么久就停下。比 zero_fill_limit_frames 早
+  # 得多：lift 一出现就意味着那些帧正在被记 missing，而且这个状态不可逆 —— 所有站以
+  # 相同帧率前进，差距是守恒的，只有重启能复位。健康运行时 lift 恒为 0（实测 8 次
+  # 抬升/回落只出现在过敏 cap=1 的测试里）。null = 不启用。
+  stop_after_lift_seconds: 30
   # 块 0 的起始 frame_id。为空时自动对齐到"所有站都已越过的第一个
   # frame_id 为 n_cum 整数倍的全局网格点"；显式指定时必须是 n_cum 的倍数。
   start_frame_id: null

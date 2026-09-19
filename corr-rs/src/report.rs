@@ -35,6 +35,8 @@ pub struct RunReport {
     pub stall_timeout: Duration,
     /// Set when the run stopped because a station exceeded the zero-fill cap.
     pub stopped_zero_fill_exceeded: Option<String>,
+    /// Set when the run stopped because the watermark stayed lifted for too long.
+    pub stopped_lift_exceeded: Option<String>,
     /// Set when a receive thread hit an error the whole run had to answer -- see
     /// [`crate::assemble::AssembleError::is_fatal`]. The output is still complete
     /// rows; it just stops early and says why.
@@ -130,6 +132,9 @@ impl RunReport {
             self.stall_timeout
         );
         if let Some(why) = &self.stopped_zero_fill_exceeded {
+            let _ = writeln!(s, "  STOPPED: {why}");
+        }
+        if let Some(why) = &self.stopped_lift_exceeded {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_fatal {

@@ -522,6 +522,7 @@ pub(crate) fn run_receive_with(
         elapsed: Duration::ZERO,
         monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, status_cell, plan),
         autospec: autospec_cell,
+        lift_stop_after: cfg.integration.stop_after_lift_seconds.map(Duration::from_secs),
     };
     pipeline.run()?;
     let elapsed = pipeline.elapsed;
@@ -641,6 +642,7 @@ pub(crate) fn run_receive_with(
         requested_per_station: ss.requested_per_station,
         stall_timeout: pipeline.sched.stall_timeout(),
         stopped_zero_fill_exceeded: stop.zero_fill_message(),
+        stopped_lift_exceeded: stop.lift_message(),
         stopped_fatal: fatal_stop,
         rows_written,
         output_dir: opts.output_dir.clone(),

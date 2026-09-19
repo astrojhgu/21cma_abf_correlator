@@ -289,6 +289,13 @@ pub struct RowScheduler {
     stall_timeout: Duration,
     /// See [`RowSchedulerParams::max_spread_frames`].
     max_spread_frames: Option<u64>,
+    /// When the watermark was first lifted above the slowest station, or `None` while it
+    /// is not lifted.
+    ///
+    /// Only a clock can answer "how long have we been leaving that station behind".
+    /// Cleared rather than paused when the lift goes away, so a station that recovers
+    /// and falls behind again gets a fresh interval instead of inheriting the old one.
+    lift_since: Option<Instant>,
 
     /// Per station: last progress value seen, and when it changed.
     ///
@@ -401,6 +408,7 @@ impl RowScheduler {
             block_slots,
             zero_fill_limit,
             max_spread_frames,
+            lift_since: None,
             zero_fill_exceeded: None,
             // Sized up front: a scheduler indexes these by station on a hot path
             // and a default empty Vec would panic the first time it fires.
@@ -444,6 +452,32 @@ impl RowScheduler {
         }
         let (min, _) = self.progress_range();
         self.watermark().saturating_sub(min)
+    }
+
+    /// Frames in one staging slot, for callers that report a gap in slots.
+    pub fn frames_per_slot(&self) -> u64 {
+        self.frames_per_slot
+    }
+
+    /// Note whether the watermark is lifted as of `now`, and report how long it has been.
+    ///
+    /// Called about once a second by the pipeline, which is the thread that has both a
+    /// clock and spare time. Deliberately not done in `step`: that runs per staging slot
+    /// on the hot path, and a stop condition measured in seconds does not need that rate.
+    ///
+    /// Zero means "not lifted right now" -- either it never was, or it recovered, in
+    /// which case the clock is cleared rather than left running.
+    pub fn note_lift(&mut self, now: Instant) -> Duration {
+        if self.max_spread_frames.is_none() {
+            return Duration::ZERO;
+        }
+        if self.watermark_lift() > 0 {
+            let since = *self.lift_since.get_or_insert(now);
+            now.saturating_duration_since(since)
+        } else {
+            self.lift_since = None;
+            Duration::ZERO
+        }
     }
 
     /// Every station's progress relative to the watermark, in frames and in station
@@ -832,6 +866,37 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_lift_clock_starts_clears_and_restarts() {
+        let mut f = Fixture::new(2, 1);
+        f.advance_all(10 * N_CUM);
+        f.sched.max_spread_frames = Some(FPS); // one slot
+
+        // Level: nothing is being skipped, so there is nothing to time.
+        assert_eq!(f.sched.note_lift(f.t), Duration::ZERO);
+
+        // One station pulls a whole slot ahead: the clock starts at zero, not at the
+        // fixture's start time.
+        f.advance_one(0, 2 * FPS);
+        assert!(f.sched.watermark_lift() > 0);
+        assert_eq!(f.sched.note_lift(f.t), Duration::ZERO);
+
+        let after_30 = f.t + Duration::from_secs(30);
+        assert_eq!(f.sched.note_lift(after_30), Duration::from_secs(30));
+
+        // Catching up clears it...
+        f.advance_one(1, 2 * FPS);
+        assert_eq!(f.sched.watermark_lift(), 0);
+        assert_eq!(f.sched.note_lift(after_30), Duration::ZERO);
+
+        // ...and falling behind again starts a fresh interval rather than resuming the
+        // old one, which would trip the stop immediately.
+        f.advance_one(0, 2 * FPS);
+        assert_eq!(f.sched.note_lift(after_30), Duration::ZERO);
+        let after_35 = after_30 + Duration::from_secs(5);
+        assert_eq!(f.sched.note_lift(after_35), Duration::from_secs(5));
     }
 
     #[test]
