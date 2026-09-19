@@ -156,6 +156,8 @@ pub(crate) struct RecvThreadArgs {
     pub(crate) zero_fill_limit_frames: u64,
     pub(crate) idx: usize,
     pub(crate) cpu: u32,
+    /// False leaves the thread free to migrate (`cpu.pin_cores`).
+    pub(crate) pin: bool,
     pub(crate) packets_per_frame: u64,
     pub(crate) frames_per_slot: u64,
     pub(crate) frame_stride: usize,
@@ -169,9 +171,11 @@ pub(crate) struct RecvThreadArgs {
 /// ring, and honour the scheduler's stall-recovery requests between polls.
 pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
     let mut sock = a.sock;
-    if let Err(e) = pin_to_cpu(a.cpu) {
-        // Not fatal: an unpinned thread still works, it is just less predictable.
-        eprintln!("corr: station {}: cannot pin to CPU {}: {e}", a.idx, a.cpu);
+    if a.pin {
+        if let Err(e) = pin_to_cpu(a.cpu) {
+            // Not fatal: an unpinned thread still works, it is just less predictable.
+            eprintln!("corr: station {}: cannot pin to CPU {}: {e}", a.idx, a.cpu);
+        }
     }
 
     let mut asm = StationAssembler::new(
@@ -377,6 +381,7 @@ impl ReceiveBackend for ThreadBackend {
                 zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
                 idx,
                 cpu: plan.enabled[idx].recv_cpu,
+                pin: cfg.cpu.pin_cores,
                 packets_per_frame,
                 frames_per_slot,
                 frame_stride,

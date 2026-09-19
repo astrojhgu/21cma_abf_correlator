@@ -193,9 +193,10 @@ impl ReceiveBackend for AsyncBackend {
             let cpu = cpus[w % cpus.len()];
             let geo = geometry.clone();
             let stations: Vec<usize> = group.iter().map(|p| p.idx).collect();
+            let pin = setup.cfg.cpu.pin_cores;
             let handle = std::thread::Builder::new()
                 .name(format!("corr-async-rx{w}"))
-                .spawn(move || worker_main(w, cpu, group, geo))
+                .spawn(move || worker_main(w, cpu, pin, group, geo))
                 .map_err(|e| anyhow::anyhow!("spawning receive worker {w}: {e}"))?;
             println!("  worker {w} on CPU {cpu}: station(s) {stations:?}");
             self.handles.push(handle);
@@ -237,13 +238,16 @@ impl ReceiveBackend for AsyncBackend {
 fn worker_main(
     w: usize,
     cpu: u32,
+    pin: bool,
     group: Vec<Pending>,
     g: Arc<RunGeometry>,
 ) -> Vec<(usize, RecvOutcome)> {
-    if let Err(e) = pin_to_cpu(cpu) {
-        // Not fatal: an unpinned worker still receives, it is just less
-        // predictable -- the same judgement the thread path makes.
-        eprintln!("corr-async: worker {w}: cannot pin to CPU {cpu}: {e}");
+    if pin {
+        if let Err(e) = pin_to_cpu(cpu) {
+            // Not fatal: an unpinned worker still receives, it is just less
+            // predictable -- the same judgement the thread path makes.
+            eprintln!("corr-async: worker {w}: cannot pin to CPU {cpu}: {e}");
+        }
     }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_io()

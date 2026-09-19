@@ -353,6 +353,17 @@ pub struct CpuCfg {
     /// node instead of being scattered.
     #[serde(default)]
     pub auto_layout: bool,
+    /// Whether each receive thread is pinned to one core.
+    ///
+    /// Pinning buys predictability -- a task stays on one core its whole life, which is
+    /// why it is the default -- and it also removes the only remedy the scheduler has.
+    /// Measured on this machine: `mlx5_compN`'s interrupt lands on `cpuN`, so every
+    /// receive thread shares its core with that station's queue interrupts, and rx16 sat
+    /// at 32% on cpu20 while cpu28 idled at 22%. A pinned thread cannot move; an
+    /// unpinned one can, and CFS will balance it against the softirq work. The cost is
+    /// migration and NUMA locality -- the staging buffer lives on one node.
+    #[serde(default = "default_true")]
+    pub pin_cores: bool,
 }
 
 /// A resolved CPU assignment.
@@ -459,6 +470,11 @@ fn nic_irq_core_share(ifaces: &[String]) -> Vec<u64> {
         }
     }
     share
+}
+
+/// For `CpuCfg::pin_cores`: absent means the historical behaviour (pinned).
+fn default_true() -> bool {
+    true
 }
 
 /// The NUMA node an interface lives on, and that node's cores.
