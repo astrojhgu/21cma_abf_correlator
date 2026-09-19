@@ -192,6 +192,24 @@ pub struct GpuCfg {
 pub struct StorageCfg {
     pub writers: usize,
     pub queue_bytes: u64,
+    /// What to do when the writer queue is full.
+    ///
+    /// **`drop` (the default) throws the row away and keeps receiving.** The
+    /// alternative, `block`, is what this code used to do unconditionally, and it
+    /// is how a disk stall takes a whole run down: `flush_rows` waits for a buffer,
+    /// so the pipeline stops releasing staging slots, so every receive worker
+    /// parks, so nothing reads the sockets and the kernel drops everything that
+    /// arrives. Measured 2026-09-19: a 52-second stall in that path became 240
+    /// million dropped packets and a run that never recovered.
+    ///
+    /// A dropped row is dropped *whole*. The queue's unit is one complete row
+    /// (`Job::Row` carries the full spectrum), so a row goes to every baseline file
+    /// or to none of them -- and because rows are numbered from the frame counter
+    /// rather than from the file position, the gap is clean: `row_index` jumps in
+    /// `blocks.csv` and `time.bin`, and every file of the set is missing exactly the
+    /// same rows.
+    #[serde(default)]
+    pub queue_full: QueueFull,
     pub fsync_on_stop: bool,
     /// How many rows to write before syncing the baseline files to the platter.
     ///
@@ -416,6 +434,19 @@ pub struct MonitoringCfg {
     /// (`docs/DESIGN-status-http.md`).
     #[serde(default)]
     pub http: HttpCfg,
+}
+
+/// What the writer does when its queue cannot take another row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueFull {
+    /// Throw the row away and keep receiving: the run survives a slow disk, at the
+    /// cost of a gap in the data. See [`StorageCfg::queue_full`].
+    #[default]
+    Drop,
+    /// Wait for the writer. Never loses a row, but a stall propagates all the way
+    /// back to the sockets -- see [`StorageCfg::queue_full`] for the measurement.
+    Block,
 }
 
 /// The status endpoint's configuration.

@@ -60,7 +60,7 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 
 use crate::config::{
-    local_day_at, local_stamp_at, local_tz_name, local_utc_offset_s, Config, RunPlan,
+    local_day_at, local_stamp_at, local_tz_name, local_utc_offset_s, Config, QueueFull, RunPlan,
 };
 
 /// Bytes in one row of one baseline's file.
@@ -975,6 +975,16 @@ pub struct Writer {
     rows: Arc<AtomicU64>,
     first_error: Arc<Mutex<Option<anyhow::Error>>>,
     pool: Vec<Vec<u8>>,
+    /// What to do when the queue cannot take another row.
+    queue_full: QueueFull,
+    /// Rows thrown away because the queue was full: a gap in the data, counted so
+    /// the end-of-run report can state it. Only this handle touches it.
+    dropped: u64,
+    /// A run of consecutive drops, so the log says "dropped 52 rows (2301..2352)"
+    /// once instead of printing 52 lines, and announces the recovery too.
+    drop_streak: u64,
+    drop_first_row: u64,
+    drop_last_row: u64,
     /// Rows that may be in flight, from `storage.queue_bytes`.
     queue_depth: usize,
     pool_cap: usize,
@@ -1176,6 +1186,11 @@ impl Writer {
                 rows,
                 first_error,
                 pool: Vec::new(),
+                queue_full: cfg.storage.queue_full,
+                dropped: 0,
+                drop_streak: 0,
+                drop_first_row: 0,
+                drop_last_row: 0,
                 queue_depth: depth,
                 pool_cap: depth + 2,
                 sent: 0,
@@ -1186,6 +1201,48 @@ impl Writer {
             },
             resume,
         ))
+    }
+
+    /// Record a row thrown away because the queue was full.
+    ///
+    /// The first drop explains itself and names the row, the rest are counted
+    /// silently, and the recovery reports the range. One line per dropped row would
+    /// turn a 52-second stall into 52 lines of noise, while the range is what a
+    /// reader needs: those row indices are the gap in `blocks.csv`, `time.bin` and
+    /// every baseline file.
+    fn note_dropped(&mut self, row_index: u64) {
+        if self.drop_streak == 0 {
+            self.drop_first_row = row_index;
+            eprintln!(
+                "writer: queue full ({depth} rows in flight), dropping row {row_index} and any \
+                 others that will not fit -- the run keeps receiving; a dropped row is absent \
+                 from every file of this set",
+                depth = self.queue_depth
+            );
+        }
+        self.drop_streak += 1;
+        self.drop_last_row = row_index;
+        self.dropped += 1;
+    }
+
+    /// Called after a row is handed over, so a run of drops gets closed out.
+    fn note_queued(&mut self) {
+        if self.drop_streak > 0 {
+            eprintln!(
+                "writer: caught up after dropping {n} row(s) (row_index {first}..={last}); \
+                 blocks.csv and time.bin jump across them, and no baseline file holds a partial \
+                 row",
+                n = self.drop_streak,
+                first = self.drop_first_row,
+                last = self.drop_last_row
+            );
+            self.drop_streak = 0;
+        }
+    }
+
+    /// Rows thrown away because the queue was full.
+    pub fn dropped_rows(&self) -> u64 {
+        self.dropped
     }
 
     /// Take an error the writer thread hit, if any.
@@ -1280,23 +1337,53 @@ impl Writer {
             None => Vec::with_capacity(self.row_bytes),
         };
         buf.extend_from_slice(spectrum);
-        if self
-            .tx
-            .send(Job::Row {
-                buf,
-                row_ms,
-                blocks: blocks.clone(),
-            })
-            .is_err()
-        {
-            // The thread stopped between the check above and this send. Its own
-            // error is the reason whenever it recorded one: a bare "the thread
-            // stopped" here would lose the type the pipeline needs (a failed day
-            // rollover is a `RolloverFailed`, and the report names it).
-            self.take_error()?;
-            bail!("the writer thread has stopped without reporting a reason");
+        let row_index = blocks.row_index;
+        let job = Job::Row {
+            buf,
+            row_ms,
+            blocks: blocks.clone(),
+        };
+        // `buf` holds this row and nothing else and one `Job` carries one row, so
+        // this is where "all of it or none of it" is decided: a row not handed over
+        // here is never seen by the thread, and no file can hold half of it. Whether
+        // a full queue drops or blocks is `storage.queue_full`; dropping is the
+        // default, because blocking here is what turns a slow disk into lost packets
+        // (a 52 s stall became 240 M dropped packets on 2026-09-19).
+        match self.queue_full {
+            QueueFull::Drop => match self.tx.try_send(job) {
+                Ok(()) => {
+                    self.sent += 1;
+                    self.note_queued();
+                }
+                Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                    // Give the buffer back for the next row to reuse: the row is the
+                    // loss, the allocation is not.
+                    if let Job::Row { buf, .. } = job {
+                        if self.pool.len() < self.pool_cap {
+                            self.pool.push(buf);
+                        }
+                    }
+                    self.note_dropped(row_index);
+                    return self.take_error();
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                    // The thread stopped between the check above and this send. Its own
+                    // error is the reason whenever it recorded one: a bare "the thread
+                    // stopped" here would lose the type the pipeline needs (a failed
+                    // day rollover is a `RolloverFailed`, and the report names it).
+                    self.take_error()?;
+                    bail!("the writer thread has stopped without reporting a reason");
+                }
+            },
+            QueueFull::Block => {
+                if self.tx.send(job).is_err() {
+                    self.take_error()?;
+                    bail!("the writer thread has stopped without reporting a reason");
+                }
+                self.sent += 1;
+                self.note_queued();
+            }
         }
-        self.sent += 1;
         let queued = self.queued();
         if queued > self.max_outstanding {
             self.max_outstanding = queued;
@@ -1353,6 +1440,11 @@ impl Writer {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+        eprintln!(
+            "writer: dropped {} row(s) while the queue was full; every file of the set is \
+             missing exactly those rows, and row_index jumps across them in blocks.csv",
+            self.dropped_rows(),
+        );
         eprintln!(
             "writer: {} rows handed over, deepest queue {} of {} rows ({} MB); \
              the pipeline thread never wrote or fsynced a row",
@@ -1938,6 +2030,58 @@ mod tests {
         // Pre-1970 instants must not produce "-123" milliseconds.
         assert!(text_time(-1).ends_with(".999"), "{}", text_time(-1));
         assert!(text_time(0).ends_with(".000"), "{}", text_time(0));
+    }
+
+    /// A full queue drops whole rows and keeps going instead of stalling the
+    /// pipeline: blocking there is what turns a slow disk into lost packets.
+    #[test]
+    fn a_full_queue_drops_whole_rows_and_keeps_receiving() {
+        let (mut cfg, plan) = test_plan_and_cfg();
+        // A two-row queue, so "full" is reachable deterministically.
+        let row_bytes = baseline_row_bytes(plan.n_freq) * plan.n_baseline;
+        cfg.storage.queue_bytes = row_bytes as u64 * 2;
+        let d = TempDir::new("queue-full");
+        let (mut w, _) = Writer::open(d.path(), &plan, &cfg, "hash-a", 1).unwrap();
+        assert_eq!(w.queue_depth, 2, "this test needs a shallow queue");
+
+        // Swap the handle's channel for one that is already full, so the outcome does
+        // not depend on how fast the writer thread happens to be. `_rx` stays alive so
+        // the channel does not look disconnected.
+        let (tx, _rx) = std::sync::mpsc::sync_channel(1);
+        tx.send(Job::Row {
+            buf: vec![0u8; row_bytes],
+            row_ms: 0,
+            blocks: blocks_for(&plan, 0, plan.n_cum as u64),
+        })
+        .expect("room for one");
+        w.tx = tx;
+
+        let t0 = midday_now();
+        for i in 0..3u64 {
+            w.write_row(
+                &make_row(&plan, i),
+                t0 + i as i64,
+                &blocks_for(&plan, i, plan.n_cum as u64),
+            )
+            .expect("a full queue is no longer an error: the row is dropped instead");
+        }
+        assert_eq!(w.dropped_rows(), 3, "three rows offered, none fit");
+
+        // Whole rows only: nothing reached the writer thread, so nothing was written,
+        // and in particular no file holds a fraction of a row. This is the property
+        // that makes a drop safe to read downstream -- every file of the set is
+        // missing exactly the same rows, and `row_index` jumps across them.
+        let sets = sets_on_disk(d.path(), &plan);
+        assert_eq!(sets.len(), 1, "{sets:?}");
+        assert_eq!((sets[0].1, sets[0].2), (0, 0), "no rows in the sidecars: {sets:?}");
+        for p in baseline_paths_for_tag(d.path(), &plan, &sets[0].0) {
+            assert_eq!(
+                std::fs::metadata(&p).unwrap().len(),
+                0,
+                "{} must be empty: a dropped row writes to no baseline at all",
+                p.display()
+            );
+        }
     }
 
     /// A reader watching `-time.txt` has to see rows as they are written. The file
