@@ -434,8 +434,13 @@ fn nic_irq_core_share(ifaces: &[String]) -> Vec<u64> {
 
     let mut share: Vec<u64> = Vec::new();
     for irq in &want {
-        let Ok(list) = std::fs::read_to_string(format!("/proc/irq/{irq}/smp_affinity_list"))
-        else {
+        // `effective_affinity_list` first: it is the core the kernel will actually use.
+        // `smp_affinity_list` is only the *permitted* set, and on this machine it reads
+        // 0-31 for every vector -- ranking by it would always conclude "evenly spread"
+        // and never move a receive thread. Fall back to it where effective is absent.
+        let list = std::fs::read_to_string(format!("/proc/irq/{irq}/effective_affinity_list"))
+            .or_else(|_| std::fs::read_to_string(format!("/proc/irq/{irq}/smp_affinity_list")));
+        let Ok(list) = list else {
             continue;
         };
         for cpu in parse_cpulist(list.trim()) {

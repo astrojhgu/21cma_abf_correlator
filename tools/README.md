@@ -263,25 +263,32 @@ sudo ethtool -G ens2f0np0 rx 8192      # 临时生效，重启失效；持久化
 - 长跑对比要**同一窗口内交错**（A/B/A/B，各 5–10 分钟）；这台共享机器的负载漂移是十分钟量级，块式对比会被淹没（实测同配置两次跑差 3.2 倍）。
 - 起跑前先 `doctor.py`；`pkill -f corr-replay` 会杀掉执行它的 shell 自己，用 `pkill -x`。
 
-### 待 root：把网卡中断收进它自己的 NUMA node（2026-09-19 事故的正解）
+### 待 root：把一半队列中断挪到闲核上（2026-09-19 事故的处置）
 
-`cpu.avoid_nic_interfaces` 只把网卡所在 NUMA node 的核从接收线程池里拿掉，**前提是中断确实
-待在那个 node 里**。这次它不是：`/sys/class/net/ens2f0np0/device/msi_irqs` 有 33 个向量，而
-每核的 `smp_affinity_list` 都分到 2 个 —— 等于没有绑定。于是 `ksoftirqd` 在 cpu18-21、26、27
-上忙，而 `auto_layout` 把 rx14–rx23 恰好放在这批核上：接收线程和软中断抢同一个核，socket
-积压一路涨到 **420 MB** 才丢包，而在此期间 `capacity` 报 `ok`、等环 0%、零填充 0% ——
-监控上什么都看不出来。等积压超过读取产能就开始成片丢：3 小时里 lost 3.47 亿、零填充
-10.12%，7 个站的数据报废（水位线被 cap 抬了 85 槽，才保住其余 17 站）。
+事故的机制：这张卡的 **33 个 MSI-X 向量与 32 个核一一对应** —— 看
+`/proc/irq/<n>/effective_affinity_list`，它是 `mlx5_compN → cpuN`。注意**不要**看
+`smp_affinity_list`：本机对每个向量都写着 `0-31`，那只是允许范围，据此判断会得出
+"中断均匀散布、无处可避"的错误结论（我第一版就是这么误判的）。
 
-把中断绑回 NIC 自己的 node，两者就一致了（`avoid_nic_interfaces` 本来就在避 node 0）：
+而 corr 的接收线程也在那些核上：`rx14/15/16` 与 `comp18/19/20` 同核，被 ksoftirqd 抢时间，
+60 s 窗口实测它们只拿到 **33-35%** 的核，而别的接收线程有 50-71%。对应的正是事故里丢包
+最多的端口（10065/10068/10069）。socket 积压涨到 420 MB 后开始成片丢包：3 小时 lost 3.47 亿、
+零填充 10.12%，7 个站报废（水位线被 cap 抬了 85 槽，才保住其余 17 站）。
 
-    for f in /sys/class/net/ens2f0np0/device/msi_irqs/*; do
-        echo 0-3 > /proc/irq/$(basename "$f")/smp_affinity_list
-    done
+**算力本身是够的**，缺的是分布：异步版 24 个接收线程合计 12.75 核，非 corr 的 CPU 占用
+约 5 核，整机 17.8/32 核；同一窗口 cpu0-3 只用了 2-24%，cp28-31 也是 21-25%。
+所以把**一半**中断（comp16 及以后）挪到 cpu0-3 即可，cpu18-27 随之干净：
 
-绑完 cpu4–31 是干净的 28 个核（24 接收 + pipeline + 2 writer + monitor，正好够用），而且
-`nic_irq_core_share()` 会看到区分度、自动把接收线程从最重的核上挪开（它在均匀时会明说
-"spread evenly ... left alone"，不假装做了优化）。
+    tools/pin-mlx5-irqs.sh --dry-run        # 先看会改什么，不需要 root
+    sudo tools/pin-mlx5-irqs.sh             # 只挪 comp16+（推荐）
+    sudo tools/pin-mlx5-irqs.sh --all       # 33 个向量全挪（4 核承担全部中断，风险更大）
+    sudo tools/pin-mlx5-irqs.sh --revert    # 回退
 
-注意：**手工指定 `recv_cpus` 解决不了这个问题**。按 24 站 + pipeline + 2 writer + monitor
-算需要 28 个核，而避开 node 0 与那 6 个忙核之后只剩 22 个，怎么排都会有 6 个核与中断共享。
+改动不持久，重启即失效；要持久就写一个 oneshot systemd unit 调这个脚本。
+这台机器上 `irqbalance` 是 inactive + disabled，所以手工绑定不会被覆盖。
+
+改完盯 corr-web 的「网卡缓冲（RX ring）」卡：**ring 溢出非零说明目标核过载，立刻 --revert**。
+
+顺便：**手工排 `cpu.recv_cpus` 解决不了这个问题**。24 站 + pipeline + 2 writer + monitor
+需要 28 个核，而避开 node 0 与当时最忙的 6 个核之后只剩 22 个，怎么排都会有核与中断共享。
+先把中断挪开，布局才有腾挪余地。
