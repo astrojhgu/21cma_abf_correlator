@@ -1451,11 +1451,16 @@ impl Writer {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        eprintln!(
-            "writer: dropped {} row(s) while the queue was full; every file of the set is \
-             missing exactly those rows, and row_index jumps across them in blocks.csv",
-            self.dropped_rows(),
-        );
+        let dropped = self.dropped_rows();
+            if dropped > 0 {
+                // Only when it happened: "dropped 0 rows, every file is missing exactly those
+                // rows" is noise pretending to be information.
+                eprintln!(
+                    "writer: dropped {dropped} row(s) while the queue was full; every file of the \
+                     set is missing exactly those rows, and row_index jumps across them in \
+                     blocks.csv"
+                );
+            }
         eprintln!(
             "writer: {} rows handed over, deepest queue {} of {} rows ({} MB); \
              the pipeline thread never wrote or fsynced a row",
