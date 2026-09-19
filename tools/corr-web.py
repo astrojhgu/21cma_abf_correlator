@@ -1050,6 +1050,24 @@ class Handler(BaseHTTPRequestHandler):
         """Quiet: a page opening is not news, and this console shows corr's log."""
 
 
+def check_history(text):
+    """`deque(maxlen=0)` 在 Python 里是**无上限**，所以 0 会静默地做出"永不遗忘"的曲线，
+    正好是 --history 存在的原因。拒绝它，而不是让它变成另一种行为。
+
+    先自己 `int()`：把字符串直接和 1 比较抛的是 TypeError，argparse 只会印一句
+    `invalid check_history value`，把这条说明吞掉。
+    """
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"需要一个整数，收到 {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            "必须 >= 1（0 在 Python 里表示无上限，会让曲线永不遗忘）"
+        )
+    return value
+
+
 def split_bind(text):
     host, _, port = text.rpartition(":")
     if not host or not port.isdigit():
@@ -1066,7 +1084,9 @@ def main():
     ap.add_argument("--bind", default=DEFAULT_BIND,
                     help=f"本程序的监听地址（默认 {DEFAULT_BIND}）")
     ap.add_argument("--interval", type=float, default=1.0, help="取数间隔秒（默认 1）")
-    ap.add_argument("--history", type=int, default=3600, help="内存里保留多少个样本")
+    ap.add_argument("--history", type=check_history, metavar="N", default=1000,
+                    help="内存里保留多少个样本（默认 1000；按 1 秒间隔约 17 分钟。\n"
+                         "调大只会把更多点压进同一张图里 —— 窗口是点数，不是时间）")
     ap.add_argument("--spectra-interval", type=float, default=5.0,
                     help="自相关谱的取数间隔秒，0 = 不取（默认 5）")
     ap.add_argument("--nic", default="ens2f0np0",
