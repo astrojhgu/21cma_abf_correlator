@@ -229,10 +229,18 @@ class Collector(threading.Thread):
         if not rx:
             return None
         rx.sort(key=lambda r: -r[1])
+        # 线程名是 corr-async-rxN，而 N 就是站索引：实测 rx16 对应站 index 16（S08，端口
+        # 10068），也正是事故里积压 420 MB 的那一路。所以逐线程的数可以直接贴到「每站」表。
+        by_index = {}
+        for name, pct in rx:
+            suffix = name.rsplit("rx", 1)[-1]
+            if suffix.isdigit():
+                by_index[int(suffix)] = round(pct, 1)
         return {
             "warmup": False,
             "pid": pid,
             "count": len(rx),
+            "by_index": by_index,
             "fastest": {"name": rx[0][0], "pct": rx[0][1]},
             "slowest": {"name": rx[-1][0], "pct": rx[-1][1]},
             "sum_pct": sum(r[1] for r in rx),
@@ -529,7 +537,7 @@ th:last-child, td:last-child { width:44%; }
     <div class="meta" id="wm-meta">等待第一份快照…</div>
     <table><thead><tr>
       <th>station</th><th>progress</th><th>zero-filled</th><th>lost</th>
-      <th>等环 ms</th><th>静默 s</th><th>相对水位线（槽）</th>
+      <th>等环 ms</th><th>静默 s</th><th>线程 CPU</th><th>相对水位线（槽）</th>
     </tr></thead><tbody id="stations"></tbody></table>
   </section>
 </main>
@@ -735,7 +743,8 @@ function threadsCard(t) {
   const sub = `rx ${t.count} 个 · 合计 ${(t.sum_pct / 100).toFixed(2)} 核`
     + ` · 最慢 ${slow.name || "?"} ${(slow.pct || 0).toFixed(1)}%`
     + ` · 最快 ${fast.name || "?"} ${(fast.pct || 0).toFixed(1)}%`
-    + `（差 ${((fast.pct || 0) - (slow.pct || 0)).toFixed(0)} 个百分点）`;
+    + `（差 ${((fast.pct || 0) - (slow.pct || 0)).toFixed(0)} 个百分点）`
+    + ` · 逐线程见下方「每站」表`;
 
   if (sq >= 100) {
     return { v: `squeeze ${sq.toFixed(0)}/s`, cls: "v bad", sub,
@@ -894,16 +903,26 @@ function render(s) {
 
   const tb = document.getElementById("stations");
   tb.innerHTML = "";
+  // 逐线程的 CPU，按站索引对齐（线程 rxN ↔ 站 N）。
+  const thrByIndex = (s.threads && s.threads.by_index) || {};
   snap.stations.forEach((st, i) => {
     const tr = document.createElement("tr");
     const off = offs.length > i ? offs[i] : null;
+    const thr = thrByIndex[i];
     const hot = st.silence_s > 2 || st.lost_packets > 0 && snap.recv.wait_pct > 50;
     tr.className = st.silence_s > 2 ? "hot" : (st.zero_filled_frames > 0 ? "warm" : "");
     tr.innerHTML = `<td>${st.name}</td><td>${st.progress_frames}</td>
       <td>${st.zero_filled_frames}</td><td>${st.lost_packets.toLocaleString()}</td>
       <td>${fmt(st.slot_wait_ms, 0)}</td><td>${fmt(st.silence_s, 1)}</td>
+      <td>${thr === null || thr === undefined ? "–" : thr.toFixed(1)}</td>
       <td>${wmBar(off, sc, capv)}</td>`;
     if (hot) tr.title = "这一路的静默或等待明显偏高";
+    if (thr !== undefined) {
+      // 不上色：这个值健康时也就 32%（那个核同时扛着本路队列的中断），与故障时几乎一样，
+      // 所以它区分不了好坏。它回答的是"积压涨起来时是谁被饿"。
+      tr.title = (tr.title ? tr.title + "；" : "")
+        + `这一路的收包线程 ${thr.toFixed(1)}% 核（健康时最慢的也就 32% 上下，别当警报看）`;
+    }
     if (off !== null && off < 0) {
       tr.title = (tr.title ? tr.title + "；" : "")
         + "这一路在水位线之下：落后部分按 missing 记录，行里表现为补零";
