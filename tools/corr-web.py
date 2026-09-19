@@ -313,6 +313,24 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
 .spec.quiet polyline { stroke:#6e7681; }
 .spec .axis { display:flex; justify-content:space-between; color:var(--dim); font-size:10px; }
 .spec .axis .mid { color:var(--dim); }
+/* 水位线：一行一站，0 处的竖线就是水位线，落在线左边的红条是"落后于水位线"的部分
+   ——那些帧会被记成 missing；cap 线画在同一根轴上，所以"离被迫放弃还差多远"是看
+   得见的，不用人去减两个数。轴是对称的，0 永远在正中，两次刷新之间位置可比。 */
+.wm { display:grid; gap:2px; }
+.wmrow { display:grid; grid-template-columns:30px 1fr 76px; align-items:center; gap:8px;
+         font-size:11px; font-variant-numeric:tabular-nums; }
+.wmrow .s { color:var(--dim); }
+.wmrow .s:last-child { text-align:right; }
+.wmtrack { position:relative; height:11px; background:var(--card); border:1px solid var(--line);
+           border-radius:3px; }
+.wmtrack i { position:absolute; top:1px; bottom:1px; opacity:.85; }
+.wmtrack i.lag { background:var(--bad); }
+.wmtrack i.lead { background:var(--ok); }
+.wmtrack .zero, .wmtrack .cap { position:absolute; top:-1px; bottom:-1px; width:1px; }
+.wmtrack .zero { background:var(--fg); opacity:.7; }
+.wmtrack .cap { background:var(--warn); width:2px; opacity:.9; }
+td.lag { color:var(--bad); }
+td.lead { color:var(--ok); }
 </style></head><body>
 <header>
   <h1 id="run">corr 状态</h1>
@@ -330,6 +348,8 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
       <div class="s" id="lostwin">–</div></div>
     <div class="card"><div class="k">收包侧等环</div><div class="v" id="wait">–</div>
       <div class="s" id="spread">–</div></div>
+    <div class="card"><div class="k">水位线</div><div class="v" id="wm">–</div>
+      <div class="s" id="wmsub">–</div></div>
     <div class="card"><div class="k">H2D</div><div class="v" id="h2d">–</div>
       <div class="s" id="slotfree">–</div></div>
     <div class="card"><div class="k">CPU / load</div><div class="v" id="cpu">–</div>
@@ -349,10 +369,15 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
     <div class="specs" id="specs"></div>
   </section>
 
+  <section><h2>水位线（各站相对水位线，槽）</h2>
+    <div class="meta" id="wm-meta">等待第一份快照…</div>
+    <div class="wm" id="wm-rows"></div>
+  </section>
+
   <section><h2>每站</h2>
     <table><thead><tr>
       <th>station</th><th>progress</th><th>zero-filled</th><th>lost</th>
-      <th>等环 ms</th><th>静默 s</th>
+      <th>等环 ms</th><th>静默 s</th><th>相对水位线</th>
     </tr></thead><tbody id="stations"></tbody></table>
   </section>
 </main>
@@ -394,6 +419,53 @@ function drawSeries(s, hist) {
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   });
   line.setAttribute("points", pts.join(" "));
+}
+
+// 水位线：每站相对水位线的位置，一行一站。0 处的竖线是水位线；落在它左边（红）的站就是
+// "帧会被记成 missing"的那几个 —— 也就是把整环水位线按住不放的站。cap 线画在同一根轴上，
+// 于是"离被迫把它放弃还差多远"是看得见的。轴取对称量程，0 永远在正中。
+function drawWatermark(offs, capv, stations) {
+  const box = document.getElementById("wm-rows");
+  const meta = document.getElementById("wm-meta");
+  if (!box) return;
+  if (!offs || offs.length === 0) {
+    box.innerHTML = "";
+    meta.className = "meta stale";
+    meta.textContent = "还没有站进度：等第一行闭合";
+    return;
+  }
+  // 量程跟着数据走，**不**被 cap 撑开：cap 是"还差多远才被迫放弃"的参照，不是当前量程。
+  // 正常运行时站间差只有 0.0x 槽，若把 4 槽的 cap 一并画进轴里，24 个站会全挤在中线上，
+  // 这张图就等于没有（第一版就是这样）。cap 落在轴外时改在说明里点名。
+  const maxAbs = offs.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  const half = Math.max(maxAbs * 1.15, 0.05);
+  const capIn = capv !== null && capv !== undefined && capv <= half;
+  const at = v => ((v + half) / (2 * half)) * 100;
+  // 水位线本身读 0.00，不带符号：它不是"领先了一点点"。
+  const txt = v => Math.abs(v) < 0.005 ? "0.00" : (v > 0 ? "+" : "") + v.toFixed(2);
+  const slowest = offs.indexOf(Math.min(...offs));
+  let html = "";
+  for (let i = 0; i < offs.length; i++) {
+    const v = offs[i];
+    const a = Math.min(at(0), at(v));
+    const b = Math.max(at(0), at(v));
+    const name = stations && stations[i] ? stations[i].name : String(i);
+    const tag = (i === slowest && v < 0) ? " ← 最慢" : "";
+    html += `<div class="wmrow"><span class="s">${name}</span>`
+      + `<div class="wmtrack">`
+      + `<i class="${v < 0 ? "lag" : "lead"}" `
+      + `style="left:${a.toFixed(2)}%;width:${Math.max(b - a, 0.5).toFixed(2)}%"></i>`
+      + (capIn ? `<span class="cap" style="left:${at(-capv).toFixed(2)}%" `
+                 + `title="cap ${capv} 槽：再落后这么多就不再等它"></span>` : "")
+      + `<span class="zero" style="left:${at(0).toFixed(2)}%"></span>`
+      + `</div><span class="s">${txt(v)}${tag}</span></div>`;
+  }
+  box.innerHTML = html;
+  meta.className = "meta";
+  meta.textContent = `轴 ±${half.toFixed(2)} 槽 · 竖线 = 水位线（0）· `
+    + ((capv === null || capv === undefined) ? "未设 cap · "
+        : (capIn ? `橙线 = cap ${capv} 槽 · ` : `cap ${capv} 槽在轴外（离得还远）· `))
+    + `绿 = 领先，红 = 落后于水位线（这些帧进 blocks.csv 时记成 missing）`;
 }
 
 function render(s) {
@@ -508,18 +580,49 @@ function render(s) {
   document.getElementById("limits").textContent =
       `门限：环 ${fmt(lim.ring_busy, 0)}% · 链路 ${fmt(lim.link, 0)}% · CPU ${fmt(lim.cpu, 0)}%`;
 
+  // 水位线：谁在拖后腿、拖多少、离 cap 多远。spread 只说差多少，这一块说差在谁身上。
+  const offs = (snap.recv && snap.recv.stations_offset_slots) || [];
+  const capv = snap.recv ? snap.recv.max_spread_slots : null;
+  const wmv = document.getElementById("wm");
+  const wms = document.getElementById("wmsub");
+  if (offs.length === 0) {
+    wmv.textContent = "–"; wmv.className = "v";
+    wms.textContent = "还没有行闭合，各站进度尚未形成水位线";
+  } else {
+    const lag = Math.max(0, -Math.min(...offs));
+    const lead = Math.max(...offs);
+    const slow = offs.indexOf(Math.min(...offs));
+    const slowName = (snap.stations && snap.stations[slow]) ? snap.stations[slow].name : slow;
+    const lifted = snap.recv.watermark_lift_slots || 0;
+    wmv.textContent = lag.toFixed(2) + " 槽";
+    wmv.className = "v " + (lag > 0.5 ? "bad" : (lag > 0.05 ? "warn" : "ok"));
+    wmv.title = "最慢的站落后水位线多少；落后于水位线的帧会被记成 missing，也就是补零的来源";
+    wms.textContent = `最慢 #${slowName} · 最快 +${lead.toFixed(2)} · spread ${fmt(snap.recv.spread_slots, 2)}`
+      + (capv ? ` · cap ${capv}` : " · 无 cap")
+      + (lifted > 0 ? ` · 已抬 ${lifted.toFixed(2)} 槽` : "");
+  }
+  drawWatermark(offs, capv, snap.stations);
+
   const tb = document.getElementById("stations");
   tb.innerHTML = "";
-  for (const st of snap.stations) {
+  snap.stations.forEach((st, i) => {
     const tr = document.createElement("tr");
+    const off = offs.length > i ? offs[i] : null;
     const hot = st.silence_s > 2 || st.lost_packets > 0 && snap.recv.wait_pct > 50;
     tr.className = st.silence_s > 2 ? "hot" : (st.zero_filled_frames > 0 ? "warm" : "");
+    const offTxt = off === null ? "–"
+        : (Math.abs(off) < 0.005 ? "0.00" : (off > 0 ? "+" : "") + off.toFixed(2));
     tr.innerHTML = `<td>${st.name}</td><td>${st.progress_frames}</td>
       <td>${st.zero_filled_frames}</td><td>${st.lost_packets.toLocaleString()}</td>
-      <td>${fmt(st.slot_wait_ms, 0)}</td><td>${fmt(st.silence_s, 1)}</td>`;
+      <td>${fmt(st.slot_wait_ms, 0)}</td><td>${fmt(st.silence_s, 1)}</td>
+      <td class="${off === null ? "" : (off < 0 ? "lag" : "lead")}">${offTxt}</td>`;
     if (hot) tr.title = "这一路的静默或等待明显偏高";
+    if (off !== null && off < 0) {
+      tr.title = (tr.title ? tr.title + "；" : "")
+        + "这一路在水位线之下：落后部分按 missing 记录，行里表现为补零";
+    }
     tb.appendChild(tr);
-  }
+  });
 
   if (!chartsBuilt) buildCharts(s.series);
   for (const ser of s.series) drawSeries(ser, s.history);

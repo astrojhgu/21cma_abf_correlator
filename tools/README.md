@@ -252,7 +252,7 @@ sudo ethtool -G ens2f0np0 rx 8192      # 临时生效，重启失效；持久化
 `tools/corr-web.py` 页面的"网卡层"卡片与 `loss_attribution.py` 是同一份口径：**应用侧
 全干净、网卡层在丢**就是当前这种局面的特征。
 
-| `corr-web.py` | 独立运行的**状态监测界面**：轮询 corr 的两个只读端点——每秒取 `GET /status.json`（运行状态，自己攒历史画曲线），每 5 s 取 `GET /autospectra.json`（最新那一行的自相关谱，每路一格 dB 曲线）；页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库，**不读 NFS**（谱由写盘端记录，不是读回来的——这台机器上被测的就是写盘那条路径）；corr 停了也不崩，显示"断开 N 秒"并继续展示最后一份。接口契约见 `docs/DESIGN-status-http.md`。 |
+| `corr-web.py` | 独立运行的**状态监测界面**：轮询 corr 的两个只读端点——每秒取 `GET /status.json`（运行状态，自己攒历史画曲线），每 5 s 取 `GET /autospectra.json`（最新那一行的自相关谱，每路一格 dB 曲线）；页面默认在 `http://127.0.0.1:8080/`。只用 Python 标准库，**不读 NFS**（谱由写盘端记录，不是读回来的——这台机器上被测的就是写盘那条路径）；corr 停了也不崩，显示"断开 N 秒"并继续展示最后一份。接口契约见 `docs/DESIGN-status-http.md`。页面上的「水位线」卡片与那张一行一站的图读的是 `recv.stations_offset_slots`：0 处的竖线就是水位线，红线是落在它左边的站（落后于水位线的帧进 `blocks.csv` 时记成 missing），橙线是 `integration.max_spread_slots` 的 cap——离被迫放弃还差多远因此是看得见的，不用去减两个数。 |
 
 **三条使用纪律**（都是踩出来的）：
 
