@@ -359,7 +359,7 @@ th:last-child, td:last-child { width:44%; }
       <div class="s" id="wqsub">–</div></div>
     <div class="card"><div class="k">capacity</div><div class="v" id="verdict">–</div>
       <div class="s" id="limits">–</div></div>
-    <div class="card"><div class="k">网卡层（硬件队列）</div><div class="v" id="nic">–</div>
+    <div class="card"><div class="k">网卡层（ring 溢出）</div><div class="v" id="nic">–</div>
       <div class="s" id="nicsub">–</div></div>
   </div>
 
@@ -463,6 +463,49 @@ function wmBar(off, sc, capv) {
     + `</span></div>`;
 }
 
+// 网卡层卡片：判据是 ring 溢出，不是端口级丢弃。
+//
+// `rx_prio0_discards`（与 `rx_discards_phy` 是同一个寄存器的两个名字）是**端口级**计数：
+// 进入这张卡的包里被网卡丢掉的总数。实测它偶发增长时，ring 溢出、`/proc/net/udp` 的 drops
+// 和 corr 自己的 lost/sockdrop 往往全是 0 —— 那些包不是我们的（多为其它流量或未订阅的组播），
+// 用它当报警条件会误报。真正会变成零填充的是 `rx_out_of_buffer`：RX ring 满、描述符不够。
+// 所以主值只认它；端口级丢弃退到副行，并且只有当同一窗口的零填充也在涨时才变色 ——
+// 那才叫"这次真的丢到我们了"。
+function nicCard(nic, zfWinPct) {
+  if (!nic) return { v: "–", cls: "v", sub: "未采样", title: "" };
+  if (nic.error) return { v: "?", cls: "v warn", sub: nic.error, title: "" };
+  if (nic.warmup) return { v: "…", cls: "v", sub: "需要两次采样才能算增量", title: "" };
+
+  const ring = nic.out_of_buffer_per_s || 0;
+  const port = nic.discards_per_s || 0;
+  const zfHot = (zfWinPct || 0) > 0;
+  const sub = `到达 ${(nic.mpps || 0).toFixed(2)} Mpps · ring 溢出 ${ring.toFixed(0)}/s`
+    + ` · 端口级丢弃 ${port.toFixed(0)}/s`
+    + ` · 发 pause ${(nic.pause_per_s || 0).toFixed(0)}/s`
+    + ` · 软中断丢 ${(nic.softnet_dropped_per_s || 0).toFixed(0)}/s`;
+
+  if (ring > 0) {
+    return {
+      v: `溢出 ${ring.toFixed(0)}/s`, cls: "v bad", sub,
+      title: "RX ring 满、描述符不够：这些包在网卡里就没了，应用侧的 lost/sockdrop/udp drops "
+           + "都看不到它们——它们会直接变成零填充。调大 ring 才治这个（ethtool -G，需要 root）",
+    };
+  }
+  if (port > 0 && zfHot) {
+    return {
+      v: `端口丢 ${port.toFixed(0)}/s`, cls: "v bad", sub,
+      title: "端口级丢弃，而且这一窗口的零填充同时在涨：这次丢的里面确实有 corr 的包",
+    };
+  }
+  return {
+    v: "0/s", cls: "v ok", sub,
+    title: port > 0
+      ? "端口级丢弃是有的，但 ring 没溢出、零填充也没涨：这些包不是 corr 的"
+        + "（多为其它流量或未订阅的组播），应用侧三个计数仍是 0"
+      : "网卡三层（ring 溢出 / 硬中断 / 软中断）都没有丢弃",
+  };
+}
+
 function render(s) {
   const snap = s.latest;
   const conn = document.getElementById("conn");
@@ -515,30 +558,12 @@ function render(s) {
       `${fmt(snap.host.cpu_cores, 1)}/${snap.host.cores_online}`;
   document.getElementById("load").textContent = `load1 ${fmt(snap.host.load1, 1)}`;
 
-  // 网卡层：补零变多时，先在这里看是不是硬件队列丢的（应用侧那几项可能全是干净的）。
-  const nic = s.nic || null;
+  // 网卡层：主值只认 ring 溢出，端口级丢弃退到副行（判据见 nicCard 的注释）。
+  const nc = nicCard(s.nic, snap.window ? snap.window.zero_fill_pct : 0);
   const nv = document.getElementById("nic");
   const ns = document.getElementById("nicsub");
-  if (!nic) {
-    nv.textContent = "–"; nv.className = "v";
-    ns.textContent = "未采样";
-  } else if (nic.error) {
-    nv.textContent = "?"; nv.className = "v warn";
-    ns.textContent = nic.error;
-  } else if (nic.warmup) {
-    nv.textContent = "…"; nv.className = "v";
-    ns.textContent = "需要两次采样才能算增量";
-  } else if (nic.discards_per_s > 0) {
-    nv.textContent = `${nic.discards_per_s.toFixed(0)}/s`; nv.className = "v bad";
-    nv.title = "包在网卡 RX 队列就被扔了：ring 太小或中断被推迟，与接收程序无关";
-    ns.textContent = `到达 ${nic.mpps.toFixed(2)} Mpps · prio0 硬件丢弃 · `
-      + `发 pause ${nic.pause_per_s.toFixed(0)}/s · 软中断丢 ${nic.softnet_dropped_per_s.toFixed(0)}/s`;
-  } else {
-    nv.textContent = "0/s"; nv.className = "v ok";
-    nv.title = "网卡三层（硬件队列 / 软中断 / 流控）都没有丢弃";
-    ns.textContent = `到达 ${nic.mpps.toFixed(2)} Mpps · 无硬件丢弃 · `
-      + `软中断丢 ${nic.softnet_dropped_per_s.toFixed(0)}/s`;
-  }
+  nv.textContent = nc.v; nv.className = nc.cls; nv.title = nc.title;
+  ns.textContent = nc.sub;
 
   // 写盘队列：占用率是"丢之前"的先行指标，丢行数是已经发生的损害。丢一行 = 数据里一个
   // 洞，而且它在**所有**文件里都不存在（blocks.csv 的 row_index 会在那里跳跃），所以这一格
