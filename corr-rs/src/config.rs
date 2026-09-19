@@ -400,6 +400,54 @@ fn layout_from_pool(pool: &[u32], n_station: usize, writers: usize) -> Option<Cp
     })
 }
 
+/// How many of these interfaces' MSI-X vectors the kernel has *assigned* to each
+/// core. Index is the CPU number, so it lines up with `CpuLayout`.
+///
+/// Read from `/proc/irq/<n>/smp_affinity_list`, not from the counters in
+/// `/proc/interrupts`. The counters are cumulative since boot and were measured
+/// here to look nearly uniform (4.4e8 to 5.4e8 per core over 32 cores) even while
+/// `ksoftirqd` is busy on six of them and the receive threads sharing those six
+/// are the ones that fall behind -- a lifetime average cannot show a current
+/// concentration. Affinity is what the kernel will actually use, and sampling
+/// counters at startup would be worse still: before the run starts the streams
+/// are not flowing, so there is nothing to sample.
+///
+/// A vector bound to several cores counts once for each. Empty when nothing can
+/// be read; a uniform result means "not pinned anywhere in particular", which
+/// leaves the caller's order alone rather than inventing a preference.
+fn nic_irq_core_share(ifaces: &[String]) -> Vec<u64> {
+    let mut want: Vec<String> = Vec::new();
+    for iface in ifaces {
+        let Ok(entries) = std::fs::read_dir(format!("/sys/class/net/{iface}/device/msi_irqs"))
+        else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                want.push(name.to_string());
+            }
+        }
+    }
+    if want.is_empty() {
+        return Vec::new();
+    }
+
+    let mut share: Vec<u64> = Vec::new();
+    for irq in &want {
+        let Ok(list) = std::fs::read_to_string(format!("/proc/irq/{irq}/smp_affinity_list"))
+        else {
+            continue;
+        };
+        for cpu in parse_cpulist(list.trim()) {
+            if share.len() <= cpu as usize {
+                share.resize(cpu as usize + 1, 0);
+            }
+            share[cpu as usize] += 1;
+        }
+    }
+    share
+}
+
 /// The NUMA node an interface lives on, and that node's cores.
 fn nic_node_cpus(iface: &str) -> Option<(i32, Vec<u32>)> {
     let node: i32 = std::fs::read_to_string(format!(
@@ -1236,7 +1284,42 @@ impl Config {
         }
 
         let online = online_cpus().with_context(|| "reading /sys/devices/system/cpu/online")?;
-        let pool: Vec<u32> = online.into_iter().filter(|c| !excluded.contains(c)).collect();
+        let mut pool: Vec<u32> = online.into_iter().filter(|c| !excluded.contains(c)).collect();
+
+        // Receive threads come off the head of the pool, so put the cores the kernel
+        // assigned the fewest NIC IRQs to there. Skipping the NIC's NUMA node is not
+        // enough: on this machine the queue IRQs are not confined to it, and the cores
+        // that `ksoftirqd` ends up busy on are inside the pool (see
+        // `nic_irq_core_share`). The sort is stable, so a tie keeps the kernel's order.
+        let counts = nic_irq_core_share(&self.cpu.avoid_nic_interfaces);
+        let hits = |c: &u32| counts.get(*c as usize).copied().unwrap_or(0);
+        let lo = pool.iter().map(|c| hits(c)).min().unwrap_or(0);
+        let hi = pool.iter().map(|c| hits(c)).max().unwrap_or(0);
+        if !counts.is_empty() {
+            if hi == lo {
+                // An even share means the vectors are not pinned anywhere in particular, so
+                // there is no quiet core to prefer. Say that, instead of reporting a
+                // preference that does not exist -- the sort would be a no-op anyway.
+                notes.push(format!(
+                    "NIC IRQs are spread evenly ({} vector(s) per core across the {} cores of the \
+                     pool), so the receive layout is left alone; confining them needs root",
+                    lo,
+                    pool.len()
+                ));
+            } else {
+                pool.sort_by_key(|c| hits(c));
+                let quiet = pool.first().copied().unwrap_or(0);
+                let busy = pool.last().copied().unwrap_or(0);
+                notes.push(format!(
+                    "receive cores ordered by NIC IRQ assignment: lightest cpu{quiet} carries {} \
+                     of the interface's vectors, heaviest cpu{busy} carries {}",
+                    hits(&quiet),
+                    hits(&busy)
+                ));
+            }
+        }
+
+
         let writers = self.storage.writers;
         let layout = layout_from_pool(&pool, n_station, writers).with_context(|| {
             format!(
@@ -1252,6 +1335,35 @@ impl Config {
             "auto layout: receive on {:?}, pipeline {}, writers {:?}, monitor {}",
             layout.recv_cpus, layout.pipeline_cpu, layout.writer_cpus, layout.monitor_cpu
         ));
+        // Only meaningful when the assignment has contrast: with an even share every core
+        // is equally "heaviest", so warning would be noise (and the sort did nothing).
+        if !counts.is_empty() && hi != lo {
+            let heavy: Vec<u32> = layout
+                .recv_cpus
+                .iter()
+                .copied()
+                .filter(|c| hits(c) == hi)
+                .collect();
+            if !heavy.is_empty() {
+                notes.push(format!(
+                    "WARNING: receive core(s) {heavy:?} carry the most NIC vectors ({hi} each), \
+                     because there were not enough lighter cores for {n_station} stations: \
+                     expect those stations to fall behind under load"
+                ));
+            }
+        }
+        if !counts.is_empty() && hi != lo {
+            let heavy: Vec<u32> = layout.recv_cpus.iter().copied().filter(|c| hits(c) == hi).collect();
+            if !heavy.is_empty() {
+                notes.push(format!(
+                    "WARNING: receive core(s) {heavy:?} carry the most NIC vectors ({hi} each): \
+                     there were not enough lighter cores for {n_station} stations, so expect \
+                     those stations to fall behind under load"
+                ));
+            }
+        }
+        // If the quiet cores ran out, say so rather than pretend: the receive threads
+        // that landed on a busy core are the ones that will fall behind first.
         Ok((layout, notes))
     }
 
@@ -1620,6 +1732,38 @@ mod tests {
         assert_eq!(parse_cpulist(" 5\n"), vec![5]);
         assert_eq!(parse_cpulist(""), Vec::<u32>::new());
         assert_eq!(parse_cpulist("junk,7"), vec![7]);
+    }
+
+    #[test]
+    #[test]
+    fn receive_cores_avoid_the_cores_the_nic_irqs_are_assigned_to() {
+        // The pool auto_layout builds on this machine: node 0 (cpu0-3) removed, 28 cores.
+        let pool: Vec<u32> = (4..32).collect();
+        let hot = [18u32, 19, 20];
+        let mut share = vec![0u64; 32];
+        for c in hot {
+            share[c as usize] = 8; // eight of the interface's vectors land here
+        }
+
+        let hits = |c: &u32| share.get(*c as usize).copied().unwrap_or(0);
+        let mut ordered = pool.clone();
+        ordered.sort_by_key(|c| hits(c));
+
+        // Receive threads take the whole head; only `writers + 2` cores are left over.
+        let split = ordered.len() - (1 + 2);
+        let layout = layout_from_pool(&ordered, 24, 1).expect("28 cores fit 24 + tail");
+        assert_eq!(layout.recv_cpus, ordered[..split]);
+        for c in hot {
+            assert!(
+                !layout.recv_cpus.contains(&c),
+                "cpu{c} carries the most NIC IRQs and must not host a receive thread: {:?}",
+                layout.recv_cpus
+            );
+        }
+
+        // Stable sort: equal-share cores keep the order the kernel gave them.
+        let quiet: Vec<u32> = pool.iter().copied().filter(|c| !hot.contains(c)).collect();
+        assert_eq!(layout.recv_cpus, quiet[..split]);
     }
 
     #[test]
