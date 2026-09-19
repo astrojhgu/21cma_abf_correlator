@@ -141,6 +141,10 @@ class Collector(threading.Thread):
         # 与 samples 一一对应：nic 采样频率与 status 轮询不同，逐条记录才能对齐。
         self.samples_udp = deque(maxlen=history)
         self.udp_backlog_mb = 0.0
+        self.threads_now = None
+        self._thread_prev = None
+        self._thread_prev_t = None
+        self._squeeze_prev = None
         self.latest = None
         self.error = None
         self.received_at = None
@@ -155,6 +159,86 @@ class Collector(threading.Thread):
         req = urllib.request.Request(url, headers={"Cache-Control": "no-store"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def _find_pid(self):
+        """status.json 里没有 pid 时，自己去 /proc 里认领。"""
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open("/proc/%s/comm" % name) as fh:
+                    comm = fh.read().strip()
+            except OSError:
+                continue
+            if comm in ("corr-async", "corr"):
+                return int(name)
+        return None
+
+    def _sample_threads(self):
+        """收包线程的 CPU 分摊，加上 NAPI 没处理完的次数（time_squeeze）。
+
+        **诊断用，不是预警**：健康运行时最慢的收包线程也只拿到 33%（它所在的核被网卡
+        队列中断占了固定一份），最慢与最快能差 40 个百分点 —— 与故障时几乎一样，所以它
+        区分不了好坏。真正敏感的信号是积压。这一块的用处是：积压开始涨的时候，在这里看
+        出是哪几个线程被饿，以及内核是否已经在硬扛（`time_squeeze` 健康时应为 0）。
+        """
+        with self.lock:
+            pid = (self.latest or {}).get("pid")
+        if not pid:
+            pid = self._find_pid()
+        if not pid:
+            return None
+
+        now = time.monotonic()
+        cur = {}
+        try:
+            for t in os.listdir("/proc/%d/task" % pid):
+                try:
+                    with open("/proc/%d/task/%s/stat" % (pid, t)) as fh:
+                        raw = fh.read()
+                    with open("/proc/%d/task/%s/comm" % (pid, t)) as fh:
+                        comm = fh.read().strip()
+                except OSError:
+                    continue
+                rest = raw[raw.rindex(")") + 2:].split()
+                cur[t] = (comm, int(rest[11]) + int(rest[12]))
+        except OSError:
+            return None
+
+        squeeze = 0
+        try:
+            with open("/proc/net/softnet_stat") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 3:
+                        squeeze += int(f[2], 16)
+        except OSError:
+            pass
+
+        prev, prev_t, prev_sq = self._thread_prev, self._thread_prev_t, self._squeeze_prev
+        self._thread_prev, self._thread_prev_t, self._squeeze_prev = cur, now, squeeze
+        if prev is None or prev_t is None or prev_sq is None:
+            return {"warmup": True}
+
+        dt = max(now - prev_t, 1e-6)
+        hz = os.sysconf("SC_CLK_TCK")
+        rx = []
+        for t, (comm, ticks) in cur.items():
+            if t in prev and comm.startswith("corr-async-rx"):
+                rx.append((comm, (ticks - prev[t][1]) / hz / dt * 100.0))
+        if not rx:
+            return None
+        rx.sort(key=lambda r: -r[1])
+        return {
+            "warmup": False,
+            "pid": pid,
+            "count": len(rx),
+            "fastest": {"name": rx[0][0], "pct": rx[0][1]},
+            "slowest": {"name": rx[-1][0], "pct": rx[-1][1]},
+            "sum_pct": sum(r[1] for r in rx),
+            "squeeze_per_s": max(0.0, (squeeze - prev_sq) / dt),
+            "dt_s": dt,
+        }
 
     def _udp_backlog(self):
         """每个 UDP socket 的接收积压与丢弃。
@@ -212,6 +296,7 @@ class Collector(threading.Thread):
         d = lambda k: (cur["counters"].get(k, 0) - prev["counters"].get(k, 0))  # noqa: E731
         udp = self._udp_backlog() or {}
         self.udp_backlog_mb = (udp.get("backlog_bytes_max", 0) or 0) / 1e6
+        self.threads_now = self._sample_threads()
         self.nic_now = {
             "error": None,
             "dt_s": dt,
@@ -327,6 +412,7 @@ class Collector(threading.Thread):
             "history": history,
             "series": [{"key": k, "title": t, "unit": u, "max": m} for k, t, u, m in SERIES],
             "nic": self.nic_state(),
+            "threads": self.threads_now,
             "url": self.url,
         }
 
@@ -424,6 +510,8 @@ th:last-child, td:last-child { width:44%; }
       <div class="s" id="wqsub">–</div></div>
     <div class="card"><div class="k">网卡缓冲（RX ring）</div><div class="v" id="nicbuf">–</div>
       <div class="s" id="nicbufsub">–</div></div>
+    <div class="card"><div class="k">收包线程（诊断）</div><div class="v" id="threads">–</div>
+      <div class="s" id="threadsub">–</div></div>
     <div class="card"><div class="k">capacity</div><div class="v" id="verdict">–</div>
       <div class="s" id="limits">–</div></div>
     <div class="card"><div class="k">网卡层（ring 溢出）</div><div class="v" id="nic">–</div>
@@ -632,6 +720,38 @@ function bufferCard(nic) {
          + `调大需要 root：ethtool -G ${iface} rx ${max || 8192}` };
 }
 
+// 收包线程卡片：诊断用，不是预警。
+//
+// 健康运行时最慢的收包线程也只拿到 33%（它所在的核被网卡队列中断占了固定一份），最慢
+// 与最快能差 40 个百分点 —— 与故障时几乎一样，所以它区分不了好坏，别拿它当警报。它的
+// 用处是：积压开始涨的时候，在这里看是哪几个线程被饿。主值取 time_squeeze 的增量，那
+// 是"NAPI 一轮都没把队列收干净"的直接证据，健康运行时应为 0。
+function threadsCard(t) {
+  if (!t) return { v: "–", cls: "v", sub: "看不到收包进程（corr 未运行？）", title: "" };
+  if (t.warmup) return { v: "…", cls: "v", sub: "需要两次采样才能算 CPU", title: "" };
+
+  const sq = t.squeeze_per_s || 0;
+  const slow = t.slowest || {}, fast = t.fastest || {};
+  const sub = `rx ${t.count} 个 · 合计 ${(t.sum_pct / 100).toFixed(2)} 核`
+    + ` · 最慢 ${slow.name || "?"} ${(slow.pct || 0).toFixed(1)}%`
+    + ` · 最快 ${fast.name || "?"} ${(fast.pct || 0).toFixed(1)}%`
+    + `（差 ${((fast.pct || 0) - (slow.pct || 0)).toFixed(0)} 个百分点）`;
+
+  if (sq >= 100) {
+    return { v: `squeeze ${sq.toFixed(0)}/s`, cls: "v bad", sub,
+      title: "NAPI 一轮的预算用完了还没收干净队列，内核在硬扛，收包线程必然被饿。"
+           + "这是积压涨起来时最该先看的一条" };
+  }
+  if (sq > 0) {
+    return { v: `squeeze ${sq.toFixed(0)}/s`, cls: "v warn", sub,
+      title: "偶发 NAPI 预算不足。健康运行时应为 0；持续非零说明管中断的那些核在过载" };
+  }
+  return { v: "0/s", cls: "v ok", sub,
+    title: `收包线程 CPU 分布（诊断用）：最慢 ${(slow.pct || 0).toFixed(1)}%、`
+         + `最快 ${(fast.pct || 0).toFixed(1)}%。这个差距健康时也有 40 个百分点，`
+         + `所以它区分不了好坏 —— 积压才是那个信号，这里用来查原因` };
+}
+
 function render(s) {
   const snap = s.latest;
   const conn = document.getElementById("conn");
@@ -719,6 +839,13 @@ function render(s) {
   const nbs = document.getElementById("nicbufsub");
   nbv.textContent = bc.v; nbv.className = bc.cls; nbv.title = bc.title;
   nbs.textContent = bc.sub;
+
+  // 收包线程：诊断用（判据见 threadsCard）
+  const tc = threadsCard(s.threads);
+  const tv = document.getElementById("threads");
+  const tsub = document.getElementById("threadsub");
+  tv.textContent = tc.v; tv.className = tc.cls; tv.title = tc.title;
+  tsub.textContent = tc.sub;
 
   const v = document.getElementById("verdict");
   v.textContent = snap.capacity.bottleneck;
