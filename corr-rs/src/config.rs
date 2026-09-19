@@ -990,8 +990,21 @@ impl Config {
         // Only checked when it is set: waiting for ever is the historical
         // behaviour, and it stays available.
         if let Some(n) = self.integration.max_spread_slots {
+            // Zero is not "no cap": it pins the watermark to the fastest station,
+            // so a station one frame behind is never waited for at all. That is
+            // the watermark deleted rather than capped, and it would turn a
+            // healthy run's ordinary jitter into missing frames -- which is why
+            // it gets its own message instead of the headroom one below.
+            if n == 0 {
+                bail!(
+                    "integration.max_spread_slots=0 would pin the watermark to the fastest \
+                     station, so every station one frame behind would be recorded as missing \
+                     instead of being waited for: use at least 1 (a healthy run stays below \
+                     one slot), or `null` for no cap at all"
+                );
+            }
             let left = self.gpu.block_slots.saturating_sub(n);
-            if n == 0 || left < 2 {
+            if left < 2 {
                 bail!(
                     "integration.max_spread_slots={n} would leave {left} staging slot(s) of \
                      gpu.block_slots={}: the pipeline holds one and the receive side needs at \
@@ -1668,6 +1681,33 @@ mod tests {
         let mut c = base_config();
         c.gpu.block_slots = 1;
         assert!(c.validate().unwrap_err().to_string().contains("block_slots"));
+    }
+
+    #[test]
+    fn the_lag_cap_is_bounded_by_the_staging_ring() {
+        let mut c = base_config();
+
+        // No cap is the historical behaviour, and it stays available.
+        c.integration.max_spread_slots = None;
+        c.validate().expect("null must stay valid");
+
+        // Zero reads like "no cap" and means the opposite, so it is rejected
+        // with its own reason rather than the headroom one.
+        c.integration.max_spread_slots = Some(0);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("pin the watermark to the fastest station"),
+            "zero needs its own reason, not the headroom one: {err}"
+        );
+
+        let block_slots = c.gpu.block_slots;
+        assert!(block_slots >= 3, "base_config has {block_slots} staging slots");
+        c.integration.max_spread_slots = Some(block_slots - 2);
+        c.validate().expect("the largest cap that still leaves two slots");
+
+        c.integration.max_spread_slots = Some(block_slots - 1);
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("staging slot"), "unexpected error: {err}");
     }
 
     #[test]
