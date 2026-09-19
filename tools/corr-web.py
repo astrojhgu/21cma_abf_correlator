@@ -115,6 +115,10 @@ SERIES = [
     # 可写槽 = block_slots - spread - 1，所以这条曲线直接说明"等环为什么高"：贴近
     # 11 就是环被站间差占满。量程固定在环的槽数上，于是"离上限多近"是一眼可见的。
     ("spread", "站间进度差（环 11 槽）", "槽", 11.0),
+    # 积压是"读不过来"的先行指标，而且是**唯一**会提前几小时动的量：在它撞到 socket
+    # 缓冲上限（实测 granted 512 MiB，420 MB 时开始丢）之前，drops、零填充、等环、
+    # spread 全都是 0。量程自适应：正常贴近 0，故障时到几百 MB。
+    ("udp", "UDP 积压（最大 socket）", "MB", None),
 ]
 
 
@@ -134,6 +138,9 @@ class Collector(threading.Thread):
         self.nic_now = None
         self.lock = threading.Lock()
         self.samples = deque(maxlen=history)
+        # 与 samples 一一对应：nic 采样频率与 status 轮询不同，逐条记录才能对齐。
+        self.samples_udp = deque(maxlen=history)
+        self.udp_backlog_mb = 0.0
         self.latest = None
         self.error = None
         self.received_at = None
@@ -204,11 +211,13 @@ class Collector(threading.Thread):
         dt = max(cur["t"] - prev["t"], 1e-6)
         d = lambda k: (cur["counters"].get(k, 0) - prev["counters"].get(k, 0))  # noqa: E731
         udp = self._udp_backlog() or {}
+        self.udp_backlog_mb = (udp.get("backlog_bytes_max", 0) or 0) / 1e6
         self.nic_now = {
             "error": None,
             "dt_s": dt,
             "udp_sockets": udp.get("sockets", 0),
             "udp_backlog_bytes_max": udp.get("backlog_bytes_max", 0),
+            "udp_backlog_mb": (udp.get("backlog_bytes_max", 0) or 0) / 1e6,
             "udp_queued_sockets": udp.get("queued_sockets", 0),
             "udp_drops_total": udp.get("drops_total", 0),
             "udp_worst_port": udp.get("worst_port"),
@@ -244,6 +253,7 @@ class Collector(threading.Thread):
                     if snap.get("ready"):
                         self.latest = snap
                         self.samples.append(snap)
+                        self.samples_udp.append(self.udp_backlog_mb)
                     self.error = None
                     self.received_at = time.time()
                     self.count += 1
@@ -303,8 +313,9 @@ class Collector(threading.Thread):
                     "link": s["gpu"]["link_pct"],
                     "wait": s["recv"]["wait_pct"],
                     "spread": s["recv"]["spread_slots"],
+                    "udp": udp_mb,
                 }
-                for s in self.samples
+                for s, udp_mb in zip(self.samples, self.samples_udp)
             ]
         return {
             "connected": error is None and latest is not None,
