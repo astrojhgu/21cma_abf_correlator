@@ -355,14 +355,22 @@ pub struct CpuCfg {
     pub auto_layout: bool,
     /// Whether each receive thread is pinned to one core.
     ///
-    /// Pinning buys predictability -- a task stays on one core its whole life, which is
-    /// why it is the default -- and it also removes the only remedy the scheduler has.
-    /// Measured on this machine: `mlx5_compN`'s interrupt lands on `cpuN`, so every
-    /// receive thread shares its core with that station's queue interrupts, and rx16 sat
-    /// at 32% on cpu20 while cpu28 idled at 22%. A pinned thread cannot move; an
-    /// unpinned one can, and CFS will balance it against the softirq work. The cost is
-    /// migration and NUMA locality -- the staging buffer lives on one node.
-    #[serde(default = "default_true")]
+    /// Default **false**: the threads may migrate, and CFS balances them against the
+    /// softirq work. Pinning buys predictability -- a task stays on one core its whole
+    /// life -- and it also removes the only remedy the scheduler has. Measured on this
+    /// machine: `mlx5_compN`'s interrupt lands on `cpuN`, so every receive thread shares
+    /// its core with that station's queue interrupts, and rx16 sat at 32% on cpu20 while
+    /// cpu28 idled at 22%. A pinned thread cannot move away from that; an unpinned one
+    /// can.
+    ///
+    /// The cost is migration and NUMA locality -- every packet writes staging, and a
+    /// thread wandering over a dozen cores on an eight-node machine pays for remote
+    /// memory. A 30-minute run says that price is smaller than it first looked: steady
+    /// state was ~1 MB of backlog per socket and 0.29 slots of spread, against 0.45 MB /
+    /// 0.2 slots pinned. Note that the earlier 90-second A/B that made unpinned look 20x
+    /// worse measured only the *start-up transient*, where pinned is in fact cleaner
+    /// (0.004-0.007% of frames fabricated against zero). Set `true` to pin again.
+    #[serde(default)]
     pub pin_cores: bool,
 }
 
@@ -470,11 +478,6 @@ fn nic_irq_core_share(ifaces: &[String]) -> Vec<u64> {
         }
     }
     share
-}
-
-/// For `CpuCfg::pin_cores`: absent means the historical behaviour (pinned).
-fn default_true() -> bool {
-    true
 }
 
 /// The NUMA node an interface lives on, and that node's cores.
@@ -1315,10 +1318,14 @@ impl Config {
                 .iter()
                 .filter(|c| excluded.contains(c))
                 .collect();
-            if !clash.is_empty() {
+            // Only worth saying when the threads are actually pinned there: with
+            // `cpu.pin_cores: false` the list is informational and nothing is bound to
+            // those cores, so the warning would be noise on a config that is fine.
+            if !clash.is_empty() && self.cpu.pin_cores {
                 notes.push(format!(
-                    "WARNING: receive cores {clash:?} are on a NIC's NUMA node; that is the \
-                     layout measured to cost 7x more fabricated frames (HANDOFF 6.16)"
+                    "WARNING: receive cores {clash:?} are on a NIC's NUMA node and the threads \
+                     are pinned there; that is the layout measured to cost 7x more fabricated \
+                     frames (HANDOFF 6.16)"
                 ));
             }
             return Ok((explicit, notes));
@@ -1866,6 +1873,25 @@ mod tests {
         let mut c = base_config();
         c.gpu.block_slots = 1;
         assert!(c.validate().unwrap_err().to_string().contains("block_slots"));
+    }
+
+    #[test]
+    fn receive_threads_are_unpinned_unless_asked_otherwise() {
+        // The default matters: it decides whether a receive thread whose core is busy
+        // with that queue's interrupts can move away.
+        let c = base_config();
+        assert!(
+            !c.cpu.pin_cores,
+            "absent must mean unpinned: the threads are left free to migrate"
+        );
+
+        // Round trip instead of a textual edit: replacing every "cpu:" in the shipped
+        // YAML also hits "pipeline_cpu:" and destroys the document.
+        let mut wants_pin = base_config();
+        wants_pin.cpu.pin_cores = true;
+        let yaml = serde_yaml::to_string(&wants_pin).expect("a config serialises");
+        let parsed = Config::from_yaml_str(&yaml).expect("pin_cores: true must parse");
+        assert!(parsed.cpu.pin_cores, "asking for pinning still works");
     }
 
     #[test]

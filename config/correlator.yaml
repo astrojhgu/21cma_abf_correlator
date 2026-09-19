@@ -187,6 +187,10 @@ storage:
 # 具体哪种绑法更好留待 Phase 2 实测（改本文件即可，不必改代码）。
 cpu:
   # 第 i 个 enabled station 用 recv_cpus[i]；长度必须 >= enabled station 数。
+  # 不绑核：接收线程可以迁移，CFS 会把它们从被中断占住的核上挪开。这也是代码里的默认
+  # 值（`CpuCfg::pin_cores`），写在这里只是让默认配置自解释。此时下面的 recv_cpus 只是
+  # 信息性的 —— 没有线程真的被绑在上面；改回 true 即恢复绑定。
+  pin_cores: false
   recv_cpus: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
               16, 17, 18, 19, 20, 21, 22, 23]
   # 提交 H2D + kernel、维护水位线的线程。
