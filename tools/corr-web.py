@@ -112,6 +112,9 @@ SERIES = [
     ("cpu", "本进程 CPU", "核", None),
     ("link", "H2D 链路", "%", 120.0),
     ("wait", "收包侧等环", "%", 100.0),
+    # 可写槽 = block_slots - spread - 1，所以这条曲线直接说明"等环为什么高"：贴近
+    # 11 就是环被站间差占满。量程固定在环的槽数上，于是"离上限多近"是一眼可见的。
+    ("spread", "站间进度差（环 11 槽）", "槽", 11.0),
 ]
 
 
@@ -245,6 +248,7 @@ class Collector(threading.Thread):
                     "cores": s["host"]["cores_online"],
                     "link": s["gpu"]["link_pct"],
                     "wait": s["recv"]["wait_pct"],
+                    "spread": s["recv"]["spread_slots"],
                 }
                 for s in self.samples
             ]
@@ -376,8 +380,12 @@ function drawSeries(s, hist) {
   if (!line || hist.length === 0) return;
   const vals = hist.map(p => p[s.key]);
   const cur = vals[vals.length - 1];
-  last.textContent = `${fmt(cur)} ${s.unit}`;
-  let max = s.max !== null ? s.max : Math.max(...vals);
+  // 量程用**整个保留历史**，不是当前画出来的这一段：用窗口内最大值定标时，峰值一旦
+  // 滑出窗口曲线就自己重新缩放，纵轴于是永远读不出数（看到的现象）。同时把峰值写在
+  // 当前值旁边，这样"回落到多少"是能读的，而不是猜的。
+  const peak = Math.max(...vals);
+  last.textContent = `${fmt(cur)} ${s.unit} · 峰值 ${fmt(peak)}`;
+  let max = s.max !== null ? s.max : Math.max(peak, 1e-9);
   if (!(max > 0)) max = 1;
   const n = Math.max(hist.length - 1, 1);
   const pts = vals.map((v, i) => {
