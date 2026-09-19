@@ -1245,6 +1245,17 @@ impl Writer {
         self.dropped
     }
 
+    /// How many rows the queue can hold.
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth
+    }
+
+    /// The deepest the queue has been, in rows: how close this run has come to
+    /// dropping data.
+    pub fn max_queue_depth(&self) -> u64 {
+        self.max_outstanding
+    }
+
     /// Take an error the writer thread hit, if any.
     ///
     /// One row late at most: the thread records the first failure and stops, and

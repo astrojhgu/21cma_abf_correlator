@@ -226,13 +226,23 @@ impl<'a> Pipeline<'a> {
                         // The set tag is read live rather than captured once: the
                         // thread opens the next set at a day boundary, and a monitor
                         // showing the previous set's name is worse than none.
-                        let set_tag = self.writer.as_ref().map(|w| w.current_set_tag());
+                        // Everything the sampler needs to know about the writer,
+                        // read once: the set tag (a rollover changes it mid-run),
+                        // how full the queue is (the early warning) and how many rows
+                        // it has had to drop (the damage).
+                        let wstat = self.writer.as_ref().map(|w| crate::monitor::WriterStatus {
+                            set_tag: w.current_set_tag(),
+                            queued: w.queued(),
+                            queue_depth: w.queue_depth() as u64,
+                            max_queued: w.max_queue_depth(),
+                            dropped: w.dropped_rows(),
+                        });
                         m.tick(
                             &self.sched,
                             self.progress,
                             self.ring.as_ref(),
                             self.gpu.as_ref(),
-                            set_tag.as_deref(),
+                            wstat.as_ref(),
                             now,
                         );
                     }

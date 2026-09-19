@@ -330,6 +330,8 @@ polyline { fill:none; stroke:var(--accent); stroke-width:1.5; }
       <div class="s" id="slotfree">–</div></div>
     <div class="card"><div class="k">CPU / load</div><div class="v" id="cpu">–</div>
       <div class="s" id="load">–</div></div>
+    <div class="card"><div class="k">写盘队列</div><div class="v" id="wq">–</div>
+      <div class="s" id="wqsub">–</div></div>
     <div class="card"><div class="k">capacity</div><div class="v" id="verdict">–</div>
       <div class="s" id="limits">–</div></div>
     <div class="card"><div class="k">网卡层（硬件队列）</div><div class="v" id="nic">–</div>
@@ -463,11 +465,36 @@ function render(s) {
       + `软中断丢 ${nic.softnet_dropped_per_s.toFixed(0)}/s`;
   }
 
+  // 写盘队列：占用率是"丢之前"的先行指标，丢行数是已经发生的损害。丢一行 = 数据里一个
+  // 洞，而且它在**所有**文件里都不存在（blocks.csv 的 row_index 会在那里跳跃），所以这一格
+  // 一变红就是"这腿的数据有缺口"，而不是"有点慢"。
+  const w = snap.writer;
+  const wv = document.getElementById("wq");
+  const ws = document.getElementById("wqsub");
+  if (!w) {
+    wv.textContent = "–"; wv.className = "v";
+    ws.textContent = "本次运行没有 writer（dry run？）";
+  } else {
+    const dropping = (w.dropped_window || 0) > 0;
+    const hot = (w.queued_pct || 0) >= 75;
+    wv.textContent = dropping ? `丢 ${w.dropped_window} 行` : `${w.queued}/${w.queue_depth}`;
+    wv.className = "v " + (dropping ? "bad" : (hot ? "warn" : "ok"));
+    wv.title = dropping
+      ? "写盘队列满，本窗口的行被丢弃：这些行在本次运行的每个文件里都不存在"
+      : "队列占用是丢弃之前的先行指标；到 75% 以上就该留意写盘速度了";
+    ws.textContent = `占用 ${(w.queued_pct || 0).toFixed(0)}% · 峰值 ${w.max_queued}/${w.queue_depth}`
+      + ` · 累计丢 ${w.dropped_total} 行`
+      + (dropping ? `（本窗口占 ${(w.dropped_pct_window || 0).toFixed(0)}% 的行）` : "");
+  }
+
   const v = document.getElementById("verdict");
   v.textContent = snap.capacity.bottleneck;
+  // 丢行单独点出来：红。它和 socket 丢包不同 —— 那些包没了就是没了，而丢一行是**每个
+  // 文件都缺那一行**，事后补不回来。
   v.className = snap.capacity.bottleneck === "ok" ? "ok"
       : (snap.capacity.bottleneck === "gpu_link" || snap.capacity.bottleneck === "process_cpu")
-        ? "warn" : "bad";
+        ? "warn"
+        : (snap.capacity.bottleneck === "writer_drops" ? "bad" : "bad");
   v.title = snap.capacity.detail;
   const lim = snap.capacity.limits;
   document.getElementById("limits").textContent =

@@ -168,6 +168,10 @@ pub(crate) struct Snapshot {
     pub host: Host,
     pub capacity: Capacity,
     pub stations: Vec<Station>,
+    /// The writer, when this run has one (a dry run does not). Read this before
+    /// looking at `capacity`: a full queue is data being thrown away, and unlike
+    /// every other bottleneck here it cannot be recovered from.
+    pub writer: Option<WriterView>,
     /// What the process itself is using. Answers "can this run for weeks" from the
     /// outside: resident memory, threads and descriptors all have to stay flat.
     pub process: Process,
@@ -285,6 +289,44 @@ pub(crate) struct Station {
     pub silence_s: f64,
 }
 
+/// What the writer handle knows, as the sampler sees it.
+///
+/// Built by the pipeline at each tick: the only thing monitor.rs needs to know
+/// about the writer, and it is plain data.
+pub(crate) struct WriterStatus {
+    /// The set being written right now (`<file_prefix><stamp>`).
+    pub set_tag: String,
+    /// Rows handed over but not yet written: the queue's length at this instant.
+    pub queued: u64,
+    /// How many rows the queue holds.
+    pub queue_depth: u64,
+    /// The deepest it has been since the run started.
+    pub max_queued: u64,
+    /// Rows dropped because the queue was full, cumulative.
+    pub dropped: u64,
+}
+
+/// The writer, as a reader of the status endpoint sees it.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct WriterView {
+    pub set_tag: String,
+    pub queue_depth: u64,
+    /// Rows in flight right now.
+    pub queued: u64,
+    /// How full the queue is, in percent. **This is what to watch before rows start
+    /// being dropped**; `dropped_*` only reports it afterwards.
+    pub queued_pct: f64,
+    /// The deepest the queue has been.
+    pub max_queued: u64,
+    /// Rows dropped because the queue was full, since the run started.
+    pub dropped_total: u64,
+    /// ... and over the last interval: the severity right now.
+    pub dropped_window: u64,
+    /// Those drops as a percentage of the rows closed in the same interval, which is
+    /// the number that says whether this run's data is usable.
+    pub dropped_pct_window: f64,
+}
+
 /// The one place a run's live state is handed to an outside reader.
 ///
 /// A slot, not a channel: the reader polls, and only the latest sample is
@@ -342,6 +384,7 @@ struct Snap {
     slot_wait_ns: u64,
     ring_blocks: u64,
     socket_drops: u64,
+    dropped_rows: u64,
     h2d_bytes: u64,
     slot_free_ns: u64,
     cpu_ticks: u64,
@@ -360,6 +403,10 @@ struct Verdict {
 struct Derived {
     dt: f64,
     cur: Snap,
+    /// The writer, rendered here so that both the line and the snapshot read the
+    /// same numbers.
+    writer: Option<WriterView>,
+    d_dropped: u64,
     d_rows: u64,
     d_frames: u64,
     d_zf: u64,
@@ -454,6 +501,7 @@ impl Monitor {
         progress: &[Arc<StationProgress>],
         ring: &SlotRing,
         gpu: Option<&Correlator>,
+        dropped: u64,
         at: Instant,
     ) -> Snap {
         let rows = sched.stats().rows_closed;
@@ -489,6 +537,7 @@ impl Monitor {
             slot_wait_ns,
             ring_blocks: ring.block_events(),
             socket_drops: socket_drops(&self.ports),
+            dropped_rows: dropped,
             h2d_bytes,
             slot_free_ns,
             cpu_ticks: cpu_ticks(),
@@ -503,7 +552,7 @@ impl Monitor {
         progress: &[Arc<StationProgress>],
         ring: &SlotRing,
         gpu: Option<&Correlator>,
-        set_tag: Option<&str>,
+        writer: Option<&WriterStatus>,
         now: Instant,
     ) {
         let due = match self.prev {
@@ -513,7 +562,8 @@ impl Monitor {
         if !due {
             return;
         }
-        let cur = self.sample(sched, progress, ring, gpu, now);
+        let dropped = writer.map(|w| w.dropped).unwrap_or(0);
+        let cur = self.sample(sched, progress, ring, gpu, dropped, now);
         let previous = self.prev.replace(cur);
         // On the first tick there is nothing to subtract, so the sample is its own
         // baseline: every delta below comes out zero and `dt` is zero, which is
@@ -533,6 +583,7 @@ impl Monitor {
         let d_stalls = cur.stalls.saturating_sub(prev.stalls);
         let d_blocks = cur.ring_blocks.saturating_sub(prev.ring_blocks);
         let d_drops = cur.socket_drops.saturating_sub(prev.socket_drops);
+        let d_dropped = cur.dropped_rows.saturating_sub(prev.dropped_rows);
 
         // Receive side: station-seconds spent waiting for a slot, as a fraction of
         // the station-seconds that just elapsed. 0 = never refused, 1 = every
@@ -583,9 +634,32 @@ impl Monitor {
             .saturating_sub(sched.watermark()) as f64
             / self.frames_per_slot.max(1) as f64;
 
+        // The queue's occupancy is the early warning; `dropped_window` is what
+        // happened. Both come from the same handle, read once per tick.
+        let writer_view = writer.map(|w| WriterView {
+            set_tag: w.set_tag.clone(),
+            queue_depth: w.queue_depth,
+            queued: w.queued,
+            queued_pct: if w.queue_depth > 0 {
+                100.0 * w.queued as f64 / w.queue_depth as f64
+            } else {
+                0.0
+            },
+            max_queued: w.max_queued,
+            dropped_total: w.dropped,
+            dropped_window: d_dropped,
+            dropped_pct_window: if d_rows > 0 {
+                100.0 * d_dropped as f64 / d_rows as f64
+            } else {
+                0.0
+            },
+        });
+
         let d = Derived {
             dt,
             cur,
+            writer: writer_view,
+            d_dropped,
             d_rows,
             d_frames,
             d_zf,
@@ -607,7 +681,15 @@ impl Monitor {
             // The ring counts leases in and out, so its reading is signed; a
             // count published to a reader cannot be negative, so clamp.
             blocked_now: ring.blocked_now().max(0) as u64,
-            verdict: verdict(d_drops, wait_ratio, link_ratio, cpu_cores, cores, load),
+            verdict: verdict(
+                d_dropped,
+                d_drops,
+                wait_ratio,
+                link_ratio,
+                cpu_cores,
+                cores,
+                load,
+            ),
         };
 
         if self.print {
@@ -624,7 +706,7 @@ impl Monitor {
             }
         }
         if let Some(cell) = &self.cell {
-            cell.publish(self.snapshot(&d, sched, progress, set_tag));
+            cell.publish(self.snapshot(&d, sched, progress));
         }
     }
 
@@ -633,7 +715,7 @@ impl Monitor {
             "mon {rows}r {rate:+.2}r/s | zf {zf_total:.4}% (win {zf_window:.4}%) | lost +{d_lost} \
              | recv wait {wait_r:.0}% spread {spread:.1}sl blocked {blocked} blocks +{d_blocks} \
              stalled +{d_stalls} | cpu {cpu:.1}/{cores:.0}c load {load:.1} | h2d {h2d:.1}GB/s \
-             {link:.0}% slotfree {sfree:.0}% | sockdrop +{drops} | capacity: {verdict}",
+             {link:.0}% slotfree {sfree:.0}% | sockdrop +{drops} wdrop +{wdrops} | capacity: {verdict}",
             rows = d.cur.rows,
             rate = d.rate_rows,
             zf_total = d.zf_total,
@@ -651,6 +733,7 @@ impl Monitor {
             link = d.link_ratio * 100.0,
             sfree = d.slot_free_ratio * 100.0,
             drops = d.d_drops,
+            wdrops = d.d_dropped,
             verdict = d.verdict.detail,
         );
     }
@@ -663,7 +746,6 @@ impl Monitor {
         d: &Derived,
         sched: &RowScheduler,
         progress: &[Arc<StationProgress>],
-        set_tag: Option<&str>,
     ) -> Snapshot {
         let at_ns = now_ns();
         let stations = (0..self.n_station)
@@ -689,7 +771,11 @@ impl Monitor {
             run: RunInfo {
                 name: self.run_name.clone(),
                 output_dir: self.output_dir.clone(),
-                set_tag: set_tag.unwrap_or_default().to_string(),
+                set_tag: d
+                    .writer
+                    .as_ref()
+                    .map(|w| w.set_tag.clone())
+                    .unwrap_or_default(),
                 n_station: self.n_station,
                 n_baseline: self.n_baseline,
                 n_freq: self.n_freq,
@@ -746,6 +832,7 @@ impl Monitor {
                 },
             },
             process: process_stats(),
+            writer: d.writer.clone(),
             stations,
         }
     }
@@ -757,6 +844,7 @@ impl Monitor {
 /// `capacity` both come from here, so the log and a monitor page cannot disagree
 /// about what the wall is.
 fn verdict(
+    d_dropped: u64,
     d_drops: u64,
     wait_ratio: f64,
     link_ratio: f64,
@@ -764,7 +852,14 @@ fn verdict(
     cores: f64,
     load: f64,
 ) -> Verdict {
-    if d_drops > 0 {
+    if d_dropped > 0 {
+        // First, because it is the only one here that loses data outright and
+        // cannot be undone: the row is gone from every file of the set.
+        Verdict {
+            bottleneck: "writer_drops",
+            detail: format!("写盘队列满，已丢 {d_dropped} 行（数据缺口）"),
+        }
+    } else if d_drops > 0 {
         Verdict {
             bottleneck: "socket_drops",
             detail: format!("收包侧已溢出（socket 丢 {d_drops}）"),
@@ -873,22 +968,27 @@ pub(crate) mod tests {
     /// reported by its own token.
     #[test]
     fn the_verdict_names_the_first_resource_at_its_ceiling() {
-        let ok = verdict(0, 0.0, 0.0, 4.0, 32.0, 1.0);
+        let ok = verdict(0, 0, 0.0, 0.0, 4.0, 32.0, 1.0);
         assert_eq!(ok.bottleneck, "ok");
 
         // A drop is the wall even when the ring is also busy: it is the one that
         // has already lost data.
-        let dropped = verdict(3, 0.5, 1.5, 31.0, 32.0, 40.0);
+        let dropped = verdict(0, 3, 0.5, 1.5, 31.0, 32.0, 40.0);
         assert_eq!(dropped.bottleneck, "socket_drops");
 
-        assert_eq!(verdict(0, 0.5, 0.0, 1.0, 32.0, 1.0).bottleneck, "ring");
-        assert_eq!(verdict(0, 0.0, 0.96, 1.0, 32.0, 1.0).bottleneck, "gpu_link");
+        // A dropped row outranks a dropped packet: the packet is gone too, but the
+        // row is a hole in the data that nothing can fill in afterwards.
+        let wdrop = verdict(2, 9, 0.9, 1.5, 31.0, 32.0, 40.0);
+        assert_eq!(wdrop.bottleneck, "writer_drops");
+
+        assert_eq!(verdict(0, 0, 0.5, 0.0, 1.0, 32.0, 1.0).bottleneck, "ring");
+        assert_eq!(verdict(0, 0, 0.0, 0.96, 1.0, 32.0, 1.0).bottleneck, "gpu_link");
         assert_eq!(
-            verdict(0, 0.0, 0.0, 1.0, 32.0, 33.0).bottleneck,
+            verdict(0, 0, 0.0, 0.0, 1.0, 32.0, 33.0).bottleneck,
             "machine_load"
         );
         assert_eq!(
-            verdict(0, 0.0, 0.0, 28.0, 32.0, 1.0).bottleneck,
+            verdict(0, 0, 0.0, 0.0, 28.0, 32.0, 1.0).bottleneck,
             "process_cpu"
         );
     }
@@ -981,6 +1081,7 @@ pub(crate) mod tests {
                 fds: 1,
                 uptime_s: 0.0,
             },
+            writer: None,
             stations: vec![],
         }
     }

@@ -82,6 +82,8 @@ abort 整个进程 —— 所以 `status.rs` 里没有任何可达的 `unwrap`/`
 | | `spread_slots`、`blocked_now` | 站间进度差（槽）、此刻被环挡住的站数 |
 | `gpu` | `h2d_gbs`、`required_gbs`、`link_pct`、`slot_free_pct` | 链路实际/需求、pipeline 等槽释放的比例 |
 | `host` | `cpu_cores`、`cores_online`、`load1` | 本进程核数 / 在线核数 / 整机 load |
+| `writer` | `set_tag`、`queue_depth`、`queued`、`queued_pct` | 写盘队列：**`queued_pct` 是丢弃之前的先行指标**（到 75% 以上就该看写盘速度了） |
+| | `max_queued`、`dropped_total`、`dropped_window`、`dropped_pct_window` | 峰值占用，以及因队列满而**丢弃的行**（累计 / 本窗口 / 占本窗口行数的百分比）。丢一行 = 每个文件都缺那一行（`row_index` 跳跃），所以 `dropped_window > 0` 时 `capacity.bottleneck` 会先报 `writer_drops` |
 | `capacity` | `bottleneck` | `ok` / `socket_drops` / `ring` / `gpu_link` / `machine_load` / `process_cpu` |
 | | `detail`、`limits` | 与 stderr 那行**同一份**结论与门限（同一函数产出，不会两处打架） |
 | `stations[]` | `name`、`progress_frames`、`zero_filled_frames`、`lost_packets`、`slot_wait_ms`、`silence_s` | 每站明细：哪一路在丢、在等、在静默 |
