@@ -24,6 +24,11 @@
 #   MODE=sync tools/run-24-nf16384.sh        # 对照腿：线程后端
 #   WORKERS=12 tools/run-24-nf16384.sh       # 收包 worker 数（异步腿）
 #   NEW_SET=1 tools/run-24-nf16384.sh        # 今天已有套时另起一套，不续写
+#     —— 这一个不是可选项，是**前端换了纪元之后必须做的那一步**：当天那一套的帧号
+#     是旧纪元的，续写时起点会被钉在旧帧号上（1.0e10），而前端重启后的流在 4e7，
+#     于是每个包都落在"起点之前"被丢弃，运行表现为一直 0 行。2026-09-20 实测：
+#     g05 上裸调本脚本每次都卡在这里。相关机会明确打印 STOPPED（原因见 stop.rs 的
+#     StreamNotAdvancing），不会静默空转；看到它就 NEW_SET=1 另起一套。
 #   CHK_NIC=0 tools/run-24-nf16384.sh        # 跳过起跑前那 20 s 的网卡层静默检查
 #   DOCTOR=1 tools/run-24-nf16384.sh         # 起跑前先跑 tools/doctor.py（慢，但值得）
 #   TREND=1  tools/run-24-nf16384.sh         # 收尾再打一份逐行明细
@@ -131,10 +136,15 @@ if not have:
           .format(iface, iface))
     sys.exit(2)
 if want and want not in have:
-    print("配置里的 receiver.interface_ip = {} 不在 {} 的地址 {} 上；\n"
-          "  本机该用的地址是 {}。改配置，或 CFG=<本机的那一份>。"
-          .format(want, iface, have, have[0]))
-    sys.exit(2)
+    # A mismatch is a warning, not a refusal: measured on g05, a config naming
+    # another machine's address still received all 24 stations, because this
+    # machine's profile puts the group addresses on the interface itself. What
+    # does stop a run dead is an interface with no address at all (that was g04:
+    # rx_packets/s = 0), and that is the branch above.
+    print("注意：配置里的 receiver.interface_ip = {} 不在 {} 的地址 {} 上"
+          "（本机是 {}）。多数情况下仍能收全，因为组播组地址可能直接配在网卡上；"
+          "若收不到数据先改这里。".format(want, iface, have, have[0]))
+    sys.exit(0)
 print("配置与本机一致：{} = {}".format(iface, want or have[0]))
 CFGCHK
 ) || { echo "$CFGCHK_OUT" >&2; exit 2; }
