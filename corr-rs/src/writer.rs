@@ -65,6 +65,15 @@ use crate::config::{
     local_day_at, local_stamp_at, local_tz_name, local_utc_offset_s, Config, QueueFull, RunPlan,
 };
 
+/// Longest row still worth page-locking, in bytes.
+///
+/// Above this the row buffer is an ordinary allocation. The threshold is not
+/// derived, it is the boundary between the two geometries this program is
+/// actually run at: 4 stations at `n_freq = 16384` is a 1.31 MB row, where
+/// page-locking buys 1.35x on the fetch, and 24 stations is a 39 MB row, where
+/// page-locking costs a factor of 159 in lost frames (see `pin_rows`).
+const MAX_PINNED_ROW: usize = 4 << 20;
+
 /// Bytes in one row of one baseline's file.
 pub fn baseline_row_bytes(n_freq: u32) -> usize {
     n_freq as usize * 8 // complex64
@@ -1170,6 +1179,16 @@ impl Writer {
         };
 
         let row_bytes = state.row_bytes;
+        // Which side of the row-size gate this run landed on is worth being able
+        // to see without guessing, at the two geometries that matter.
+        if std::env::var("CORR_PIN_DEBUG").is_ok() {
+            eprintln!(
+                "writer: row_bytes={} rows_per_fetch={} -> pin_rows={}",
+                row_bytes,
+                plan.rows_per_fetch,
+                plan.rows_per_fetch == 1 && row_bytes <= MAX_PINNED_ROW
+            );
+        }
         let n_station = state.n_station;
         let prefix = state.prefix.clone();
         let live_tag = state.tag.clone();
@@ -1220,7 +1239,27 @@ impl Writer {
                 // One row per fetch is what makes the row buffer the fetch
                 // destination (`flush_rows`), and that is the only case where
                 // page-locking it changes anything.
-                pin_rows: plan.rows_per_fetch == 1,
+                // One row per fetch is what makes the row buffer the fetch
+                // destination (`flush_rows`), and that is one of the two
+                // conditions for page-locking it to be worth anything. The other
+                // is that the row has to be small: this path exists for
+                // sub-millisecond rows, where the fetch is most of the row period
+                // and the D2H is the whole cost.
+                //
+                // Measured, and the reason this is gated at all: at 24 stations
+                // with a one-second integration a row is 39 MB, and pinning it
+                // cost the receive side badly. Same configuration, 150 s each on
+                // this machine:
+                //
+                //                    lost frames   socket drops   receive cost
+                //   pageable (master)       31,155         11,293   19.3 s/station
+                //   page-locked          4,960,459      1,748,749   25.9 s/station
+                //
+                // -- a factor of 159 in lost frames, zero fill 0.005% -> 0.74%.
+                // Turning the same switch off in a 60 s run put it back at 12,011
+                // lost and 0.005% with nothing else changed. So short rows get
+                // the page-locked path and long ones stay as they always were.
+                pin_rows: plan.rows_per_fetch == 1 && row_bytes <= MAX_PINNED_ROW,
                 sent: 0,
                 rows_at_open,
                 max_outstanding: 0,
