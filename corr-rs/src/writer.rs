@@ -256,7 +256,15 @@ pub struct RowBlock {
 /// One row on its way to the writer thread.
 enum Job {
     Row {
-        buf: RowBuf,
+        /// The buffer this row lives in, shared with the other rows of its fetch
+        /// batch. The last row of a batch is the one that puts it back in the
+        /// pool -- see `run_writer_thread`.
+        buf: std::sync::Arc<RowBuf>,
+        /// Where this row starts inside `buf`, and how long it is. One row per
+        /// fetch makes these `0` and `row_bytes`; a batch of `rows_per_fetch`
+        /// rows shares one buffer and each row names its own slice.
+        offset: usize,
+        len: usize,
         row_ms: i64,
         blocks: RowBlock,
     },
@@ -893,17 +901,27 @@ fn run_writer_thread(
         match job {
             Job::Row {
                 buf,
+                offset,
+                len,
                 row_ms,
                 blocks,
             } => {
                 let t0 = std::time::Instant::now();
-                let r = state.write_one(&buf, row_ms, &blocks);
+                let r = state.write_one(&buf[offset..offset + len], row_ms, &blocks);
                 busy += t0.elapsed();
                 match r {
                     Ok(()) => {
                         written += 1;
                         rows.store(state.rows_total, Ordering::Release);
-                        let _ = free.send(buf);
+                        // The last slice of a batch is the one that owns the
+                        // buffer: every other row's clone is already gone by the
+                        // time it is written, because they are written in order
+                        // and the pipeline dropped its own handle when it queued
+                        // them. `try_unwrap` is how that is decided without a
+                        // counter of our own.
+                        if let Ok(owned) = std::sync::Arc::try_unwrap(buf) {
+                            let _ = free.send(owned);
+                        }
                     }
                     Err(e) => {
                         *first_error.lock().expect("not poisoned") = Some(e);
@@ -1377,27 +1395,54 @@ impl Writer {
         self.check_row(spectrum.len(), blocks)?;
         let mut buf = self.take_row_buffer(spectrum.len())?;
         buf.as_mut_slice().copy_from_slice(spectrum);
-        self.put_row(buf, row_ms, blocks)
+        let shared = std::sync::Arc::new(buf);
+        self.put_row(&shared, 0, spectrum.len(), row_ms, blocks)?;
+        self.return_buffer(shared);
+        Ok(())
     }
 
-    /// Queue a buffer that already holds exactly one row, without copying it.
+    /// Queue one row that already lives in `buf` at `offset`, without copying it.
     ///
-    /// The buffer becomes the writer's; the pool gives it back after the row is on
-    /// disk, so a run that keeps one row in flight allocates nothing per row.
-    pub fn write_row_owned(
+    /// This is the hand-over `flush_rows` uses. One fetch produces
+    /// `rows_per_fetch` rows contiguous in one buffer, so each row is a slice of
+    /// a shared buffer rather than a buffer of its own: the buffer goes back to
+    /// the pool when its last row is written, which for one row per fetch is
+    /// immediately and for a batch is after the batch.
+    pub fn write_row_slice(
         &mut self,
-        buf: RowBuf,
+        buf: &std::sync::Arc<RowBuf>,
+        offset: usize,
+        len: usize,
         row_ms: i64,
         blocks: &RowBlock,
     ) -> Result<()> {
-        self.check_row(buf.len(), blocks)?;
-        self.put_row(buf, row_ms, blocks)
+        self.check_row(len, blocks)?;
+        self.put_row(buf, offset, len, row_ms, blocks)
     }
 
-    fn put_row(&mut self, buf: RowBuf, row_ms: i64, blocks: &RowBlock) -> Result<()> {
+    /// Give a fetch buffer back to the pool. Used when a fetch returned no rows,
+    /// and by `write_row` for the one-row case.
+    pub fn return_buffer(&mut self, buf: std::sync::Arc<RowBuf>) {
+        if let Ok(owned) = std::sync::Arc::try_unwrap(buf) {
+            if self.pool.len() < self.pool_cap {
+                self.pool.push(owned);
+            }
+        }
+    }
+
+    fn put_row(
+        &mut self,
+        buf: &std::sync::Arc<RowBuf>,
+        offset: usize,
+        len: usize,
+        row_ms: i64,
+        blocks: &RowBlock,
+    ) -> Result<()> {
         let row_index = blocks.row_index;
         let job = Job::Row {
-            buf,
+            buf: std::sync::Arc::clone(buf),
+            offset,
+            len,
             row_ms,
             blocks: blocks.clone(),
         };
@@ -1414,12 +1459,10 @@ impl Writer {
                     self.note_queued();
                 }
                 Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                    // Give the buffer back for the next row to reuse: the row is the
-                    // loss, the allocation is not.
+                    // Give the buffer back for the next fetch to reuse when this was
+                    // its last row: the row is the loss, the allocation is not.
                     if let Job::Row { buf, .. } = job {
-                        if self.pool.len() < self.pool_cap {
-                            self.pool.push(buf);
-                        }
+                        self.return_buffer(buf);
                     }
                     self.note_dropped(row_index);
                     return self.take_error();
@@ -2112,7 +2155,9 @@ mod tests {
         // the channel does not look disconnected.
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         tx.send(Job::Row {
-            buf: RowBuf::new(row_bytes, false).expect("row buffer"),
+            buf: std::sync::Arc::new(RowBuf::new(row_bytes, false).expect("row buffer")),
+            offset: 0,
+            len: row_bytes,
             row_ms: 0,
             blocks: blocks_for(&plan, 0, plan.n_cum as u64),
         })

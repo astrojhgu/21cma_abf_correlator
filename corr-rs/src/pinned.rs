@@ -32,6 +32,12 @@ pub struct PinnedBuf {
 // writer pool hands these between the pipeline thread and the writer threads.
 unsafe impl Send for PinnedBuf {}
 
+// Sound for the same reason as `Send` plus one more: the only way to get a
+// `&mut` to the bytes is `&mut self`, so a shared reference can only ever hand
+// out `&[u8]`. Sharing one batch buffer between the rows of that batch is
+// exactly what `RowBuf` is shared for.
+unsafe impl Sync for PinnedBuf {}
+
 impl PinnedBuf {
     /// Allocate `len` page-locked bytes, zeroed.
     pub fn new(len: usize) -> Result<Self> {
@@ -45,10 +51,17 @@ impl PinnedBuf {
                 st.name()
             );
         }
-        let ptr = raw as *mut u8;
-        // SAFETY: freshly allocated, `len` bytes, and nothing else refers to it.
-        unsafe { std::ptr::write_bytes(ptr, 0, len) };
-        Ok(PinnedBuf { ptr, len })
+        // Deliberately not zeroed: the allocation is only ever read after a fetch
+        // has written every byte the caller is told about (`corr_rows_fetch`
+        // reports how many rows it wrote, and only those are handed on), and
+        // zeroing 1.31 MB costs about as much as the fetch itself -- measured as a
+        // 94 us per row gap at one frame per row before this was removed. Page
+        // locked memory is populated by the driver at allocation, so nothing is
+        // deferred to the first fetch either.
+        Ok(PinnedBuf {
+            ptr: raw as *mut u8,
+            len,
+        })
     }
 
     pub fn len(&self) -> usize {

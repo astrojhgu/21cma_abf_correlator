@@ -263,7 +263,7 @@ impl RunReport {
         );
         let _ = writeln!(
             s,
-            "  row path       : autospec {:.1} s, write_row {:.1} s, rest of flush_rows {:.1} s \
+            "  row path       : autospec {:.1} s, write_row {:.1} s, fetch+wait+pool {:.1} s \
              (row_end {:.1} s, rows_pending {:.1} s)",
             self.flush_ns[0] as f64 / 1e9,
             self.flush_ns[1] as f64 / 1e9,

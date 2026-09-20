@@ -702,21 +702,29 @@ pub(crate) fn flush_rows(
     timing: &mut [u64; 3],
 ) -> Result<u32> {
     let flush_t0 = std::time::Instant::now();
+    // The per-call share of the two counters below, so the residual is this call's
+    // and not the run's.
+    let (ap0, wr0) = (timing[0], timing[1]);
     corr.rows_wait().context("waiting for the rows")?;
     let need = corr.fetch_bytes()?;
     let row_bytes = corr.row_bytes()?;
-    // One row per fetch is the configuration short rows need, so it is worth not
-    // copying: fetch straight into the buffer the writer will write, and hand it
-    // over. A batch of several rows arrives contiguous in one buffer, so those
-    // still get split out; at rows_per_fetch > 1 that copy is a fraction of the
-    // fetch it rides on, and at rows_per_fetch == 1 it would be the whole cost.
-    let mut owned = match writer.as_deref_mut() {
-        Some(w) if need == row_bytes => Some(w.take_row_buffer(need)?),
-        _ => None,
+    // Fetch straight into a buffer the writer will write, and hand the rows over
+    // as slices of it. A batch is contiguous in one buffer (`rows_per_fetch` rows
+    // of `row_bytes`), so this works for one row per fetch and for a batch alike:
+    // no copy either way, and the buffer returns to the pool when its last row is
+    // written. The copy it replaces is not small -- one row of 24 stations at
+    // n_freq = 16384 is 39 MB, which at a 40.96 us row is 960 GB/s of memcpy.
+    let mut shared = match writer.as_deref_mut() {
+        Some(w) => Some(std::sync::Arc::new(w.take_row_buffer(need)?)),
+        None => None,
     };
     let rows = {
-        match owned.as_mut() {
-            Some(o) => corr.rows_fetch(&mut o.as_mut_slice()[..need])? as usize,
+        match shared.as_mut() {
+            Some(a) => {
+                let b = std::sync::Arc::get_mut(a)
+                    .expect("nothing else holds the buffer before the rows are queued");
+                corr.rows_fetch(&mut b.as_mut_slice()[..need])? as usize
+            }
             None => {
                 if buf.len() < need {
                     buf.resize(need, 0);
@@ -726,6 +734,9 @@ pub(crate) fn flush_rows(
         }
     };
     if rows == 0 {
+        if let (Some(w), Some(a)) = (writer.as_deref_mut(), shared.take()) {
+            w.return_buffer(a);
+        }
         return Ok(0);
     }
 
@@ -762,7 +773,7 @@ pub(crate) fn flush_rows(
         // baselines, so there is nothing to gain by storing them twice.
         if let Some(cell) = autospec {
             let t = std::time::Instant::now();
-            let spectrum = match owned.as_deref() {
+            let spectrum = match shared.as_deref() {
                 Some(o) => &o[off..off + row_bytes],
                 None => &buf[off..off + row_bytes],
             };
@@ -780,21 +791,18 @@ pub(crate) fn flush_rows(
             valid_frames_per_station: valid,
         };
         let t = std::time::Instant::now();
-        if rows == 1 && owned.is_some() {
-            // The row was fetched into the writer's own buffer, so this is a move.
-            let w = writer
-                .as_deref_mut()
-                .expect("a borrowed buffer implies a writer");
-            let o = owned.take().expect("checked just above");
-            w.write_row_owned(o, open_ms, &block)
-                .with_context(|| format!("writing row {row_index}"))?;
-        } else if let Some(w) = writer.as_deref_mut() {
-            let spectrum = match owned.as_deref() {
-                Some(o) => &o[off..off + row_bytes],
-                None => &buf[off..off + row_bytes],
-            };
-            w.write_row(spectrum, open_ms, &block)
-                .with_context(|| format!("writing row {row_index}"))?;
+        match (writer.as_deref_mut(), shared.as_ref()) {
+            // The row is already where the writer wants it: a slice of the fetch
+            // buffer, handed over by reference-count, not by copy.
+            (Some(w), Some(a)) => {
+                w.write_row_slice(a, off, row_bytes, open_ms, &block)
+                    .with_context(|| format!("writing row {row_index}"))?;
+            }
+            (Some(w), None) => {
+                w.write_row(&buf[off..off + row_bytes], open_ms, &block)
+                    .with_context(|| format!("writing row {row_index}"))?;
+            }
+            (None, _) => {}
         }
         timing[1] += t.elapsed().as_nanos() as u64;
     }
@@ -805,8 +813,16 @@ pub(crate) fn flush_rows(
         let _ = i;
     }
     pending_meta.drain(0..rows.min(pending_meta.len()));
-    let accounted = timing[0] + timing[1];
-    timing[2] += (flush_t0.elapsed().as_nanos() as u64).saturating_sub(accounted);
+    // Hand the fetch buffer back. `try_unwrap` decides who recycles it: whoever
+    // holds the last reference, which is this call if the writer has already
+    // written the last row and the last row if it has not. Without this the
+    // pipeline's own handle keeps the buffer alive, the pool never sees it again,
+    // and every row allocates and frees page-locked memory -- 94 us per row.
+    if let (Some(w), Some(a)) = (writer.as_deref_mut(), shared.take()) {
+        w.return_buffer(a);
+    }
+    let this_call = (timing[0] - ap0) + (timing[1] - wr0);
+    timing[2] += (flush_t0.elapsed().as_nanos() as u64).saturating_sub(this_call);
     Ok(rows as u32)
 }
 
