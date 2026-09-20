@@ -34,7 +34,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CFG=${CFG:-config/correlator-24-nf16384-manual.yaml}
+# 配置：优先用与本机同名的那一份（config/correlator-24-nf16384-<hostname>.yaml），
+# 没有才退回通用版。这台机器上有多份的场合，配置里机器相关的字段（interface_ip、
+# avoid_nic_interfaces、run.name）在通用版里必然只对某一台机器正确 —— 见 g05 那份的
+# 头部注释。显式 CFG=... 仍然优先。
+HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+if [ -n "$HOST" ] && [ -f "config/correlator-24-nf16384-${HOST}.yaml" ]; then
+  CFG=${CFG:-config/correlator-24-nf16384-${HOST}.yaml}
+else
+  CFG=${CFG:-config/correlator-24-nf16384-manual.yaml}
+fi
 MODE=${MODE:-async}                 # async | sync
 # 秒；**0（默认）= 不加 --duration，一直跑到 Ctrl-C**。默认不设上限是因为这条命令
 # 就是"把相关机跑起来"：观察、看实时曲线、等一个事件，都由人来决定什么时候停。要固定
@@ -94,6 +103,43 @@ if [ "$DRY" = "1" ]; then
 fi
 
 # --- 1. 前置检查 ---------------------------------------------------------
+# 配置里的 receiver.interface_ip 是 IP_ADD_MEMBERSHIP 的 imr_address，必须是本机该
+# 网卡上的地址。写错不会"少收几路"，而是一路都收不到（g05 上实测：地址没配好时
+# ens2f0np0 的 rx 速率是 0，跑起来只会看到 0 行）。这里当场核对，别等到事后看报告。
+CFGCHK_OUT=$(python3 - "$CFG" <<'CFGCHK'
+import subprocess, sys
+try:
+    import yaml
+    recv = yaml.safe_load(open(sys.argv[1]))["receiver"]
+except Exception as e:
+    print("读不出配置的 receiver 段（{}）：{}".format(sys.argv[1], e))
+    sys.exit(2)
+iface = recv.get("interface") or ""
+want = recv.get("interface_ip") or ""
+if not iface:
+    print("配置里没有 receiver.interface")
+    sys.exit(2)
+try:
+    out = subprocess.run(["ip", "-4", "-o", "addr", "show", iface],
+                         capture_output=True, text=True).stdout
+except FileNotFoundError:
+    print("没有 ip 命令，跳过一致/性检查")
+    sys.exit(0)
+have = [ln.split()[3].split("/")[0] for ln in out.splitlines() if len(ln.split()) > 3]
+if not have:
+    print("网卡 {} 上没有 IPv4 地址：先把本机网络配好（例如 nmcli connection up {}）"
+          .format(iface, iface))
+    sys.exit(2)
+if want and want not in have:
+    print("配置里的 receiver.interface_ip = {} 不在 {} 的地址 {} 上；\n"
+          "  本机该用的地址是 {}。改配置，或 CFG=<本机的那一份>。"
+          .format(want, iface, have, have[0]))
+    sys.exit(2)
+print("配置与本机一致：{} = {}".format(iface, want or have[0]))
+CFGCHK
+) || { echo "$CFGCHK_OUT" >&2; exit 2; }
+echo "cfgchk  : $CFGCHK_OUT"
+
 for other in corr corr-async; do
   if pgrep -x "$other" >/dev/null; then
     echo "已有 $other 在运行；先等它结束（两个接收端并存时的补零率没有意义）" >&2

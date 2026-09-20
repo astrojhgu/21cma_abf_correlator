@@ -1,0 +1,367 @@
+# 实时相关机运行配置 —— 24 路 × nch=16384 × 1 s 积分，**g05 专用**
+#
+# 这份与 config/correlator-24-nf16384-manual.yaml 只差三处，都是机器相关的：
+#
+#   1. receiver.interface_ip: 172.23.0.51
+#      本机 ens2f0np0 的地址（g01 是 172.23.0.11、g04 是 172.23.0.41）。
+#      它同时是 IP_ADD_MEMBERSHIP 的 imr_address，写错就 join 不上 —— 不是"少收几路"，
+#      而是一路都收不到（g05 上实测：地址没配好时 ens2f0np0 的 rx 速率是 0）。
+#      tools/run-24-nf16384.sh 起跑前会核对它，不符直接以退出码 2 停下。
+#
+#   2. cpu.avoid_nic_interfaces: []（手动版是 [ens2f0np0]）
+#      那条规则的语义是"把网卡所在 NUMA 节点整个从收包池里剔除"。它成立的前提是
+#      该节点核很少：g01 的网卡在 node0 而 node0 只有 4 个核（剔掉正好留给 ksoftirqd），
+#      但本机（和 g04）是 2 NUMA × 16 核，网卡同样在 node0 —— 剔掉整节点只剩 16 核，
+#      而这一档需要 28 核（24 收包 + 2 writer + pipeline + monitor），
+#      auto_layout 会直接拒绝编译。
+#      本机改为不剔除任何节点，交给 auto_layout 按"NIC 中断最少的核优先"排序：
+#      本机 mlx5 有 165 个中断向量、散在多核上，这个排序比整节点剔除更有针对性。
+#
+#   3. run.name: corr-g05（手动版是 corr）
+#      输出目录 = <output_dir>/<run.name> = /scratch/jhgu/corr-g05/。
+#      刻意与 g01 的 /scratch/jhgu/corr/ 分开：daily_files 的语义是"同一个本地日
+#      续写同一套"，两台机器写同一个目录会互相续写同一组文件。
+#      要让它与 g01 共用一套，把 run.name 改回 corr 即可（并确认不会同时跑）。
+#
+# 硬件环境（2026-09-20 实测）：4× L20（ECC 全 0）、32 核 / 2 NUMA 节点、
+# ens2f0np0 200GbE、net.core.rmem_max=2 GiB（每站实得 SO_RCVBUF 512 MiB）、
+# 空载。生产几何实测：1.00 行/s、24 站 gaps=0 lost=0 zero_filled=0、H2D 每卡 100%。
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# 运行目录
+# ---------------------------------------------------------------------------
+run:
+  # 写死，不再是 null（null 会生成 corr_YYYYmmdd_HHMMSS 子目录）。
+  name: corr-g05
+  # 实际输出目录是 <output_dir>/<run_name>/，所以这两行合起来 = /scratch/jhgu/corr/，
+  # 数据直接落进去，不再套一层运行目录。
+  # 实测本机写入吞吐（4 并行流合计）：/scratch 1767 MB/s、/data 1422 MB/s、
+  # /home 1387 MB/s、/data1(idfs) 472 MB/s。
+  # 需求：15 路 N_freq=4096 n_cum=1000 → 384 MB/s；24 路 → 960 MB/s。
+  # 因此默认选 /scratch；/data1 容量最大但单流仅 83 MB/s，不选。
+  output_dir: /scratch/jhgu
+  # 只收包、走完拼帧与水位线，但不提交 GPU、不落盘。用于诊断与压测。
+  dry_run: false
+
+# ---------------------------------------------------------------------------
+# 前端
+# ---------------------------------------------------------------------------
+# HANDOFF 4.1：int8 按有符号二进制补码直接转 float32，data_shift_count 不参与
+# 相关机的 FFT 计算，只作为前端量化/动态范围元数据写进 metadata，
+# 供下游把计数换算回电压。实测抽样值集中在 -4..+4，与 shift=5 相符。
+frontend:
+  data_shift_count: 5
+  sample_dtype: int8
+  sample_format: twos_complement
+
+# ---------------------------------------------------------------------------
+# 收包
+# ---------------------------------------------------------------------------
+receiver:
+  # 网卡与本地接口地址（IP_ADD_MEMBERSHIP 的 imr_address）。
+  interface: ens2f0np0
+  interface_ip: 172.23.0.51
+  # net.core.rmem_max = 2147483647，无需 root 即可开到 256 MiB。
+  # 每站内核接收缓冲。它与 ring 的领先量是**同一个设计参数**的两半：
+  # 汇编器只能领先 pipeline "可写槽数"这么远，所以 socket 里能积压的量一旦超过
+  # 领先量，积压就再也排不空（只能涨），此后每次被抢占都直接丢包。
+  # 实测：512 MiB（640 ms）配 63 ms 领先 → 30 min 补零 1.9568%（load 24–27）；
+  #       64 MiB 配 105 ms 领先 → 同负载区间 1800 s 补零 0.3534%（改善 5.5×，但三段 1.7/2.6/3.1M 仍在涨）。
+  # 现在取 32 MiB（实得 ~64 MiB ≈ 80 ms）配 105 ms 领先（见 block_slots/ring_lead）。
+  #
+  # **nch=16384 上这条不适用，改成 256 MiB**（实得 512 MiB ≈ 640 ms）。实测：
+  # 同一个 nch=16384 配置、同一台机器、同样 300 s，只把这一项从 32 MiB 改成
+  # 256 MiB 之前，每站丢 25.1 万个包（0.43%），补零率 0.4269%；而 nch=4096 的
+  # 生产档（256 MiB）在同一天同负载区间只丢 5380 个包（0.0092%），补零 0.0105%。
+  # 47× 的差别全在收包侧：nch=16384 的槽是 4 倍大（201 MB/槽，单卡拷完要 42 ms），
+  # 管线落后一个槽就是 42 ms，socket 里能积压的 84 ms 一撞就满，此后每次抢占直接
+  # 丢包。80 ms 这条经验值来自 nch=4096 的旧代码（那时补零还在收包线程里，大缓冲
+  # 会让积压排不空）；现在补零上了设备、progress 一次越过缺口，收包线程不再长时间
+  # 离岗，大缓冲就只是余量。
+  recv_buffer_bytes: 268435456
+  # SO_BUSY_POLL，单位微秒。内核 sysctl net.core.busy_poll 默认为 0，
+  # 但 per-socket 设置不受其限制。
+  busy_poll_us: 50
+  # recvmmsg 每次最多取多少个包。
+  recvmmsg_batch: 32
+  # SO_RCVTIMEO。故意设短：空轮询是收包线程注意到"该处理别的事了"的方式，
+  # 例如调度器要求它为停发的 station 补零。
+  recv_timeout_ms: 5
+  # 实测日志：4 路各独占一核、SO_RCVBUF=64MiB 时，120 s 内
+  # counter gaps = 0、lost = 0、reorder = 0。
+  # 帧对齐无需估计站间 offset：counter 是三块板共享的全局包计数。
+
+# ---------------------------------------------------------------------------
+# FFT
+# ---------------------------------------------------------------------------
+fft:
+  # 频点数。约束：n_freq 必须是 2048 的整数倍（每包 4096 个样本，
+  # 一帧 2*n_freq 个样本 → 每帧包数 P = n_freq / 2048）。
+  #   n_freq = 2048 -> P = 1 包/帧
+  #   n_freq = 4096 -> P = 2 包/帧
+  #   n_freq = 8192 -> P = 4 包/帧
+  #   n_freq = 16384 -> P = 8 包/帧
+  #
+  # nch=16384：一帧 2*n_freq = 32768 字节 = 8 个包，帧率 800e6/(2*16384) =
+  # 24414.0625 Hz。频点数变了不改变链路上的字节率（前端仍是 195 kpps×4096 B），
+  # 所以每卡 H2D 需求仍是 4.8 GB/s —— 但**丢失的粒度变粗了**：丢掉一个包
+  # （4096 个样本 = 一帧的 1/8）就让整帧作废，同一份链路质量下按帧计的补零率
+  # 会比 nch=4096 高一截，这是选 nch 的实际代价，也是这个档案存在的理由。
+  n_freq: 16384
+  # 有效采样率，用整数 Hz 表示（避免浮点解析与比较的歧义：
+  # YAML 1.1 下 800.0e6 会被当成字符串，8.0e+8 才能解析为浮点）。
+  # 实测标定：counter 前进速率 195,304.3 pps × 4096 样本/包 = 799.97 MHz，
+  # 与 800 MHz 一致（对应 RFSoC 4 GSPS ADC ÷ 5）。
+  # bin_width = sample_rate_hz / (2 * n_freq)；n_freq=16384 时为 24414.0625 Hz。
+  sample_rate_hz: 800000000
+  # HANDOFF 4.2：R2C 输出 n_freq+1 个非负频点，丢弃 Nyquist，
+  # 保留 bin 0(DC) .. n_freq-1，不做 fftshift，不做 1/N 归一化。
+  # 这两项是算法契约，改这里等于改产物定义，故不做成可选项。
+  window: rectangular
+
+# ---------------------------------------------------------------------------
+# 积分
+# ---------------------------------------------------------------------------
+integration:
+  # 每个积分行（输出行）的 FFT 帧数。HANDOFF 4.4：N_cum 是帧数，不是包数。
+  # 帧率 = sample_rate_hz / (2 * n_freq) = 97,656.25 帧/s。
+  #
+  # 注意 1 秒永远不是整数个帧：帧率 = 800e6/(2*n_freq)，对 n_freq = 2048 /
+  # 4096 / 8192 分别是 195312.5 / 97656.25 / 48828.125，分母恒为 2 的幂，
+  # 除不尽。最接近的是 97656 帧 = 0.99999744 s。
+  #
+  # 但 n_cum 还必须是 gpu.frames_per_slot 的整数倍，理由见下面那条校验说明。
+  # 256 × 382 = 97792 帧 = 1.001390 s，与 1 s 差 0.14%，取它。
+  #
+  # 这个值只决定积分长度，不再决定 pinned staging 的大小——staging 由
+  # gpu.frames_per_slot 决定，所以把积分从 10 ms 改成 10 s 不会多占一个字节。
+  # nch=16384 时帧率再减半（800e6/(2*16384)=24414.0625 Hz），1 s = 24414.0625 帧，
+  # 取 frames_per_slot=256 的上整 96*256 = 24576 帧 = 1.006635 s（与 nch=4096 的
+  # 1.001390 s / nch=8192 的 1.001390 s 同源：分母恒为 2 的幂，1 s 除不尽，只能取
+  # 最接近的整槽数）。5 分钟 = 298 行。
+  n_cum: 24576
+  # 水位线脱困超时。水位线 = min(各站已到达的最大 frame_id)。
+  # 某站超过该毫秒数无新帧，则不再阻塞水位线，其缺失帧按补零处理。
+  block_timeout_ms: 200
+  # 补零上限：某个 station 累计被要求补零的帧数超过此值就干净停止。
+  # 补零能让运行跨过短暂中断，但超过某个程度之后写出去的就是一行行静默、
+  # 却看起来像观测数据的东西，同时收包侧缓冲会一直涨着去装没人要的数据。
+  # 0 表示不设上限（只适合短测试）。
+  # 这个数是**每站累计**的补零帧数，所以别按"几秒"估：一站的帧率是 24414 Hz，
+  # 5e7 帧 = 24414 × 2048 s ≈ **34 分钟**的单站静默（24 站合计约合 85 行）。
+  # 旧的注释写"给 5 秒"，与这个阈值差了三个数量级，会让人以为容忍度很小。
+  # 实测算术：2026-09-18 那腿跑到 S09 站累计 50000136 帧时干净停止（补零率已 100%，
+  # 停在这里是对的），其余各站当时是 3500~4000 万帧。
+  zero_fill_limit_frames: 50000000
+  # 水位线允许落后最慢的站多少（单位：staging 槽）。
+  #
+  # 水位线 = 各站 progress 的最小值，而每站的前进速率都等于帧率 —— 于是站间**差值永不
+  # 缩小**，是个棘轮：掉队的站会把水位线一直拖住，环的可写槽被吃光，接收侧被拒绝、socket
+  # 溢出，而**只有重启进程才能复位**（实测 2026-09-19：一次丢包突发把站间差从 0.1 槽推到
+  # 11 槽里的 8~10 槽，此后那一腿再没自己恢复）。
+  #
+  # 设为 N 之后，落后超过 N 槽的站不再被等待：它在等的那些帧按缺失处理（与
+  # block_timeout_ms 同一条路径，同样逐行记进 blocks.csv），水位线继续前进。代价是那一站
+  # 的补零变多 —— 换整条环对所有人重新可用。留出 pipeline 一个槽 + 接收侧至少一个槽，
+  # 所以最大 9（block_slots=11 时）；null = 旧行为（永远等）。
+  max_spread_slots: 4
+  # 水位线被抬升（= 已经在放弃某个站）持续这么久就停下。比 zero_fill_limit_frames 早
+  # 得多：lift 一出现就意味着那些帧正在被记 missing，而且这个状态不可逆 —— 所有站以
+  # 相同帧率前进，差距是守恒的，只有重启能复位。健康运行时 lift 恒为 0（实测 8 次
+  # 抬升/回落只出现在过敏 cap=1 的测试里）。null = 不启用。
+  stop_after_lift_seconds: 30
+  # 块 0 的起始 frame_id。为空时自动对齐到"所有站都已越过的第一个
+  # frame_id 为 n_cum 整数倍的全局网格点"；显式指定时必须是 n_cum 的倍数。
+  start_frame_id: null
+
+# ---------------------------------------------------------------------------
+# GPU
+# ---------------------------------------------------------------------------
+# 单卡实测（1 秒积分、chunk=256）：4 路 18.8%、15 路 45.8%、24 路 87.4%。
+# 也就是说 24 路单卡装得下，不需要多卡——单卡的天花板在 26~28 路附近。
+# 前提是拷贝与计算重叠（下面注释里说明），串行做同样的事会是 157%。
+gpu:
+  # 参与计算的 GPU。24 路仍可只用 [0]；留多卡接口备用。
+  devices: [0, 1, 2, 3]
+  split: time_slice
+
+  # 一个 staging slot 每 station 放多少帧。它与 block_slots 一起决定 pinned
+  # 内存：n_station × frames_per_slot × 2×n_freq × block_slots。
+  # 实测该值在 256~4096 之间对吞吐没有影响（拷贝走的是 2D 描述符，与分块无关），
+  # 所以取小一点省 pinned 内存：24 路时 256×24×8192×3 = 151 MiB。
+  frames_per_slot: 256
+
+  # 设备侧每次 FFT + 相关 launch 处理的帧数。实测 24 路：
+  #   chunk=64 → 73.3%，chunk=128 → 86.1%，chunk=256 → 87.3%，chunk=512 → 87.6%
+  # 取 256 即接近平台，再大只增加显存。
+  #
+  # 注意：必须 <= frames_per_slot。
+  chunk_frames: 256
+
+  # staging 环的槽数。GPU 还在读某个 slot 时，收包线程可以继续写下一个 slot。
+  #
+  # 这个值不是"够用就行"，它决定接收侧的**领先量**：pipeline 只持有 1 个槽，
+  # 其余全是接收侧可以提前写的槽。实测 24 路（slots=3、in-flight=2 → 只剩 1 个
+  # 可写槽）时，每站 16 s 只收到 1.68M/3.12M 个包、每行 41% 的帧要靠补零；把
+  # 领先量放到 7 个槽后，收到全部 3.12M 个包、丢 76 个，而 host→device 吞吐没有
+  # 下降（18.8 vs 18.4 GB/s 聚合：单卡一条拷贝流已经吃满链路）。
+  #
+  # 槽数按**领先时间**定，不按槽数定：一个槽的时间 = frames_per_slot / 帧率，
+  # nch=16384 时 256/24414.0625 = 10.49 ms，所以 105 ms 领先 = 10 个可写槽
+  # → block_slots = 11（pipeline 持有 1 个）。同一份领先在 nch=4096 要 40 个槽、
+  # 在 nch=8192 要 20 个 —— 直接抄 24 会把 pinned 内存翻倍还不解决问题。
+  #
+  # 内存代价 = n_station × frames_per_slot × 2×n_freq × block_slots：
+  # 24 × 256 × 32768 × 11 = 2.06 GiB pinned。
+  block_slots: 11
+  # 接收侧保留的可写槽数（pipeline 持有 block_slots - ring_lead 个）。
+  # 这一项决定"长跑丢不丢数"：收包线程最多只能提前读到"可写槽数"这么远。
+  # block_slots=8 + 7 个可写槽在 20 s 跑里看不出问题（亏空被 socket 缓冲吃掉），
+  # 300 s 后稳定丢 25%(nch=4096)/10%(nch=8192)；12 个可写槽 + 4 拷贝在飞
+  # 实测 300 s 只丢 60 包/58.6M。
+
+  # 显存里保留多少行积分结果，然后一次性取回主机。
+  #
+  # 这是把「积分长度」与「吐数/写盘频率」解耦的旋钮。当前 1 秒积分取 1 就够了
+  # （1 Hz 吐数）。但如果将来用 10 ms 的短积分，每行都取就意味着每秒 100 次
+  # D2H（24 路 983 MB/s）和每秒 100 次唤醒 writer；这时把本项设为
+  # round(1 s / 积分长度) 即可把节奏拉回 1 Hz，而积分长度本身不用改。
+  #
+  # 代价是显存：rows_per_fetch × n_baseline × n_freq × 8 B，24 路时每行 9.4 MiB。
+  rows_per_fetch: 1
+
+# ---------------------------------------------------------------------------
+# 落盘
+# ---------------------------------------------------------------------------
+storage:
+  # 文件名前缀：原样拼在每个文件名最前面（不含路径，也**不自动加分隔符** ——
+  # 需要的分隔符写在这里，比如下面末尾那个连字符）。
+  # 于是文件长这样：
+  #   corr24-N01N02-20260918-154154.bin              每个 baseline 一个（站名直连）
+  #   corr24-20260918-154154-time.bin / -time.txt    每行的墙钟
+  #   corr24-20260918-154154-blocks.csv / -metadata.yaml
+  # 它与 file_prefix_format 生成的"时刻"两半相接，合起来是这一套的**标签**
+  # （`--set` 用的就是它，metadata 里记作 set_prefix）。留空则什么都不前缀。
+  file_prefix: "corr24-"
+  # 写盘线程数。每块要写 n_baseline 个文件（15 路 = 120 个，
+  # 24 路 = 300 个），单线程 384 MB/s 可行，但并行 writer 更能吃满 NFS。
+  writers: 2
+  # 待写队列上限。满了则阻塞并告警（不静默丢块）。
+  # 本机 755 GiB 内存，按 384 MB/s 可缓数分钟。
+  queue_bytes: 1073741824
+  # 退出时对每个 baseline 文件 fsync。
+  fsync_on_stop: true
+  # 每写多少行 fsync 一次 baseline 文件。
+  # 1 = 每行都落盘（最安全，每行每文件一次 fsync）：
+  #   1 秒积分 24 路 = 300 次/s，没问题；
+  #   100 ms 积分 = 3000 次/s，NFS 开始吃力；
+  #   10 ms 积分 = 28610 次/s，必然撑不住，短积分必须调大这个值。
+  # 调大的代价：崩溃最多丢这么多行；sidecar 仍在数据之后写，
+  # 所以丢的行是四个文件一起缺，不会出现半行。
+  fsync_every_rows: 1
+  # 写盘队列满了怎么办。**drop（默认）= 丢掉这一行，继续收数**；block = 等 writer。
+  #
+  # 这不是"丢一点数据"的取舍，而是"整条链路会不会被一次磁盘停顿带走"的取舍：
+  # block 会让 pipeline 等队列 → 环不再释放槽 → 所有接收 worker park → 没人读 socket。
+  # 实测 2026-09-19：一次 52 秒的写盘停顿变成 2.4 亿包内核丢弃，且那一腿再没恢复
+  # （详见 docs/DESIGN-writer-thread.md）。写出默认值只是为了看得见，值本身不改变
+  # config_hash（默认就是它）。
+  queue_full: drop
+
+# ---------------------------------------------------------------------------
+# 绑核
+# ---------------------------------------------------------------------------
+# 拓扑：ens2f0np0 在 NUMA node 0（CPU 0-3）；mlx5_comp0..31 的 IRQ 散在
+# CPU 0-31；GPU0/1 在 node 2（CPU 8-11），GPU2/3 在 node 7（CPU 28-31），
+# 与网卡都是 SYS（跨 socket）。
+# 无 root ⇒ 不能调 IRQ affinity、不能改 /proc/sys、不能用 SCHED_FIFO，
+# 所以收包线程必然与部分 IRQ 争核。默认从 node0 起按序分配，
+# 具体哪种绑法更好留待 Phase 2 实测（改本文件即可，不必改代码）。
+cpu:
+  # 第 i 个 enabled station 用 recv_cpus[i]；长度必须 >= enabled station 数。
+  # 绑核策略：把网卡所在 NUMA 节点的核从收包池里剔除，其余自动分配。
+  # 实测（HANDOFF 6.16）：收包线程与网卡 IRQ 撞核时补零 1.61%，避开后 0.23%（负载还高 1.5 倍）。
+  avoid_nic_interfaces: []
+  auto_layout: true
+  # false = 接收线程不绑定单核，可以在 32 个核之间迁移，于是 CFS 能把它们从被中断压住
+  # 的核上挪开（实测最慢线程 29.9% → 34.2%）。代价是 NUMA 局部性：每收一个包都要写
+  # staging，而线程在 14-16 个核之间游走会打到远端内存。交错 A/B/A/B 实测（90 s × 4 腿、
+  # 空机）：积压中位 0.45 MB → 10-13 MB、rx 合计 12.6 → 14.4 核，零填充与丢包两腿都接近 0。
+  # 所以这是"用延迟换逃开忙核"，不是普遍更优。改回 true 即恢复绑定。
+  pin_cores: false
+  # 提交 H2D + kernel、维护水位线的线程。
+  # writer 线程依次使用这些核。
+
+# ---------------------------------------------------------------------------
+# 监控
+# ---------------------------------------------------------------------------
+monitoring:
+  # 每 interval_ms 打印一行实时状态到 stderr（字段含义见 corr-rs/src/monitor.rs 顶部
+  # 的表，以及 docs/DESIGN-status-http.md）。0 = 不打这一行。
+  interval_ms: 1000
+  # 同时追加写到 <output_dir>/<run_name>/stats.csv。
+  stats_csv: true
+  # 只读状态接口：`GET /status.json` 返回上面同一份样本的 JSON，由本进程的一个
+  # 独立线程 serve；独立运行的监测界面（tools/corr-web.py）从这里取数。
+  #
+  # **默认关**（这里显式打开）：生产跑不该因为一个默认值就开监听端口。
+  # 接口只 serve JSON，没有 HTML；它不在数据通路上，启不来（端口被占）只打一行
+  # 告警然后继续跑 —— 详见 docs/DESIGN-status-http.md。
+  http:
+    enabled: true
+    # 只监听回环：监测程序与 corr 在同一台机器上。
+    # 8000 也是代码里的默认值（DEFAULT_HTTP_BIND），这一行写出来是为了看得见。
+    bind: "127.0.0.1:8000"
+
+# ---------------------------------------------------------------------------
+# station 表
+# ---------------------------------------------------------------------------
+# 来源：rfsoc-init.json（本文件不读它，此处是抄写后的单一事实来源）。
+#
+# 字段含义：
+#   name        station 名，用于文件名与日志
+#   group_ip    多播组
+#   dest_port   目的端口
+#   interface   收包网卡（与 receiver.interface 一致，留作逐站覆盖的余地）
+#   source_ip   前端板卡源 IP，仅写入 metadata，不参与过滤
+#   board       前端板卡名，仅写入 metadata
+#   order       编排序号；enabled 的站按 order 升序压紧成 0..N_station-1，
+#               这个压紧后的下标就是 baseline 公式里的 j/k
+#   gpu_id      该站数据送到哪张卡；留空则按 gpu.devices 轮询
+#   enabled     是否参与相关计算（HANDOFF 4.5）
+#
+# baseline 编号：按 j <= k 行优先，index = j*N_station - j*(j-1)/2 + (k-j)。
+# N_station=4 时为 10 条： (0,0) (0,1) (0,2) (0,3) (1,1) (1,2) (1,3) (2,2) (2,3) (3,3)
+#
+# 当前默认只开 4 路：W17 / S01 / S06 / N04，分别来自 21cma-3 / 21cma-2 /
+# 21cma-1 / 21cma-3，覆盖三块板，且正是 counter 同步长跑实测过的那几条。
+# 扩到 15 路 = 把对应行改 enabled: true 并按需重排 order；扩到 24 路同理。
+
+stations:
+  - {name: W17, group_ip: 239.1.137.3, dest_port: 10037, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 0,  gpu_id: 0, enabled: true}
+  - {name: S01, group_ip: 239.1.161.3, dest_port: 10061, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 1,  gpu_id: 0, enabled: true}
+  - {name: S06, group_ip: 239.1.166.3, dest_port: 10066, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 2,  gpu_id: 0, enabled: true}
+  - {name: N04, group_ip: 239.1.144.3, dest_port: 10044, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 3,  gpu_id: 0, enabled: true}
+
+  - {name: N01, group_ip: 239.1.141.3, dest_port: 10041, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 4,  gpu_id: 0, enabled: true}
+  - {name: N02, group_ip: 239.1.142.3, dest_port: 10042, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 5,  gpu_id: 0, enabled: true}
+  - {name: N03, group_ip: 239.1.143.3, dest_port: 10043, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 6,  gpu_id: 0, enabled: true}
+  - {name: N08, group_ip: 239.1.148.3, dest_port: 10048, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 7,  gpu_id: 0, enabled: true}
+  - {name: N09, group_ip: 239.1.149.3, dest_port: 10049, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 8,  gpu_id: 0, enabled: true}
+  - {name: N10, group_ip: 239.1.150.3, dest_port: 10050, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 9,  gpu_id: 0, enabled: true}
+  - {name: N11, group_ip: 239.1.151.3, dest_port: 10051, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 10, gpu_id: 0, enabled: true}
+  - {name: S02, group_ip: 239.1.162.3, dest_port: 10062, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 11, gpu_id: 0, enabled: true}
+  - {name: S03, group_ip: 239.1.163.3, dest_port: 10063, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 12, gpu_id: 0, enabled: true}
+  - {name: S04, group_ip: 239.1.164.3, dest_port: 10064, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 13, gpu_id: 0, enabled: true}
+  - {name: S05, group_ip: 239.1.165.3, dest_port: 10065, interface: ens2f0np0, source_ip: 172.23.0.202, board: rfsoc-21cma-2, order: 14, gpu_id: 0, enabled: true}
+  - {name: S07, group_ip: 239.1.167.3, dest_port: 10067, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 15, gpu_id: 0, enabled: true}
+  - {name: S08, group_ip: 239.1.168.3, dest_port: 10068, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 16, gpu_id: 0, enabled: true}
+  - {name: S09, group_ip: 239.1.169.3, dest_port: 10069, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 17, gpu_id: 0, enabled: true}
+  - {name: S10, group_ip: 239.1.170.3, dest_port: 10070, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 18, gpu_id: 0, enabled: true}
+  - {name: S11, group_ip: 239.1.171.3, dest_port: 10071, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 19, gpu_id: 0, enabled: true}
+  - {name: S12, group_ip: 239.1.172.3, dest_port: 10072, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 20, gpu_id: 0, enabled: true}
+  - {name: S13, group_ip: 239.1.173.3, dest_port: 10073, interface: ens2f0np0, source_ip: 172.23.0.201, board: rfsoc-21cma-1, order: 21, gpu_id: 0, enabled: true}
+  - {name: W18, group_ip: 239.1.138.3, dest_port: 10038, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 22, gpu_id: 0, enabled: true}
+  - {name: W19, group_ip: 239.1.139.3, dest_port: 10039, interface: ens2f0np0, source_ip: 172.23.0.203, board: rfsoc-21cma-3, order: 23, gpu_id: 0, enabled: true}
