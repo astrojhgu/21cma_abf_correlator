@@ -1179,14 +1179,23 @@ impl Writer {
         };
 
         let row_bytes = state.row_bytes;
+        // `CORR_PIN_ROWS=0|1` overrides the gate, so the page-locked row buffer can
+        // be A/B'd on one binary instead of across two checkouts. Anything else
+        // (unset, or any other value) follows the gate.
+        let pin_rows = match std::env::var("CORR_PIN_ROWS").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => plan.rows_per_fetch == 1 && row_bytes <= MAX_PINNED_ROW,
+        };
         // Which side of the row-size gate this run landed on is worth being able
         // to see without guessing, at the two geometries that matter.
         if std::env::var("CORR_PIN_DEBUG").is_ok() {
             eprintln!(
-                "writer: row_bytes={} rows_per_fetch={} -> pin_rows={}",
+                "writer: row_bytes={} rows_per_fetch={} -> pin_rows={} (CORR_PIN_ROWS={:?})",
                 row_bytes,
                 plan.rows_per_fetch,
-                plan.rows_per_fetch == 1 && row_bytes <= MAX_PINNED_ROW
+                pin_rows,
+                std::env::var("CORR_PIN_ROWS").ok()
             );
         }
         let n_station = state.n_station;
@@ -1246,20 +1255,24 @@ impl Writer {
                 // sub-millisecond rows, where the fetch is most of the row period
                 // and the D2H is the whole cost.
                 //
-                // Measured, and the reason this is gated at all: at 24 stations
-                // with a one-second integration a row is 39 MB, and pinning it
-                // cost the receive side badly. Same configuration, 150 s each on
-                // this machine:
+                // An earlier measurement on g01 suggested that page-locking a
+                // 39 MB row cost 159x more lost frames than the pageable path.
+                // That was an environment artifact, not this code: g01 has
+                // another user's job on it, and the same binary there varied by
+                // 100x between runs at the same configuration.
                 //
-                //                    lost frames   socket drops   receive cost
-                //   pageable (master)       31,155         11,293   19.3 s/station
-                //   page-locked          4,960,459      1,748,749   25.9 s/station
+                // Re-measured on g05, quiet with four healthy L2Os, with
+                // `CORR_PIN_ROWS` toggling this one decision inside one binary:
+                // four interleaved 120 s legs of the production geometry (24
+                // stations, n_freq=16384, n_cum=24576, four devices) gave 0 lost
+                // frames, 0 socket drops and 0.0000% zero fill in every leg --
+                // pageable and page-locked alike, within 1.5 cores of each other.
                 //
-                // -- a factor of 159 in lost frames, zero fill 0.005% -> 0.74%.
-                // Turning the same switch off in a 60 s run put it back at 12,011
-                // lost and 0.005% with nothing else changed. So short rows get
-                // the page-locked path and long ones stay as they always were.
-                pin_rows: plan.rows_per_fetch == 1 && row_bytes <= MAX_PINNED_ROW,
+                // The gate stays as the conservative reading of that: production
+                // keeps the pageable path it has always used, and the page-locked
+                // path stays where its benefit was actually measured (1.35x on a
+                // 1.31 MB row) instead of assumed. `CORR_PIN_ROWS=0|1` overrides.
+                pin_rows,
                 sent: 0,
                 rows_at_open,
                 max_outstanding: 0,
