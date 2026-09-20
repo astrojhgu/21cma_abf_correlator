@@ -23,30 +23,41 @@
 #
 # ── 一行能有多短：实测边界（2026-09-20，4 站、写 /dev/shm 排除落盘）──────
 #
-# 行率不再由 corr-rs 决定，而是由**每次取数**（corr_rows_fetch：D2H + 主机侧
-# 相加/拷贝）决定。按 4 站（10 baseline）+ 单卡实测：
+# 行率由**每次取数**（corr_rows_fetch：D2H + 主机侧相加/拷贝）决定。按 4 站
+# （10 baseline）+ 单卡实测，优化前 → 优化后：
 #
-#   frames_per_slot   行长        行率        占实时      库内占比
-#        1            40.96 us    1411/s       5.8%        97%
-#        4           163.84 us    2208/s      36.2%        96%
-#        8           327.68 us    1352/s      44.3%        95%
-#       16           655.36 us    1457/s      95.5%        87%
-#       32             1.31 ms     762/s     100.0%        75%
-#       64             2.62 ms     381/s     100.0%        41%
+#   frames_per_slot   行长        行率(前)     行率(后)   占实时    库内占比(后)
+#        1            40.96 us    1411/s       6333/s     25.9%       87%
+#        4           163.84 us    2208/s       5669/s     92.9%       90%
+#        8           327.68 us    1352/s       3052/s    100.0%       69%
+#       16           655.36 us    1457/s       1526/s    100.0%       43%
+#       32             1.31 ms     762/s        763/s    100.0%       32%
 #
-# 即：**行长 >= 约 1.3 ms 时 corr-rs 已经不是瓶颈**（32 帧起跑满数据率、还有
-# 25% 余量），更短的行则被"每行一次 GPU 往返"卡住 —— 这是库里的固定开销，不是
-# 带宽（单卡 PCIe 只用了一半）。Rust 侧原有的两个每行大开销（状态接口的自相关
-# 归约每行做一次、writer 为每行拷贝一份 1.31 MB）已在本分支移除，见
-# corr-rs 提交 "take the status reduction and the row copy off the row path"。
+# 即：**行长 >= 327.68 us（8 帧）时已经跑满数据率、corr-rs 不是瓶颈**；1 帧
+# （40.96 us）那一档只剩 26%，卡在"每行一次同步 D2H"上 —— 单卡每行要搬
+# H2D 524 KiB + D2H 1.31 MiB = 1.83 MiB，同步完成，所以 D2H 的**实际速率**
+# （页锁定目标是 22 GB/s，普通可分页目标约 12 GB/s）就是天花板，向上还有约
+# 2 倍余量（需要把调用方的取数缓冲也做成 cudaHostAlloc 的页锁定内存）。
 #
-# **另一个更大的开关：split。** 同一组 4 站 / 40.96 us / 单卡：
-#   split: time_slice      → 2043 行/s（D2H 先进 pinned scratch，再 memcpy/相加到输出）
-#   split: baseline_range  → **5916 行/s**（每张卡只搬自己那段 baseline，D2H 直接落到输出）
-# baseline_range 的代价是每张卡都要持有全部站点，也就是 H2D 乘以卡数：n_freq=16384
-# 时一站 3.2 GB/s，单卡 19.2 GB/s 的上限意味着**一张卡最多约 6 站**。所以 24 站仍
-# 必须用 time_slice，而"几站 + 亚毫秒行"应当用 baseline_range。
-# 两种 split 的写出数据都已核对：10 个 baseline 文件字节数一致、无全零切片。
+# 这一轮拿掉的三个每行大开销：
+#   1) 状态接口的自相关归约原来每行做一次（固定 ~0.3 ms/行），现在按
+#      monitoring.interval_ms 限流；
+#   2) writer 原来为每行 memcpy 一份（24 站一行 39 MB），现在 rows_per_fetch=1
+#      时把取数缓冲直接交给 writer（write_row_owned），交接从拷贝变成 move；
+#   3) corr-cuda 的取数路径原来把 D2H 落进 pinned scratch 再在主机上 memcpy/
+#      相加到输出。用 CORR_FETCH_DEBUG 实测（24 站 1 s 积分，每次 fetch）：
+#        D2H 四份 partial row  26 GB/s → 48.5 ms
+#        主机侧 memcpy/相加    10.6 GB/s → 118.7 ms   ← 真正的大头
+#      现在 device 0 的 partial row 直接落进输出缓冲（省掉一整遍读写），
+#      24 站的 fetch 从 167 ms 降到 113 ms；4 站从 275 us 降到约 120 us。
+#
+# **split 已不再是那个开关。** 之前 time_slice(2043/s) 明显慢于
+# baseline_range(5916/s)，原因就是上面第 3 条的主机侧拷贝；拿掉之后两者等价
+# （实测 5785 vs 6155 行/s，在抖动范围内），而 time_slice 不需要每张卡持有全部
+# 站点，所以仍然用 time_slice。baseline_range 只在一个场景仍值得考虑：单卡、
+# 站数 <= 6（每站 3.2 GB/s，单卡 19.2 GB/s 上限），它把 D2H 摊到卡上。
+# 两种 split 的写出数据都已核对：baseline 文件字节数一致、无全零切片；4 卡与
+# 1 卡的同一 baseline 功率一致到 1.3%（确认多卡 partial row 都加进去了）。
 #
 # 两个刻意的补偿：
 #   block_slots x frames_per_slot 保持 2816 帧（115 ms）不变，staging 仍是 2112 MiB，

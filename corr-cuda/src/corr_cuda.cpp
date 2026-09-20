@@ -876,6 +876,42 @@ extern "C" corr_status corr_row_end(void *h, uint64_t frames) {
     return CORR_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic: where the time inside corr_rows_fetch goes.
+//
+// Off unless CORR_FETCH_DEBUG is set, and printed every few thousand calls, so it
+// cannot affect a run and needs no ABI change. It exists because `ns_fetch` alone
+// cannot say whether to make the host copy faster or to stop making it.
+// ---------------------------------------------------------------------------
+namespace {
+struct FetchDebug {
+    uint64_t calls = 0;
+    uint64_t ns_transfer = 0;   // cudaMemcpyAsync plus its synchronisation
+    uint64_t ns_sum = 0;        // the host-side copy/add into the caller's buffer
+    uint64_t bytes = 0;
+};
+FetchDebug g_fetch_dbg;
+
+bool fetch_debug_on() {
+    static const bool on = std::getenv("CORR_FETCH_DEBUG") != nullptr;
+    return on;
+}
+
+void fetch_debug_report() {
+    if (!fetch_debug_on() || g_fetch_dbg.calls == 0) return;
+    const FetchDebug &d = g_fetch_dbg;
+    std::fprintf(stderr,
+                 "fetch debug: %llu calls, %.3f MB/call, transfer %.1f us/call "
+                 "(%.2f GB/s), host sum %.1f us/call (%.2f GB/s)\n",
+                 (unsigned long long)d.calls,
+                 (double)d.bytes / d.calls / 1e6,
+                 (double)d.ns_transfer / d.calls / 1e3,
+                 (double)d.bytes / (double)d.ns_transfer,
+                 (double)d.ns_sum / d.calls / 1e3,
+                 (double)d.bytes / (double)d.ns_sum);
+}
+}  // namespace
+
 extern "C" corr_status corr_rows_wait(void *h) {
     Context *ctx = as_ctx(h);
     if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
@@ -946,27 +982,49 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
         const corr::GpuPlacement &pl = ctx->plans[static_cast<size_t>(d)];
         int32_t got = 0;
         const size_t slice = ctx->slice_bytes(d);
+        uint64_t t_part = 0;
         const uint64_t tf0 = now_ns();
         if (ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE) {
-            // Every device transferred a whole partial row into the scratch; add
-            // them. The first one is copied rather than added so the output
-            // buffer does not have to be cleared first.
-            if (ctx->scatter == nullptr ||
-                ctx->scatter_bytes < ctx->out_bytes())
-                return fail(CORR_ERR_INTERNAL, "partial-row buffer is missing or too small");
-            if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)], ctx->scatter,
-                                          ctx->scatter_bytes, 0, &got)) != CORR_OK)
-                return st;
+            // Every device holds a *partial* row -- a whole row of baselines over
+            // its share of the frames -- and the partials are added on the host.
+            // Device 0's is the output until the others are added to it, so it
+            // lands in the caller's buffer directly instead of in the scratch and
+            // then being copied out: a partial row is contiguous in baseline
+            // order, so the destination pitch is 0 and one copy does it.
+            //
+            // That pass is not a detail. Measured with CORR_FETCH_DEBUG at 24
+            // stations, one second integration: the D2H of four partial rows runs
+            // at 26 GB/s, and the host-side copy-or-add runs at 10.6 GB/s and
+            // takes 118 ms of the fetch's 167 ms. At one frame per row the same
+            // two halves are 58 us and 210 us.
+            const uint64_t tp0 = now_ns();
+            if (d == 0) {
+                if ((st = corr::gpu_row_fetch(ctx->gpus[0], out, ctx->out_bytes(), 0,
+                                              &got)) != CORR_OK)
+                    return st;
+            } else {
+                if (ctx->scatter == nullptr ||
+                    ctx->scatter_bytes < ctx->out_bytes())
+                    return fail(CORR_ERR_INTERNAL,
+                                "partial-row buffer is missing or too small");
+                if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)],
+                                              ctx->scatter, ctx->scatter_bytes, 0,
+                                              &got)) != CORR_OK)
+                    return st;
+            }
+            t_part = now_ns() - tp0;
             if (got > 0) {
                 const float *src = static_cast<const float *>(ctx->scatter);
                 float *dst = reinterpret_cast<float *>(out);
                 const size_t values = (size_t)got * pitch / sizeof(float);
-                if (d == 0) {
-                    std::memcpy(dst, src, values * sizeof(float));
-                } else {
+                g_fetch_dbg.bytes += values * sizeof(float);
+                if (d > 0) {
+                    const uint64_t ts0 = now_ns();
                     for (size_t i = 0; i < values; ++i) dst[i] += src[i];
+                    g_fetch_dbg.ns_sum += now_ns() - ts0;
                 }
             }
+            g_fetch_dbg.ns_transfer += t_part;
         } else if (pl.baselines_are_contiguous) {
             // One two-dimensional copy straight into the row buffer, at the
             // offset this device's range starts at.
@@ -994,6 +1052,18 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
         }
     }
     *out_rows = rows < 0 ? 0 : rows;
+    g_fetch_dbg.calls += 1;
+    // Time-based, not call-based: a one-second integration makes a handful of
+    // calls a minute and a 40.96 us row makes twenty thousand a second, and both
+    // are worth seeing.
+    if (fetch_debug_on()) {
+        static uint64_t last_report_ns = 0;
+        const uint64_t now = now_ns();
+        if (now - last_report_ns >= 1000000000ull) {
+            last_report_ns = now;
+            fetch_debug_report();
+        }
+    }
     return CORR_OK;
 }
 
