@@ -50,6 +50,33 @@ pub enum StopReason {
         /// index beside the name.
         station: usize,
     },
+    /// Every station is receiving packets, but the run's own frame numbering has
+    /// not moved for `seconds`.
+    ///
+    /// This is the "the stream and the run disagree about which frame it is" state,
+    /// and it is dangerous precisely because nothing looks wrong: the sockets are
+    /// read and drained, the ring is untouched, no packet is counted as lost, no
+    /// frame is counted as zero filled, and the run writes no rows for as long as
+    /// it is left alone. Two ways in, both seen for real on 2026-09-20:
+    ///
+    /// * the front end's counter restarted (its epoch changed) mid-run, so every
+    ///   later packet belonged to a frame the assembler had already finalized --
+    ///   a healthy run producing 1.00 rows/s froze at row 132 and stayed there;
+    /// * a restarted front end plus `daily_files` resuming the day's set: the resume
+    ///   floor pinned the start frame at the set's continuation (1.0e10) while the
+    ///   stream was at 4.0e7, so every packet arrived "before the start" and a run
+    ///   that reported `0 slots, 0 rows` sat at 12 cores of CPU forever.
+    StreamNotAdvancing {
+        /// The frame the run's rows are numbered from.
+        start_frame: u64,
+        /// The frame every station's finalized progress is stuck at.
+        progress: u64,
+        seconds: u64,
+        /// Stations still receiving packets, and the total, so the message can say
+        /// whether the front end went quiet instead.
+        live: usize,
+        n_station: usize,
+    },
     /// A receive thread hit an error it could not fix.
     Fatal { station: usize, message: String },
     /// The output file set for a new local day could not be opened. The run stops
@@ -87,6 +114,25 @@ impl StopReason {
                  writing hours of data that is short on those frames; blocks.csv carries the \
                  per-row count for the rows already written",
                 *slots_milli as f64 / 1000.0
+            ),
+            StopReason::StreamNotAdvancing {
+                start_frame,
+                progress,
+                seconds,
+                live,
+                n_station,
+            } => format!(
+                "the run's frame numbering has not advanced for {seconds}s while {live} of \
+                 {n_station} stations are still receiving: the rows are numbered from frame \
+                 {start_frame} and every station is stuck at {progress}. Packets that arrive \
+                 below the start frame, or behind a frame already finalized, are dropped \
+                 without being counted as lost or zero filled -- so a run in this state reads \
+                 its sockets, loses nothing on paper and writes no rows. The usual cause is \
+                 the front end's counter restarting (a new epoch) part way through, or a \
+                 resume of the day's set at a frame the stream will never reach again. Start \
+                 a new set (--allow-second-set, or NEW_SET=1 for tools/run-24-nf16384.sh) \
+                 after checking the front end, and keep this set's rows: they stop at the \
+                 epoch change"
             ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
             StopReason::RolloverFailed { prefix, detail } => format!(
@@ -145,6 +191,17 @@ impl RunStop {
     pub fn lift_message(&self) -> Option<String> {
         match self.reason() {
             Some(r @ StopReason::LiftCap { .. }) => Some(r.describe()),
+            _ => None,
+        }
+    }
+
+    /// The stream/run frame mismatch, reported on the same "STOPPED:" line as the
+    /// other reasons a run ends without being asked to: a reader of the report has
+    /// one place to look, and this one in particular must not be silent -- a run
+    /// stopped here wrote no rows at all, or stopped writing them part way.
+    pub fn stream_message(&self) -> Option<String> {
+        match self.reason() {
+            Some(r @ StopReason::StreamNotAdvancing { .. }) => Some(r.describe()),
             _ => None,
         }
     }

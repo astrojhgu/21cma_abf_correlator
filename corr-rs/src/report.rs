@@ -37,6 +37,9 @@ pub struct RunReport {
     pub stopped_zero_fill_exceeded: Option<String>,
     /// Set when the run stopped because the watermark stayed lifted for too long.
     pub stopped_lift_exceeded: Option<String>,
+    /// `Some` when the run stopped because the front end's frame numbering and the
+    /// run's own had come apart (see [`crate::stop::StopReason::StreamNotAdvancing`]).
+    pub stopped_stream_flat: Option<String>,
     /// Set when a receive thread hit an error the whole run had to answer -- see
     /// [`crate::assemble::AssembleError::is_fatal`]. The output is still complete
     /// rows; it just stops early and says why.
@@ -150,6 +153,9 @@ impl RunReport {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_lift_exceeded {
+            let _ = writeln!(s, "  STOPPED: {why}");
+        }
+        if let Some(why) = &self.stopped_stream_flat {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_fatal {

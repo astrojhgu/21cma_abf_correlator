@@ -63,6 +63,10 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) sampled_once: bool,
     pub(crate) prev_lost: u64,
     pub(crate) prev_prog: u64,
+    /// Consecutive one-second samples in which no station advanced its finalized
+    /// progress at all, while every station was still receiving. See
+    /// [`StopReason::StreamNotAdvancing`].
+    pub(crate) flat_seconds: u64,
     pub(crate) prev_zf: u64,
     /// How many times the loop asked the scheduler for work and got nothing, and
     /// what those polls cost. The device report says how long the *library* calls
@@ -320,6 +324,42 @@ impl<'a> Pipeline<'a> {
                         if self.timeline.len() < 40 && (d_lost > 0 || self.timeline.len() < 3) {
                             self.timeline.push((d_prog / self.n_station as u64, d_lost / self.n_station as u64, d_zf / self.n_station as u64));
                         }
+
+                        // Watchdog for the one failure that leaves no trace anywhere
+                        // else: the front end keeps sending, every packet is dropped
+                        // for arriving before the run's start frame or behind an
+                        // already-finalized frame, and the run writes nothing while
+                        // reporting zero loss. See StopReason::StreamNotAdvancing for
+                        // the two ways this happened for real.
+                        //
+                        // The test is *consecutive* seconds with no progress at all,
+                        // which is what keeps it rate independent: a replay slow
+                        // enough to matter here (0.6 frames/s) still advances several
+                        // frames inside the window, so this cannot fire on a slow
+                        // front end -- only on one whose frame numbering will never
+                        // reach the run's.
+                        let live = (0..self.n_station)
+                            .filter(|i| self.sched.silence_ms(*i, now) < 500)
+                            .count();
+                        if !first && d_prog == 0 && live == self.n_station {
+                            self.flat_seconds += 1;
+                            if self.flat_seconds >= stream_flat_limit_s() {
+                                self.stop.stop(StopReason::StreamNotAdvancing {
+                                    start_frame: self.sched.row_start_frame(),
+                                    progress: self.sched.progress_of(0).min(
+                                        (0..self.n_station)
+                                            .map(|i| self.sched.progress_of(i))
+                                            .min()
+                                            .unwrap_or(0),
+                                    ),
+                                    seconds: self.flat_seconds,
+                                    live,
+                                    n_station: self.n_station,
+                                });
+                            }
+                        } else {
+                            self.flat_seconds = 0;
+                        }
                     }
                     if std::env::var_os("CORR_PIPE_DEBUG").is_some() {
                         let now = Instant::now();
@@ -368,6 +408,21 @@ impl<'a> Pipeline<'a> {
         self.elapsed = self.t0.elapsed();
         Ok(())
     }
+}
+
+/// How many consecutive one-second samples with no progress at all the watchdog
+/// in the pipeline loop tolerates before it stops the run. Ten is far above the
+/// ~1 s a healthy run spends discarding pre-start packets, and far below the
+/// hours a run in this state would otherwise sit there.
+///
+/// `CORR_STREAM_FLAT_S` overrides it, for a front end slow enough to advance less
+/// than one frame per sample on purpose.
+fn stream_flat_limit_s() -> u64 {
+    std::env::var("CORR_STREAM_FLAT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v >= 3)
+        .unwrap_or(10)
 }
 
 /// How long the loop backs off when the scheduler has nothing to do.
