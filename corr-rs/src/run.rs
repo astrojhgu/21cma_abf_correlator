@@ -711,15 +711,19 @@ pub(crate) fn flush_rows(
     // still get split out; at rows_per_fetch > 1 that copy is a fraction of the
     // fetch it rides on, and at rows_per_fetch == 1 it would be the whole cost.
     let mut owned = match writer.as_deref_mut() {
-        Some(w) if need == row_bytes => Some(w.take_row_buffer(need)),
+        Some(w) if need == row_bytes => Some(w.take_row_buffer(need)?),
         _ => None,
     };
     let rows = {
-        let target: &mut Vec<u8> = owned.as_mut().unwrap_or(buf);
-        if target.len() < need {
-            target.resize(need, 0);
+        match owned.as_mut() {
+            Some(o) => corr.rows_fetch(&mut o.as_mut_slice()[..need])? as usize,
+            None => {
+                if buf.len() < need {
+                    buf.resize(need, 0);
+                }
+                corr.rows_fetch(&mut buf[..need])? as usize
+            }
         }
-        corr.rows_fetch(&mut target[..need])? as usize
     };
     if rows == 0 {
         return Ok(0);

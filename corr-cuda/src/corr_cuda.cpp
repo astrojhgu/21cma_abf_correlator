@@ -1071,6 +1071,24 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
 // Device placement -- what the split actually was
 // ---------------------------------------------------------------------------
 
+extern "C" corr_status corr_host_alloc(size_t bytes, void **out) {
+    if (out == nullptr) return fail(CORR_ERR_ARG, "out is NULL");
+    if (bytes == 0) return fail(CORR_ERR_ARG, "bytes must be > 0");
+    void *p = nullptr;
+    cudaError_t e = cudaHostAlloc(&p, bytes, cudaHostAllocDefault);
+    if (e != cudaSuccess) {
+        return failf(CORR_ERR_NOMEM, "cudaHostAlloc(%zu bytes) failed: %s; "
+                     "page-locked memory counts against RLIMIT_MEMLOCK",
+                     bytes, cuda_error_string(e).c_str());
+    }
+    *out = p;
+    return CORR_OK;
+}
+
+extern "C" void corr_host_free(void *p) {
+    if (p != nullptr) cudaFreeHost(p);
+}
+
 extern "C" int32_t corr_n_devices(void *h) {
     Context *ctx = as_ctx(h);
     if (ctx == nullptr) return -1;

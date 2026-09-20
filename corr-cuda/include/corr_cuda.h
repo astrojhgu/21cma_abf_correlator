@@ -492,6 +492,26 @@ corr_status corr_device_baselines(void *ctx, int32_t device_index,
 corr_status corr_device_stats_get(void *ctx, int32_t device_index,
                                   corr_device_stats *out);
 
+/*
+ * Host memory for a row buffer, pinned, and its matching free.
+ *
+ * Why this exists: corr_rows_fetch() transfers into whatever the caller passes,
+ * and the transfer rate depends on what that is. Measured on this machine for a
+ * 1.31 MiB row: 22.5 GB/s into page-locked memory, 12 GB/s into ordinary
+ * pageable memory, because the pageable case is staged through a bounce buffer.
+ * At a one-second integration that difference is invisible (the fetch is 0.2% of
+ * the run); at a 40.96 us row the fetch is most of the row period, and it is the
+ * difference between 6333 and roughly 9000 rows per second.
+ *
+ * Nothing in the library requires the buffer to be pinned, so a caller that does
+ * not care can keep a Vec. Handing the same buffer to a writer afterwards is
+ * fine: page-locked memory is ordinary cached memory as far as the CPU is
+ * concerned, except that a large page-locked allocation counts against
+ * RLIMIT_MEMLOCK, which is why the free is not optional.
+ */
+corr_status corr_host_alloc(size_t bytes, void **out);
+void corr_host_free(void *p);
+
 
 #ifdef __cplusplus
 } /* extern "C" */

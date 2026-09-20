@@ -161,6 +161,11 @@ extern "C" {
     pub fn corr_create(cfg: *const corr_config, out_ctx: *mut *mut c_void) -> corr_status;
     pub fn corr_destroy(ctx: *mut c_void) -> corr_status;
 
+    /// Page-locked host memory for a row buffer, and its free. See
+    /// [`crate::pinned::PinnedBuf`] for why the fetch destination is pinned.
+    pub fn corr_host_alloc(bytes: usize, out: *mut *mut c_void) -> corr_status;
+    pub fn corr_host_free(p: *mut c_void);
+
     pub fn corr_staging_info(
         ctx: *mut c_void,
         station: i32,

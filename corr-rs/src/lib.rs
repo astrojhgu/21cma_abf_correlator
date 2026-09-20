@@ -51,6 +51,7 @@ pub mod ffi;
 pub mod frame;
 pub mod gpu;
 pub mod net;
+pub mod pinned;
 pub mod pipeline;
 pub mod receiver;
 pub mod report;

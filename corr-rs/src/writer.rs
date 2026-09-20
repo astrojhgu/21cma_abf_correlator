@@ -59,6 +59,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
+use crate::pinned::RowBuf;
+
 use crate::config::{
     local_day_at, local_stamp_at, local_tz_name, local_utc_offset_s, Config, QueueFull, RunPlan,
 };
@@ -254,7 +256,7 @@ pub struct RowBlock {
 /// One row on its way to the writer thread.
 enum Job {
     Row {
-        buf: Vec<u8>,
+        buf: RowBuf,
         row_ms: i64,
         blocks: RowBlock,
     },
@@ -880,7 +882,7 @@ impl SetState {
 fn run_writer_thread(
     mut state: SetState,
     rx: std::sync::mpsc::Receiver<Job>,
-    free: std::sync::mpsc::Sender<Vec<u8>>,
+    free: std::sync::mpsc::Sender<RowBuf>,
     rows: Arc<AtomicU64>,
     first_error: Arc<Mutex<Option<anyhow::Error>>>,
 ) {
@@ -970,11 +972,11 @@ pub struct Writer {
     set_kind: SetKind,
 
     tx: std::sync::mpsc::SyncSender<Job>,
-    rx_free: std::sync::mpsc::Receiver<Vec<u8>>,
+    rx_free: std::sync::mpsc::Receiver<RowBuf>,
     handle: Option<std::thread::JoinHandle<()>>,
     rows: Arc<AtomicU64>,
     first_error: Arc<Mutex<Option<anyhow::Error>>>,
-    pool: Vec<Vec<u8>>,
+    pool: Vec<RowBuf>,
     /// What to do when the queue cannot take another row.
     queue_full: QueueFull,
     /// Rows thrown away because the queue was full: a gap in the data, counted so
@@ -988,6 +990,10 @@ pub struct Writer {
     /// Rows that may be in flight, from `storage.queue_bytes`.
     queue_depth: usize,
     pool_cap: usize,
+    /// Whether row buffers are page-locked. True when one fetch produces one row,
+    /// which is the only case where the row buffer *is* the fetch destination --
+    /// see [`crate::pinned::RowBuf`].
+    pin_rows: bool,
     /// Rows this process has handed to the thread, and the reader count it
     /// started from. The queue length is their difference against what the
     /// thread has finished -- counting buffers instead would drift, because a
@@ -1193,6 +1199,10 @@ impl Writer {
                 drop_last_row: 0,
                 queue_depth: depth,
                 pool_cap: depth + 2,
+                // One row per fetch is what makes the row buffer the fetch
+                // destination (`flush_rows`), and that is the only case where
+                // page-locking it changes anything.
+                pin_rows: plan.rows_per_fetch == 1,
                 sent: 0,
                 rows_at_open,
                 max_outstanding: 0,
@@ -1349,22 +1359,24 @@ impl Writer {
     /// stations at `n_freq = 16384` is 39 MB, so at a one-second integration it is
     /// 39 MB/s and at a 40.96 us row it is 960 GB/s of `memcpy` -- more than the
     /// machine's whole memory bandwidth, spent moving bytes nobody reads.
-    pub fn take_row_buffer(&mut self, need: usize) -> Vec<u8> {
-        let mut buf = match self.pool.pop().or_else(|| self.rx_free.try_recv().ok()) {
-            Some(b) => b,
-            None => Vec::with_capacity(need),
-        };
-        if buf.len() > need {
-            buf.truncate(need);
+    pub fn take_row_buffer(&mut self, need: usize) -> Result<RowBuf> {
+        let reusable = self
+            .pool
+            .pop()
+            .or_else(|| self.rx_free.try_recv().ok())
+            // A pooled buffer of the wrong size is not reusable: the length is the
+            // allocation's, and it is the length the fetch checks.
+            .filter(|b| b.len() == need && b.is_pinned() == self.pin_rows);
+        match reusable {
+            Some(b) => Ok(b),
+            None => RowBuf::new(need, self.pin_rows),
         }
-        buf.resize(need, 0);
-        buf
     }
 
     pub fn write_row(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
         self.check_row(spectrum.len(), blocks)?;
-        let mut buf = self.take_row_buffer(spectrum.len());
-        buf.copy_from_slice(spectrum);
+        let mut buf = self.take_row_buffer(spectrum.len())?;
+        buf.as_mut_slice().copy_from_slice(spectrum);
         self.put_row(buf, row_ms, blocks)
     }
 
@@ -1374,7 +1386,7 @@ impl Writer {
     /// disk, so a run that keeps one row in flight allocates nothing per row.
     pub fn write_row_owned(
         &mut self,
-        buf: Vec<u8>,
+        buf: RowBuf,
         row_ms: i64,
         blocks: &RowBlock,
     ) -> Result<()> {
@@ -1382,7 +1394,7 @@ impl Writer {
         self.put_row(buf, row_ms, blocks)
     }
 
-    fn put_row(&mut self, buf: Vec<u8>, row_ms: i64, blocks: &RowBlock) -> Result<()> {
+    fn put_row(&mut self, buf: RowBuf, row_ms: i64, blocks: &RowBlock) -> Result<()> {
         let row_index = blocks.row_index;
         let job = Job::Row {
             buf,
@@ -2100,7 +2112,7 @@ mod tests {
         // the channel does not look disconnected.
         let (tx, _rx) = std::sync::mpsc::sync_channel(1);
         tx.send(Job::Row {
-            buf: vec![0u8; row_bytes],
+            buf: RowBuf::new(row_bytes, false).expect("row buffer"),
             row_ms: 0,
             blocks: blocks_for(&plan, 0, plan.n_cum as u64),
         })
