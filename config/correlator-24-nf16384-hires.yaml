@@ -21,6 +21,33 @@
 #                       零填充 0.0000%、lost 0、sockdrop 0；
 #                       但写盘跟不上 500 MB/s，丢 19-21% 的行
 #
+# ── 一行能有多短：实测边界（2026-09-20，4 站、写 /dev/shm 排除落盘）──────
+#
+# 行率不再由 corr-rs 决定，而是由**每次取数**（corr_rows_fetch：D2H + 主机侧
+# 相加/拷贝）决定。按 4 站（10 baseline）+ 单卡实测：
+#
+#   frames_per_slot   行长        行率        占实时      库内占比
+#        1            40.96 us    1411/s       5.8%        97%
+#        4           163.84 us    2208/s      36.2%        96%
+#        8           327.68 us    1352/s      44.3%        95%
+#       16           655.36 us    1457/s      95.5%        87%
+#       32             1.31 ms     762/s     100.0%        75%
+#       64             2.62 ms     381/s     100.0%        41%
+#
+# 即：**行长 >= 约 1.3 ms 时 corr-rs 已经不是瓶颈**（32 帧起跑满数据率、还有
+# 25% 余量），更短的行则被"每行一次 GPU 往返"卡住 —— 这是库里的固定开销，不是
+# 带宽（单卡 PCIe 只用了一半）。Rust 侧原有的两个每行大开销（状态接口的自相关
+# 归约每行做一次、writer 为每行拷贝一份 1.31 MB）已在本分支移除，见
+# corr-rs 提交 "take the status reduction and the row copy off the row path"。
+#
+# **另一个更大的开关：split。** 同一组 4 站 / 40.96 us / 单卡：
+#   split: time_slice      → 2043 行/s（D2H 先进 pinned scratch，再 memcpy/相加到输出）
+#   split: baseline_range  → **5916 行/s**（每张卡只搬自己那段 baseline，D2H 直接落到输出）
+# baseline_range 的代价是每张卡都要持有全部站点，也就是 H2D 乘以卡数：n_freq=16384
+# 时一站 3.2 GB/s，单卡 19.2 GB/s 的上限意味着**一张卡最多约 6 站**。所以 24 站仍
+# 必须用 time_slice，而"几站 + 亚毫秒行"应当用 baseline_range。
+# 两种 split 的写出数据都已核对：10 个 baseline 文件字节数一致、无全零切片。
+#
 # 两个刻意的补偿：
 #   block_slots x frames_per_slot 保持 2816 帧（115 ms）不变，staging 仍是 2112 MiB，
 #     这样 slot 变小不会削弱接收侧对抖动的容忍度。

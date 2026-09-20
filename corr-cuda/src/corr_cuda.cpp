@@ -654,7 +654,12 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
         if (need > ctx->scatter_bytes) ctx->scatter_bytes = need;
     }
     if (ctx->scatter_bytes > 0) {
-        e = cudaHostAlloc(&ctx->scatter, ctx->scatter_bytes, cudaHostAllocPortable);
+        // Not `cudaHostAllocPortable`: this scratch is only ever a copy
+        // *destination* for the host and a *source* for the host-side sum, and no
+        // device ever reads or writes it. Portable memory is mapped into every
+        // device's address space, which costs transfer rate for a property this
+        // buffer does not use.
+        e = cudaHostAlloc(&ctx->scatter, ctx->scatter_bytes, cudaHostAllocDefault);
         if (e != cudaSuccess) {
             const std::string msg = cuda_error_string(e);
             cudaFreeHost(ctx->staging);
