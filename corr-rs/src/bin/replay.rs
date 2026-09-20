@@ -131,6 +131,28 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     delay_stride: i64,
 
+    /// Step the whole delay ladder every this many frames (0 = no ladder).
+    ///
+    /// With `--delay-stride s`, station i is delayed `s*i*k` samples while the
+    /// ladder step is k, where k = 1 + (frame - origin)/FRAMES. Step boundaries
+    /// fall on multiples of FRAMES in the global frame numbering, and the
+    /// correlator's rows are aligned to `n_cum` frames, so FRAMES = n_cum makes
+    /// the two grids coincide: every output row integrates exactly one step.
+    ///
+    /// `origin` is the first multiple of FRAMES at or after the first frame sent,
+    /// which is what makes the alignment hold regardless of `--start-counter`.
+    /// The delay is a property of the *sample stream*, so a step boundary is a
+    /// discontinuity in that stream: the correlation of a row is unaffected (the
+    /// delay is constant across it), and the phase measured from row to row steps
+    /// by `2*pi*f*s*dN/fs` -- which is the relation this exists to test.
+    #[arg(long, default_value_t = 0)]
+    ladder_frames: u64,
+
+    /// Stop counting up after this many ladder steps (0 = no cap). Keeps the
+    /// phase from growing without bound in a long run.
+    #[arg(long, default_value_t = 10)]
+    ladder_steps: u64,
+
     /// Print what would be sent without sending it.
     #[arg(long)]
     dry_run: bool,
@@ -285,6 +307,18 @@ fn main() -> Result<()> {
         );
     }
 
+    // Frames per packet, and the ladder's frame grid. `origin` must be the first
+    // multiple of the ladder step at or after the first frame sent: the
+    // correlator's rows are aligned to `n_cum` frames in the same numbering, so
+    // that is what makes one row integrate exactly one ladder step.
+    let packets_per_frame = (2 * cfg.fft.n_freq as u64) / SAMPLES_PER_PACKET as u64;
+    let first_frame = (cli.start_counter * SAMPLES_PER_PACKET as u64) / (2 * cfg.fft.n_freq as u64);
+    let ladder_origin = if cli.ladder_frames > 0 {
+        first_frame.div_ceil(cli.ladder_frames) * cli.ladder_frames
+    } else {
+        0
+    };
+
     println!(
         "corr-replay: {} stations, {:.0} pps each ({:.1} MB/s total), {:.1} s",
         plan.n_station,
@@ -292,6 +326,19 @@ fn main() -> Result<()> {
         cli.rate * DATAGRAM as f64 * plan.n_station as f64 / 1e6,
         cli.duration
     );
+    if cli.ladder_frames > 0 {
+        println!(
+            "  ladder: station i delayed {} * i * k samples, k stepping every {} frames \
+             ({} per frame), first frame {} -> origin {}, {} steps{}",
+            cli.delay_stride,
+            cli.ladder_frames,
+            packets_per_frame,
+            first_frame,
+            ladder_origin,
+            cli.ladder_steps,
+            if cli.delay_stride == 0 { " -- WARNING: stride 0, every step is a no-op" } else { "" }
+        );
+    }
     for s in &plan.enabled {
         println!("  [{:2}] {:<6} -> {}:{}", s.index, s.name, s.group_ip, s.dest_port);
     }
@@ -322,6 +369,8 @@ fn main() -> Result<()> {
             .find(|(i, _)| *i == index)
             .map(|(_, n)| *n)
             .unwrap_or_else(|| cli.delay_stride * index as i64);
+        // The fixed part of the ladder: `k` below multiplies this.
+        let ladder_base = sample_delay;
         let cli = cli.clone();
         let iface_ip = cfg.receiver.interface_ip;
         let iface_name = cfg.receiver.interface.clone();
@@ -345,6 +394,7 @@ fn main() -> Result<()> {
             })?;
 
             let mut packet = vec![0u8; DATAGRAM];
+            let mut sample_delay = sample_delay;
             let start = Instant::now();
             let total = (cli.duration * cli.rate) as u64;
             let mut n = 0u64;
@@ -378,6 +428,18 @@ fn main() -> Result<()> {
                 if in_gap || lost {
                     dropped += 1;
                 } else {
+                    if cli.ladder_frames > 0 {
+                        let frame = counter / packets_per_frame;
+                        let mut k = if frame >= ladder_origin {
+                            1 + (frame - ladder_origin) / cli.ladder_frames
+                        } else {
+                            1
+                        };
+                        if cli.ladder_steps > 0 {
+                            k = k.min(cli.ladder_steps);
+                        }
+                        sample_delay = ladder_base * k as i64;
+                    }
                     build_packet(counter, index as usize, sample_delay, cli, &mut packet);
                     // A full send buffer would block; dropping is the honest
                     // outcome and the receive path is expected to survive it.
