@@ -145,6 +145,7 @@ class Collector(threading.Thread):
         self._thread_prev = None
         self._thread_prev_t = None
         self._squeeze_prev = None
+        self._dropped_prev = None
         self.latest = None
         self.error = None
         self.received_at = None
@@ -180,7 +181,15 @@ class Collector(threading.Thread):
         **诊断用，不是预警**：健康运行时最慢的收包线程也只拿到 33%（它所在的核被网卡
         队列中断占了固定一份），最慢与最快能差 40 个百分点 —— 与故障时几乎一样，所以它
         区分不了好坏。真正敏感的信号是积压。这一块的用处是：积压开始涨的时候，在这里看
-        出是哪几个线程被饿，以及内核是否已经在硬扛（`time_squeeze` 健康时应为 0）。
+        出是哪几个线程被饿，以及内核在软中断层是"有压力"还是"真的丢了"。这两件事由
+        /proc/net/softnet_stat 的两列分别给出：第 2 列 dropped 是 backlog 溢出真的丢了包，
+        第 3 列 time_squeeze 只是 NAPI 一轮的预算被打满、下一轮接着收。
+
+        **判据是 dropped，不是 squeeze。** 4.7 Mpps 摊在 16 个管中断的核上（本机网卡在
+        NUMA node0，IRQ 只在 cpu0-15），每核约 0.29 Mpps，而一轮 NAPI 的预算默认是
+        300 个包 —— 预算被打满 ~70 次/s 是常态：g05 生产几何实测 squeeze 70/s 的同时
+        dropped +0、网卡各丢弃计数器 +0、相关机补零 0.0000%。所以这里显示 squeeze 的
+        同时必须带上 dropped，否则正常压力会被读成故障。
         """
         with self.lock:
             pid = (self.latest or {}).get("pid")
@@ -205,18 +214,26 @@ class Collector(threading.Thread):
         except OSError:
             return None
 
-        squeeze = 0
+        # softnet 的第 2 列是**丢了**（backlog 溢出），第 3 列是**没处理完**
+        # （NAPI 一轮的预算用完）。两个都要：前者是损失，后者是压力，单独看后者会把
+        # 正常压力误报成故障 —— 4.7 Mpps / 16 个管中断的核上，预算被打满 70 次/s 是
+        # 常态（实测 dropped 与网卡各丢弃计数器同时为 0），而文案里那句
+        # "健康时应为 0" 只在低包速率下成立。
+        squeeze = dropped = 0
         try:
             with open("/proc/net/softnet_stat") as fh:
                 for line in fh:
                     f = line.split()
                     if len(f) >= 3:
+                        dropped += int(f[1], 16)
                         squeeze += int(f[2], 16)
         except OSError:
             pass
 
         prev, prev_t, prev_sq = self._thread_prev, self._thread_prev_t, self._squeeze_prev
+        prev_dr = self._dropped_prev
         self._thread_prev, self._thread_prev_t, self._squeeze_prev = cur, now, squeeze
+        self._dropped_prev = dropped
         if prev is None or prev_t is None or prev_sq is None:
             return {"warmup": True}
 
@@ -245,6 +262,7 @@ class Collector(threading.Thread):
             "slowest": {"name": rx[-1][0], "pct": rx[-1][1]},
             "sum_pct": sum(r[1] for r in rx),
             "squeeze_per_s": max(0.0, (squeeze - prev_sq) / dt),
+            "softnet_dropped_per_s": max(0.0, (dropped - (prev_dr or 0)) / dt),
             "dt_s": dt,
         }
 
@@ -739,26 +757,33 @@ function threadsCard(t) {
   if (t.warmup) return { v: "…", cls: "v", sub: "需要两次采样才能算 CPU", title: "" };
 
   const sq = t.squeeze_per_s || 0;
+  const dr = t.softnet_dropped_per_s || 0;
   const slow = t.slowest || {}, fast = t.fastest || {};
   const sub = `rx ${t.count} 个 · 合计 ${(t.sum_pct / 100).toFixed(2)} 核`
     + ` · 最慢 ${slow.name || "?"} ${(slow.pct || 0).toFixed(1)}%`
     + ` · 最快 ${fast.name || "?"} ${(fast.pct || 0).toFixed(1)}%`
     + `（差 ${((fast.pct || 0) - (slow.pct || 0)).toFixed(0)} 个百分点）`
-    + ` · 逐线程见下方「每站」表`;
+    + ` · 软中断丢 ${dr.toFixed(0)}/s · 逐线程见下方「每站」表`;
 
+  const why = (extra) => `time_squeeze 是 NAPI 一轮的预算（默认 300 包）被打满的次数，`
+    + `下面这个 dropped 才是真丢了包（backlog 溢出）。`
+    + `4.7 Mpps 摊在 16 个管中断的核上，每核约 0.29 Mpps，预算被打满 ~70 次/s 是常态 —— `
+    + `实测本机生产几何 squeeze 70/s 时 dropped +0、网卡各丢弃计数器 +0、补零 0.0000%。`
+    + extra;
+
+  // 判据取"丢了"的那一列；squeeze 单独高只说明有压力，不是故障。
+  if (dr > 0) {
+    return { v: `软中断丢 ${dr.toFixed(0)}/s`, cls: dr >= 1000 ? "v bad" : "v warn", sub,
+      title: why("dropped 非零就是真的丢了：先看网卡卡里的各丢弃计数器，再看积压。") };
+  }
   if (sq >= 100) {
-    return { v: `squeeze ${sq.toFixed(0)}/s`, cls: "v bad", sub,
-      title: "NAPI 一轮的预算用完了还没收干净队列，内核在硬扛，收包线程必然被饿。"
-           + "这是积压涨起来时最该先看的一条" };
+    return { v: `有压力 ${sq.toFixed(0)}/s`, cls: "v warn", sub,
+      title: why("这里 squeeze 已上百但 dropped 仍为 0：压力大、还没丢，值得盯住积压。") };
   }
-  if (sq > 0) {
-    return { v: `squeeze ${sq.toFixed(0)}/s`, cls: "v warn", sub,
-      title: "偶发 NAPI 预算不足。健康运行时应为 0；持续非零说明管中断的那些核在过载" };
-  }
-  return { v: "0/s", cls: "v ok", sub,
-    title: `收包线程 CPU 分布（诊断用）：最慢 ${(slow.pct || 0).toFixed(1)}%、`
-         + `最快 ${(fast.pct || 0).toFixed(1)}%。这个差距健康时也有 40 个百分点，`
-         + `所以它区分不了好坏 —— 积压才是那个信号，这里用来查原因` };
+  return { v: `丢包 0/s · 压力 ${sq.toFixed(0)}/s`, cls: "v ok", sub,
+    title: why(`收包线程 CPU 分布（诊断用）：最慢 ${(slow.pct || 0).toFixed(1)}%、`
+             + `最快 ${(fast.pct || 0).toFixed(1)}%；这个差距健康时也有 40 个百分点，`
+             + `区分不了好坏，积压才是那个信号。`) };
 }
 
 function render(s) {
