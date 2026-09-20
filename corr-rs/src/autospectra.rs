@@ -91,8 +91,16 @@ pub(crate) struct Snapshot {
 /// The one published sample, and the geometry needed to reduce the next one.
 ///
 /// A slot, not a queue: a reader wants the newest row, and rows arrive once a
-/// second. The reduction runs on the pipeline thread (it already has the bytes)
-/// and costs a few milliseconds of it per row.
+/// second. The reduction runs on the pipeline thread (it already has the bytes).
+///
+/// **It is rate limited, and that is not a refinement.** The reduction reads
+/// every channel of every `j == k` baseline -- `n_station * n_freq` complex
+/// values -- so its cost is a fixed ~0.3 ms per *row*. Against a one-second
+/// integration that is 0.03% of the pipeline's time and nobody would ever notice;
+/// against a 40.96 us row it is seven times the row period, i.e. the status
+/// endpoint, not the correlator, decides how short a row may be. Since the only
+/// reader is a 1 Hz figure, publishing more often than the monitoring interval
+/// buys nothing and costs the row rate.
 pub(crate) struct Cell {
     slot: Mutex<Option<Arc<Snapshot>>>,
 
@@ -105,10 +113,18 @@ pub(crate) struct Cell {
     station_names: Vec<String>,
     step: usize,
     kept: usize,
+    /// Shortest gap between two publications, in ms. Never zero.
+    min_interval_ms: u64,
+    /// Wall clock of the last publication, so the expensive part can be skipped.
+    /// Only the pipeline thread publishes, so a relaxed load is enough.
+    last_publish_ms: std::sync::atomic::AtomicI64,
 }
 
 impl Cell {
-    pub(crate) fn new(plan: &RunPlan) -> Arc<Cell> {
+    /// `monitor_interval_ms` is the cadence the live line is printed at, which is
+    /// also the fastest anyone reads this figure. Zero (no live line) falls back
+    /// to one second, because the figure is still on the status endpoint.
+    pub(crate) fn new(plan: &RunPlan, monitor_interval_ms: u64) -> Arc<Cell> {
         let n_freq = plan.n_freq as usize;
         let step = (n_freq / POINTS).max(1);
         let kept = ((n_freq - SKIP_BINS) / step).max(1);
@@ -128,10 +144,16 @@ impl Cell {
             station_names: plan.enabled.iter().map(|s| s.name.clone()).collect(),
             step,
             kept,
+            // Zero means the live line is off, which says nothing about how often
+            // somebody reads the status endpoint: fall back to the 1 Hz the live
+            // line would have used rather than to "every row".
+            min_interval_ms: if monitor_interval_ms == 0 { 1000 } else { monitor_interval_ms },
+            last_publish_ms: std::sync::atomic::AtomicI64::new(i64::MIN / 2),
         })
     }
 
-    /// Reduce one row's spectrum to the dB curves and publish them.
+    /// Reduce one row's spectrum to the dB curves and publish them, unless the
+    /// previous publication is too recent to be worth another reduction.
     ///
     /// `spectrum` is one row as the writer takes it: `n_baseline` blocks of
     /// `n_freq` complex64, in `plan.baseline_pairs()` order.
@@ -142,6 +164,14 @@ impl Cell {
         row_ms: i64,
         now_unix_ms: i64,
     ) {
+        use std::sync::atomic::Ordering;
+        // Checked *before* the reduction, which is the whole point: the reduction
+        // is the cost, not the swap.
+        let last = self.last_publish_ms.load(Ordering::Relaxed);
+        if now_unix_ms.saturating_sub(last) < self.min_interval_ms as i64 {
+            return;
+        }
+        self.last_publish_ms.store(now_unix_ms, Ordering::Relaxed);
         // A short buffer means the geometry and the row disagree; that is a
         // writer-side bug, and not something to crash a running correlator over
         // from here.
@@ -321,7 +351,7 @@ mod tests {
     #[test]
     fn a_flat_row_is_a_flat_curve_per_station() {
         let plan = plan();
-        let cell = Cell::new(&plan);
+        let cell = Cell::new(&plan, 1);
         // 4x the amplitude on station 0 is 16x the power, i.e. 12.04 dB above the rest.
         let row = flat_row(&plan, |j| if j == 0 { 4.0 } else { 1.0 }, 1.0);
         let snap = cell.reduce(&row, 7, 1_700_000_000_000, 0).expect("reduced");
@@ -363,7 +393,7 @@ mod tests {
     #[test]
     fn the_dc_channel_is_excluded_from_the_curve_and_the_reference() {
         let plan = plan();
-        let cell = Cell::new(&plan);
+        let cell = Cell::new(&plan, 1);
         let row = flat_row(&plan, |_| 1.0, 1.0e3);
         let snap = cell.reduce(&row, 1, 0, 0).expect("reduced");
 
@@ -387,7 +417,7 @@ mod tests {
     #[test]
     fn a_short_row_is_refused_rather_than_indexed_out_of_bounds() {
         let plan = plan();
-        let cell = Cell::new(&plan);
+        let cell = Cell::new(&plan, 1);
         assert!(cell.reduce(&[0u8; 64], 0, 0, 0).is_none());
         assert!(cell.current().is_none());
     }

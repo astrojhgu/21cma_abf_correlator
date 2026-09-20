@@ -477,8 +477,11 @@ pub(crate) fn run_receive_with(
     // The autocorrelation curves of the newest row. Recorded as the row is written
     // (see `flush_rows`), never read back off the disk, and only when somebody could
     // actually read them: off by default, and nothing at all without the feature.
+    // Published no faster than the live line is printed -- the reduction reads every
+    // channel of every autocorrelation, which is a fixed cost *per row* and would
+    // otherwise set the shortest row the correlator can do.
     let autospec_cell = if cfg!(feature = "status-http") && cfg.monitoring.http.enabled {
-        Some(crate::autospectra::Cell::new(plan))
+        Some(crate::autospectra::Cell::new(plan, cfg.monitoring.interval_ms))
     } else {
         None
     };
@@ -518,6 +521,14 @@ pub(crate) fn run_receive_with(
         prev_lost: 0,
         prev_prog: 0,
         prev_zf: 0,
+        idle_polls: 0,
+        idle_ns: 0,
+        step_ns: 0,
+        ns_submit_arm: 0,
+        ns_close_arm: 0,
+        ns_row_end: 0,
+        ns_pending: 0,
+        flush_ns: [0; 3],
         t0: Instant::now(),
         elapsed: Duration::ZERO,
         monitor: crate::monitor::Monitor::new(cfg.monitoring.interval_ms, status_cell, plan),
@@ -586,6 +597,7 @@ pub(crate) fn run_receive_with(
                     fetch_buf,
                     writer.as_mut(),
                     autospec.as_deref(),
+                    &mut [0u64; 3],
                 )?;
             }
         }
@@ -655,6 +667,14 @@ pub(crate) fn run_receive_with(
         ring_blocks: ring.block_events(),
         ring_blocked: ring.blocked_now(),
         timeline: pipeline.timeline,
+        idle_polls: pipeline.idle_polls,
+        idle_ns: pipeline.idle_ns,
+        step_ns: pipeline.step_ns,
+        ns_submit_arm: pipeline.ns_submit_arm,
+        ns_close_arm: pipeline.ns_close_arm,
+        ns_row_end: pipeline.ns_row_end,
+        ns_pending: pipeline.ns_pending,
+        flush_ns: pipeline.flush_ns,
     })
 }
 
@@ -676,17 +696,34 @@ pub(crate) fn flush_rows(
     buf: &mut Vec<u8>,
     mut writer: Option<&mut Writer>,
     autospec: Option<&crate::autospectra::Cell>,
+    // `timing` is `[autospec, write_row, everything else]`, in ns: the row path is
+    // measured from the inside because this is where a short row's time goes, and
+    // none of it is inside a library call the device counters can see.
+    timing: &mut [u64; 3],
 ) -> Result<u32> {
+    let flush_t0 = std::time::Instant::now();
     corr.rows_wait().context("waiting for the rows")?;
     let need = corr.fetch_bytes()?;
-    if buf.len() < need {
-        buf.resize(need, 0);
-    }
-    let rows = corr.rows_fetch(&mut buf[..need])? as usize;
+    let row_bytes = corr.row_bytes()?;
+    // One row per fetch is the configuration short rows need, so it is worth not
+    // copying: fetch straight into the buffer the writer will write, and hand it
+    // over. A batch of several rows arrives contiguous in one buffer, so those
+    // still get split out; at rows_per_fetch > 1 that copy is a fraction of the
+    // fetch it rides on, and at rows_per_fetch == 1 it would be the whole cost.
+    let mut owned = match writer.as_deref_mut() {
+        Some(w) if need == row_bytes => Some(w.take_row_buffer(need)),
+        _ => None,
+    };
+    let rows = {
+        let target: &mut Vec<u8> = owned.as_mut().unwrap_or(buf);
+        if target.len() < need {
+            target.resize(need, 0);
+        }
+        corr.rows_fetch(&mut target[..need])? as usize
+    };
     if rows == 0 {
         return Ok(0);
     }
-    let row_bytes = corr.row_bytes()?;
 
     // The zero-fill figures are read once, after the rows are known to be done, so
     // every row in this batch is charged against the same snapshot. With
@@ -714,33 +751,48 @@ pub(crate) fn flush_rows(
             .get(i)
             .copied()
             .unwrap_or((0, crate::sched::system_ms()));
-        let spectrum = &buf[i * row_bytes..(i + 1) * row_bytes];
+        let off = i * row_bytes;
         // The autocorrelations of this row, taken while the bytes are in hand. The
         // alternative -- reading them back off the disk afterwards -- would hit the
         // same NFS this run is writing into, and they are 24 of the row's 300
         // baselines, so there is nothing to gain by storing them twice.
         if let Some(cell) = autospec {
-            cell.publish_row(
-                spectrum,
-                row_index,
-                open_ms,
-                crate::sched::system_ms(),
-            );
+            let t = std::time::Instant::now();
+            let spectrum = match owned.as_deref() {
+                Some(o) => &o[off..off + row_bytes],
+                None => &buf[off..off + row_bytes],
+            };
+            cell.publish_row(spectrum, row_index, open_ms, crate::sched::system_ms());
+            timing[0] += t.elapsed().as_nanos() as u64;
         }
-        if let Some(w) = writer.as_deref_mut() {
-            let valid: Vec<u64> = per_row
-                .iter()
-                .map(|z| (plan.n_cum as u64).saturating_sub(*z))
-                .collect();
-            let block = RowBlock {
-                row_index,
-                first_frame_id: row_index * plan.n_cum as u64,
-                n_cum: plan.n_cum,
-                valid_frames_per_station: valid,
+        let valid: Vec<u64> = per_row
+            .iter()
+            .map(|z| (plan.n_cum as u64).saturating_sub(*z))
+            .collect();
+        let block = RowBlock {
+            row_index,
+            first_frame_id: row_index * plan.n_cum as u64,
+            n_cum: plan.n_cum,
+            valid_frames_per_station: valid,
+        };
+        let t = std::time::Instant::now();
+        if rows == 1 && owned.is_some() {
+            // The row was fetched into the writer's own buffer, so this is a move.
+            let w = writer
+                .as_deref_mut()
+                .expect("a borrowed buffer implies a writer");
+            let o = owned.take().expect("checked just above");
+            w.write_row_owned(o, open_ms, &block)
+                .with_context(|| format!("writing row {row_index}"))?;
+        } else if let Some(w) = writer.as_deref_mut() {
+            let spectrum = match owned.as_deref() {
+                Some(o) => &o[off..off + row_bytes],
+                None => &buf[off..off + row_bytes],
             };
             w.write_row(spectrum, open_ms, &block)
                 .with_context(|| format!("writing row {row_index}"))?;
         }
+        timing[1] += t.elapsed().as_nanos() as u64;
     }
     for i in 0..rows {
         for (m, n) in zf_mark.iter_mut().zip(per_row.iter()) {
@@ -749,6 +801,8 @@ pub(crate) fn flush_rows(
         let _ = i;
     }
     pending_meta.drain(0..rows.min(pending_meta.len()));
+    let accounted = timing[0] + timing[1];
+    timing[2] += (flush_t0.elapsed().as_nanos() as u64).saturating_sub(accounted);
     Ok(rows as u32)
 }
 

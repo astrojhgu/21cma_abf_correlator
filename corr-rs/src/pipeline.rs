@@ -64,6 +64,25 @@ pub(crate) struct Pipeline<'a> {
     pub(crate) prev_lost: u64,
     pub(crate) prev_prog: u64,
     pub(crate) prev_zf: u64,
+    /// How many times the loop asked the scheduler for work and got nothing, and
+    /// what those polls cost. The device report says how long the *library* calls
+    /// took; whatever is left of the run is this loop, so when a row shorter than
+    /// a few milliseconds underperforms, this is where the missing time went --
+    /// each `Idle` costs a whole poll back-off.
+    pub(crate) idle_polls: u64,
+    pub(crate) idle_ns: u64,
+    /// Time inside `RowScheduler::step`, the loop's own deciding rather than
+    /// waiting. `step` walks every station to spot a stalled one, so it is the
+    /// one part of the loop whose cost grows with the station count.
+    pub(crate) step_ns: u64,
+    /// Per-arm wall clock, and the two library calls inside the row-closing arm
+    /// that the device counters do not cover.
+    pub(crate) ns_submit_arm: u64,
+    pub(crate) ns_close_arm: u64,
+    pub(crate) ns_row_end: u64,
+    pub(crate) ns_pending: u64,
+    /// Inside the row fetch: `[autospec, write_row, the rest of flush_rows]`, ns.
+    pub(crate) flush_ns: [u64; 3],
     pub(crate) t0: Instant,
     pub(crate) elapsed: Duration,
     /// Stop once the watermark has been lifted this long; `None` disables the check.
@@ -111,13 +130,17 @@ impl<'a> Pipeline<'a> {
                 });
                 break;
             }
-            match self.sched.step(Instant::now()) {
+            let step_t0 = Instant::now();
+            let action = self.sched.step(step_t0);
+            self.step_ns += step_t0.elapsed().as_nanos() as u64;
+            match action {
                 Action::Submit {
                     slot_seq,
                     frames,
                     row,
                 } => {
                     let _ = row;
+                    let arm_t0 = Instant::now();
                     // The first hand-over is what makes the staging the consumer's:
                     // from here on the self.ring may not move its window, because a copy
                     // may be in flight for any physical slot in it. Doing this before
@@ -161,17 +184,23 @@ impl<'a> Pipeline<'a> {
                             self.ring.release(slot_seq);
                         }
                     }
+                    self.ns_submit_arm += arm_t0.elapsed().as_nanos() as u64;
                 }
                 Action::CloseRow {
                     frames,
                     row,
                     open_ms,
                 } => {
+                    let arm_t0 = Instant::now();
                     match self.gpu.as_ref() {
                         Some(corr) => {
                             corr.row_end(frames).context("closing the row on the GPU")?;
+                            self.ns_row_end += arm_t0.elapsed().as_nanos() as u64;
+                            let pend_t0 = Instant::now();
+                            let pending = corr.rows_pending()?;
+                            self.ns_pending += pend_t0.elapsed().as_nanos() as u64;
                             self.pending_meta.push((row, open_ms));
-                            if corr.rows_pending()? >= self.plan.rows_per_fetch as i32 {
+                            if pending >= self.plan.rows_per_fetch as i32 {
                                 // A file set that cannot be opened for the new
                                 // local day stops the run *with a reason the report
                                 // carries*, like the zero-fill cap: propagating it
@@ -186,6 +215,7 @@ impl<'a> Pipeline<'a> {
                                     &mut self.fetch_buf,
                                     self.writer.as_mut(),
                                     self.autospec.as_deref(),
+                                    &mut self.flush_ns,
                                 ) {
                                     Ok(n) => n,
                                     Err(e) => {
@@ -214,6 +244,7 @@ impl<'a> Pipeline<'a> {
                             self.sched.note_row_fetched(1);
                         }
                     }
+                    self.ns_close_arm += arm_t0.elapsed().as_nanos() as u64;
                 }
                 Action::Idle => {
                     // One sample per second of what every station did, taken from the
@@ -221,6 +252,8 @@ impl<'a> Pipeline<'a> {
                     // can lose it steadily or in cascades, and the difference decides
                     // the fix, so the self.timeline is printed rather than guessed at.
                     let now = Instant::now();
+                    self.idle_polls += 1;
+                    let idle_t0 = now;
                     // A lifted watermark means a station is being left behind on purpose, and
                     // its frames are going into blocks.csv as missing. Unlike a socket backlog
                     // -- which drains once the machine quiets down -- this never clears itself,
@@ -327,11 +360,26 @@ impl<'a> Pipeline<'a> {
                             );
                         }
                     }
-                    std::thread::sleep(Duration::from_micros(200))
+                    std::thread::sleep(idle_backoff());
+                    self.idle_ns += idle_t0.elapsed().as_nanos() as u64;
                 }
             }
         }
         self.elapsed = self.t0.elapsed();
         Ok(())
     }
+}
+
+/// How long the loop backs off when the scheduler has nothing to do.
+///
+/// This was suspected of capping the row rate, on the theory that a poll landing
+/// one frame early would pay the whole back-off. Measured, it is not: at one
+/// frame per row (40.96 us) the loop polls and finds nothing 3 or 4 times in ten
+/// seconds, because a saturated pipeline is never idle, and spinning instead
+/// (0 us) made the run *slower* by burning a core the receive threads want. So
+/// the back-off stays, and it is a lag on an unsaturated loop rather than a cap
+/// on a busy one: with the row path taking ~700 us of library time per row, the
+/// loop only reaches this arm once rows are long enough for 200 us not to matter.
+pub(crate) fn idle_backoff() -> Duration {
+    Duration::from_micros(200)
 }

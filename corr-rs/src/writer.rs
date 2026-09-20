@@ -1323,11 +1323,11 @@ impl Writer {
     ///
     /// The length checks stay here rather than in the thread so a caller that
     /// passes the wrong shape is told immediately, on its own stack.
-    pub fn write_row(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
-        if spectrum.len() != self.row_bytes {
+    fn check_row(&mut self, len: usize, blocks: &RowBlock) -> Result<()> {
+        if len != self.row_bytes {
             bail!(
-                "write_row got {} bytes but one row is {} bytes",
-                spectrum.len(),
+                "write_row got {} bytes but one row is {}",
+                len,
                 self.row_bytes
             );
         }
@@ -1338,16 +1338,51 @@ impl Writer {
                 self.n_station
             );
         }
-        self.take_error()?;
+        self.take_error()
+    }
 
+    /// A buffer of exactly `need` bytes, reused from the pool when there is one.
+    ///
+    /// Exists so a caller can fetch a row *into* the buffer the writer is going to
+    /// write. With `rows_per_fetch == 1` that is what makes the hand-over a move
+    /// instead of a copy, and the copy is not optional overhead: one row of 24
+    /// stations at `n_freq = 16384` is 39 MB, so at a one-second integration it is
+    /// 39 MB/s and at a 40.96 us row it is 960 GB/s of `memcpy` -- more than the
+    /// machine's whole memory bandwidth, spent moving bytes nobody reads.
+    pub fn take_row_buffer(&mut self, need: usize) -> Vec<u8> {
         let mut buf = match self.pool.pop().or_else(|| self.rx_free.try_recv().ok()) {
-            Some(mut b) => {
-                b.clear();
-                b
-            }
-            None => Vec::with_capacity(self.row_bytes),
+            Some(b) => b,
+            None => Vec::with_capacity(need),
         };
-        buf.extend_from_slice(spectrum);
+        if buf.len() > need {
+            buf.truncate(need);
+        }
+        buf.resize(need, 0);
+        buf
+    }
+
+    pub fn write_row(&mut self, spectrum: &[u8], row_ms: i64, blocks: &RowBlock) -> Result<()> {
+        self.check_row(spectrum.len(), blocks)?;
+        let mut buf = self.take_row_buffer(spectrum.len());
+        buf.copy_from_slice(spectrum);
+        self.put_row(buf, row_ms, blocks)
+    }
+
+    /// Queue a buffer that already holds exactly one row, without copying it.
+    ///
+    /// The buffer becomes the writer's; the pool gives it back after the row is on
+    /// disk, so a run that keeps one row in flight allocates nothing per row.
+    pub fn write_row_owned(
+        &mut self,
+        buf: Vec<u8>,
+        row_ms: i64,
+        blocks: &RowBlock,
+    ) -> Result<()> {
+        self.check_row(buf.len(), blocks)?;
+        self.put_row(buf, row_ms, blocks)
+    }
+
+    fn put_row(&mut self, buf: Vec<u8>, row_ms: i64, blocks: &RowBlock) -> Result<()> {
         let row_index = blocks.row_index;
         let job = Job::Row {
             buf,

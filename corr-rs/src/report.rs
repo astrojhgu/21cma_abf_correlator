@@ -62,6 +62,21 @@ pub struct RunReport {
     /// Per second: (frames each station finalised, packets it lost, frames it had
     /// to zero fill). Sampled by the pipeline thread.
     pub timeline: Vec<(u64, u64, u64)>,
+    /// The pipeline loop's own time, as opposed to the library's: how many polls
+    /// found nothing to do (`idle_polls`), what they cost (`idle_ns`), and how
+    /// long the scheduler took to decide (`step_ns`). With millisecond rows
+    /// these three are what the row rate is made of.
+    pub idle_polls: u64,
+    pub idle_ns: u64,
+    pub step_ns: u64,
+    /// Per-arm wall clock of the two arms that do work, and the two library calls
+    /// inside the row-closing arm that the device counters do not time.
+    pub ns_submit_arm: u64,
+    pub ns_close_arm: u64,
+    pub ns_row_end: u64,
+    pub ns_pending: u64,
+    /// Inside `flush_rows`: `[autospec, write_row, the rest]`, ns.
+    pub flush_ns: [u64; 3],
 }
 
 /// One device's share, as the library reported it at the end of the run.
@@ -228,6 +243,34 @@ impl RunReport {
                 self.devices.iter().map(|d| d.ns_fetch).sum::<u64>() as f64 / 1e6 / 1e3,
             );
         }
+        // The loop's own time, which is not the library's. Printed whenever there
+        // were polls at all: at a one-second integration this is a rounding error,
+        // and at a millisecond one it is the row rate.
+        // What is left of the run once the library calls are accounted for. Read
+        // top down: a short row is limited by whichever of these is largest.
+        let rows = self.rows_closed.max(1) as f64;
+        let _ = writeln!(
+            s,
+            "  pipeline loop  : {:.1} s deciding, {:.1} s in {} idle poll(s), {} us back-off; \
+             arms submit {:.1} s / close {:.1} s ({:.0} us/row)",
+            self.step_ns as f64 / 1e9,
+            self.idle_ns as f64 / 1e9,
+            self.idle_polls,
+            crate::pipeline::idle_backoff().as_micros(),
+            self.ns_submit_arm as f64 / 1e9,
+            self.ns_close_arm as f64 / 1e9,
+            self.ns_close_arm as f64 / 1e3 / rows,
+        );
+        let _ = writeln!(
+            s,
+            "  row path       : autospec {:.1} s, write_row {:.1} s, rest of flush_rows {:.1} s \
+             (row_end {:.1} s, rows_pending {:.1} s)",
+            self.flush_ns[0] as f64 / 1e9,
+            self.flush_ns[1] as f64 / 1e9,
+            self.flush_ns[2] as f64 / 1e9,
+            self.ns_row_end as f64 / 1e9,
+            self.ns_pending as f64 / 1e9,
+        );
         for st in &self.stations {
             let name = plan
                 .enabled
