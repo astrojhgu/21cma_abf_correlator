@@ -24,11 +24,13 @@
 #   MODE=sync tools/run-24-nf16384.sh        # 对照腿：线程后端
 #   WORKERS=12 tools/run-24-nf16384.sh       # 收包 worker 数（异步腿）
 #   NEW_SET=1 tools/run-24-nf16384.sh        # 今天已有套时另起一套，不续写
-#     —— 这一个不是可选项，是**前端换了纪元之后必须做的那一步**：当天那一套的帧号
-#     是旧纪元的，续写时起点会被钉在旧帧号上（1.0e10），而前端重启后的流在 4e7，
-#     于是每个包都落在"起点之前"被丢弃，运行表现为一直 0 行。2026-09-20 实测：
-#     g05 上裸调本脚本每次都卡在这里。相关机会明确打印 STOPPED（原因见 stop.rs 的
-#     StreamNotAdvancing），不会静默空转；看到它就 NEW_SET=1 另起一套。
+#     —— 前端换了纪元（包计数器跳变或退回）时，现在**不需要人工介入**：相关机自己
+#     会重置观测状态并另起一套，日志里出现
+#       corr-async: resetting the observation and starting a new set (reset N of M)
+#     （默认最多 10 次，--max-epoch-restarts 可改；0 = 退回"停下等人"的旧行为）。
+#     它检测的是包号本身：单包向前超过 60 s 的帧数、或向后超过 2 s 的帧数（两者都
+#     远大于实测到的前端空洞 0.5–3 s，所以正常丢包不会误触发）。
+#     若日志里出现 STOPPED 且不是上面那条，那才是需要人看的情况。
 #   CHK_NIC=0 tools/run-24-nf16384.sh        # 跳过起跑前那 20 s 的网卡层静默检查
 #   DOCTOR=1 tools/run-24-nf16384.sh         # 起跑前先跑 tools/doctor.py（慢，但值得）
 #   TREND=1  tools/run-24-nf16384.sh         # 收尾再打一份逐行明细

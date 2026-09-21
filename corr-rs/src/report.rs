@@ -43,6 +43,9 @@ pub struct RunReport {
     /// `Some` when the run stopped because the front end stopped sending (see
     /// [`crate::stop::StopReason::StreamQuiet`]).
     pub stopped_stream_quiet: Option<String>,
+    /// `Some` when the run ended because the front end's packet numbering changed
+    /// epoch (see [`crate::stop::StopReason::CounterEpochChange`]).
+    pub stopped_epoch_change: Option<String>,
     /// Set when a receive thread hit an error the whole run had to answer -- see
     /// [`crate::assemble::AssembleError::is_fatal`]. The output is still complete
     /// rows; it just stops early and says why.
@@ -159,6 +162,9 @@ impl RunReport {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_stream_flat {
+            let _ = writeln!(s, "  STOPPED: {why}");
+        }
+        if let Some(why) = &self.stopped_epoch_change {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_stream_quiet {

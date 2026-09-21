@@ -165,6 +165,9 @@ pub(crate) struct RecvThreadArgs {
     pub(crate) validity_offset: usize,
     pub(crate) validity_bytes_per_slot: usize,
     pub(crate) start_frame: u64,
+    /// When a packet's frame number means the counter changed epoch. See
+    /// [`crate::assemble::EpochLimits`].
+    pub(crate) epoch_limits: crate::assemble::EpochLimits,
 }
 
 /// One station's receive loop: poll the socket, assemble frames into the staging
@@ -188,6 +191,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
         a.start_frame,
         a.validity_offset,
         a.validity_bytes_per_slot,
+        a.epoch_limits,
     );
     // Waiting for a staging slot is being alive, not being silent: the front end
     // is still sending and the packets are queueing in the socket.
@@ -265,6 +269,21 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                     if let Some((counter, payload)) = sock.packet(i) {
                         match asm.on_packet(counter, payload) {
                             Ok(()) => packets += 1,
+                            Err(e @ crate::assemble::AssembleError::CounterEpochChange {
+                                from,
+                                to,
+                                back,
+                            }) => {
+                                eprintln!("corr: station {}: {e}", a.idx);
+                                a.stop.stop(StopReason::CounterEpochChange {
+                                    station: a.idx,
+                                    from,
+                                    to,
+                                    back,
+                                });
+                                fatal_here = true;
+                                break;
+                            }
                             // Shutting down: stop parsing this batch and unwind.
                             Err(e) if e.is_fatal() => {
                                 if !matches!(e, crate::assemble::AssembleError::Aborted) {
@@ -389,6 +408,7 @@ impl ReceiveBackend for ThreadBackend {
                 validity_offset,
                 validity_bytes_per_slot,
                 start_frame,
+                epoch_limits: crate::run::epoch_limits(plan),
             };
             self.handles.push(std::thread::spawn(move || recv_thread(args)));
         }

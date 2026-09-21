@@ -561,6 +561,35 @@ pub struct AssembleStats {
     pub before_start_packets: u64,
 }
 
+/// How far a packet's frame number may depart from the highest one this station
+/// has already seen before the run calls it a new epoch rather than a gap.
+///
+/// Both limits are in frames and both come from the frame rate, not from a slot
+/// count, because what they bound is *time*: a socket buffer holds a fraction of a
+/// second of packets (0.64 s here), so a packet may legitimately arrive that far
+/// behind its neighbours and must not be mistaken for a restart.
+///
+/// `Default` is "never": detection is off unless a caller asks for it, which keeps
+/// the assembler's own tests describing the assembler rather than a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochLimits {
+    /// A single packet this many frames *ahead* of the highest frame seen means the
+    /// counter restarted forward. 60 s of frames by default, set by the caller.
+    pub jump_frames: u64,
+    /// A packet this far *behind* means the counter went back. Two seconds of
+    /// frames by default, which is three times the socket backlog.
+    pub back_frames: u64,
+}
+
+impl Default for EpochLimits {
+    fn default() -> Self {
+        EpochLimits {
+            jump_frames: u64::MAX,
+            back_frames: u64::MAX,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssembleError {
     /// The packet belongs to a frame the assembler cannot place: either far
@@ -577,6 +606,14 @@ pub enum AssembleError {
     /// that the frames in between cannot be declared missing without lapping the
     /// staging ring. See [`AssembleError::is_fatal`].
     StartupGap { gap: u64, window: u64 },
+    /// The packet's frame number is too far from the highest this station has seen
+    /// to be a gap: the front end's counter has changed epoch.
+    ///
+    /// `back` says which way -- a restarted counter sends numbers far below what has
+    /// been seen, a jumped one far above -- and the caller treats the two alike: the
+    /// observation is reset and the run starts again at whatever the stream is doing
+    /// now. The difference is only what the log says.
+    CounterEpochChange { from: u64, to: u64, back: bool },
     /// This station has fabricated more frames of silence than the configuration
     /// allows. See [`AssembleError::is_fatal`].
     ZeroFillCapExceeded { fabricated: u64, limit: u64 },
@@ -599,6 +636,7 @@ impl AssembleError {
             self,
             AssembleError::Aborted
                 | AssembleError::StartupGap { .. }
+                | AssembleError::CounterEpochChange { .. }
                 | AssembleError::ZeroFillCapExceeded { .. }
         )
     }
@@ -633,6 +671,16 @@ impl std::fmt::Display for AssembleError {
                  this run. If the front end's numbering has moved on, start a new set \
                  instead of continuing this one (--allow-second-set, or NEW_SET=1 for \
                  tools/run-24-nf16384.sh)"
+            ),
+            AssembleError::CounterEpochChange { from, to, back } => write!(
+                f,
+                "the packet numbering {}: this station had already seen frame {from} and this \
+                 packet is frame {to}. That is not a gap in the stream -- it is the front \
+                 end's counter starting a new epoch -- so the run resets its observation and \
+                 carries on from wherever the stream is now, instead of declaring {} frames \
+                 missing",
+                if *back { "went backwards" } else { "jumped forward" },
+                from.abs_diff(*to)
             ),
             AssembleError::ZeroFillCapExceeded { fabricated, limit } => write!(
                 f,
@@ -720,6 +768,14 @@ pub struct StationAssembler {
     /// The frame id the run started at, so earlier packets can be told apart from
     /// merely late ones.
     first_frame_id: u64,
+    /// Highest frame number this station has seen, whatever became of the packet.
+    /// The epoch test is against this, not against `progress`: a packet discarded as
+    /// late is still the evidence that the numbering moved.
+    highest_frame: u64,
+    /// When a frame number far from `highest_frame` means a new epoch rather than a
+    /// gap. See [`EpochLimits`].
+    epoch: EpochLimits,
+
     /// True once a packet has actually been written into the staging.
     ///
     /// The startup gap check only applies before that: once this station is
@@ -782,6 +838,7 @@ impl StationAssembler {
         first_frame_id: u64,
         validity_offset: usize,
         validity_bytes_per_slot: usize,
+        epoch: EpochLimits,
     ) -> Self {
         let slots = ring.slots();
         StationAssembler {
@@ -798,6 +855,8 @@ impl StationAssembler {
             granted: vec![u64::MAX; slots],
             progress: first_frame_id,
             first_frame_id,
+            highest_frame: first_frame_id,
+            epoch,
             placed_any: false,
             tracker: CounterTracker::new(),
             stats: AssembleStats::default(),
@@ -959,6 +1018,13 @@ impl StationAssembler {
         self.stats.lost_packets = self.tracker.lost_packets;
 
         let frame_id = self.fm.frame_id(counter);
+        // Before the tracker, the statistics and the placement: a packet from another
+        // epoch is not late, not a gap and not to be placed -- it means this run's
+        // observation is over, and everything it touches from here would be wrong.
+        if let Some(e) = self.epoch_check(frame_id) {
+            return Err(e);
+        }
+        self.highest_frame = self.highest_frame.max(frame_id);
 
         // Before the aligned start is the startup discard, not a fault.
         if frame_id < self.first_frame_id {
@@ -1065,6 +1131,31 @@ impl StationAssembler {
     #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
     // Unused only when `async-recv` is off (`--no-default-features`): it exists for
     // the readiness-driven backend, and the tests below exercise it either way.
+    /// Is this packet's frame number from the epoch this run is observing?
+    ///
+    /// Called before anything else touches state, so a rejected packet leaves the
+    /// tracker, the statistics and the liveness mark exactly as they were: the run is
+    /// about to be reset anyway, and a packet that is neither counted nor placed must
+    /// not look like either.
+    fn epoch_check(&self, frame_id: u64) -> Option<AssembleError> {
+        let hi = self.highest_frame;
+        if frame_id > hi.saturating_add(self.epoch.jump_frames) {
+            return Some(AssembleError::CounterEpochChange {
+                from: hi,
+                to: frame_id,
+                back: false,
+            });
+        }
+        if hi > frame_id.saturating_add(self.epoch.back_frames) {
+            return Some(AssembleError::CounterEpochChange {
+                from: hi,
+                to: frame_id,
+                back: true,
+            });
+        }
+        None
+    }
+
     /// Feed one packet without ever blocking on the staging ring.
     ///
     /// Byte for byte the same work as [`Self::on_packet`], with one difference:
@@ -1088,6 +1179,13 @@ impl StationAssembler {
             return Err(AssembleError::ShortPacket { len: payload.len() });
         }
         let frame_id = self.fm.frame_id(counter);
+        // Before the tracker, the statistics and the placement: a packet from another
+        // epoch is not late, not a gap and not to be placed -- it means this run's
+        // observation is over, and everything it touches from here would be wrong.
+        if let Some(e) = self.epoch_check(frame_id) {
+            return Err(e);
+        }
+        self.highest_frame = self.highest_frame.max(frame_id);
 
         // Whatever the counter skipped is declared final *before* the slot probe
         // below, exactly as `on_packet` does it. The order is not a detail: a packet
@@ -1272,6 +1370,7 @@ mod tests {
                 first_frame_id,
                 STATION_BYTES,
                 MASK_BYTES,
+                EpochLimits::default(),
             );
             Fixture {
                 buf,
@@ -1410,7 +1509,16 @@ mod tests {
         let ring = Arc::new(SlotRing::primed(SLOTS, 0));
         let base = buf.as_mut_ptr();
         let mut a = StationAssembler::new(
-            P, FPS, FRAME, FRAME * FPS as usize, ring, base, 0, samples, MASK_BYTES,
+            P,
+            FPS,
+            FRAME,
+            FRAME * FPS as usize,
+            ring,
+            base,
+            0,
+            samples,
+            MASK_BYTES,
+            EpochLimits::default(),
         );
         let payload = vec![7i8 as u8; SAMPLES_PER_PACKET as usize];
 
@@ -1455,7 +1563,18 @@ mod tests {
         use std::sync::Arc;
 
         let ring = Arc::new(SlotRing::primed(3, 0));
-        let mut a = StationAssembler::new(2, 4, 8, 32, ring, std::ptr::null_mut(), 0, 0, 0);
+        let mut a = StationAssembler::new(
+            2,
+            4,
+            8,
+            32,
+            ring,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            EpochLimits::default(),
+        );
         let prog = Arc::new(StationProgress::new(0));
         a.set_liveness(prog.clone());
         assert_eq!(prog.get(), 0, "nothing published before anything happened");
@@ -1825,6 +1944,50 @@ mod tests {
             !ring.is_free(2_500_000_000 + SLOTS as u64),
             "a primed ring must free exactly one lap, not more"
         );
+    }
+
+    #[test]
+    fn a_counter_that_restarts_is_an_epoch_change_and_not_a_gap() {
+        // The two departures from the run's numbering that a front end really
+        // produces: a restart (numbers go back), and a jump (numbers leap forward
+        // past anything a gap could be). Both have to be told apart from the
+        // legitimate ones -- a packet reordered within the socket buffer, and a
+        // stream that skipped a few frames -- because those are ordinary traffic and
+        // resetting the observation for them would throw away good rows.
+        let mut f = Fixture::new(1_000_000);
+        f.asm.epoch = EpochLimits {
+            jump_frames: 100_000,
+            back_frames: 20_000,
+        };
+        // The fixture feeds counters; a frame is `P` counters (`frame_id =
+        // counter / packets_per_frame`), so a frame offset is a counter offset
+        // times `P`.
+        let c = |frame: i64| -> u64 { (frame * P as i64) as u64 };
+        f.send(c(1_000_000));
+        // Within the backward limit: late, not a new epoch.
+        assert!(f.asm.on_packet(c(999_990), &Fixture::payload(1)).is_ok());
+        // Within the forward limit: a gap the assembler may declare missing.
+        assert!(f.asm.on_packet(c(1_010_000), &Fixture::payload(2)).is_ok());
+
+        let back = f.asm.on_packet(c(970_000), &Fixture::payload(3)).unwrap_err();
+        match back {
+            AssembleError::CounterEpochChange { from, to, back } => {
+                assert!(back, "the numbering went down");
+                assert_eq!(from, 1_010_000, "the highest frame seen, not the last one");
+                assert_eq!(to, 970_000);
+            }
+            other => panic!("expected an epoch change, got {other:?}"),
+        }
+        assert!(
+            back.is_fatal(),
+            "the run cannot keep observing this stream and must be reset"
+        );
+
+        let ahead = f.asm.on_packet(c(1_210_000), &Fixture::payload(4)).unwrap_err();
+        match ahead {
+            AssembleError::CounterEpochChange { back, .. } => assert!(!back, "it jumped forward"),
+            other => panic!("expected an epoch change, got {other:?}"),
+        }
     }
 
     #[test]

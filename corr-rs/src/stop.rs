@@ -95,6 +95,21 @@ pub enum StopReason {
         progress: u64,
         n_station: usize,
     },
+    /// A station saw a frame number that cannot belong to the epoch this run is
+    /// observing: the front end's counter restarted, or it jumped.
+    ///
+    /// The run ends here so it can be *started again* -- that is the whole point of
+    /// telling this apart from the other reasons. `corr-async` does that itself
+    /// (`--max-epoch-restarts`, ten by default) by resetting the observation: a new
+    /// sniff, a new start frame, a new staging window and a new set, exactly as if
+    /// the operator had restarted it, except that it takes a second and the row
+    /// files of the previous epoch stay where they are.
+    CounterEpochChange {
+        station: usize,
+        from: u64,
+        to: u64,
+        back: bool,
+    },
     /// A receive thread hit an error it could not fix.
     Fatal { station: usize, message: String },
     /// The output file set for a new local day could not be opened. The run stops
@@ -168,6 +183,22 @@ impl StopReason {
                  set's rows are complete up to the gap, and blocks.csv shows where it is. \
                  CORR_STREAM_QUIET_S changes how long a quiet front end is tolerated"
             ),
+            StopReason::CounterEpochChange {
+                station,
+                from,
+                to,
+                back,
+            } => format!(
+                "station index {station} saw the packet numbering {}: it had already seen frame \
+                 {from} and the next packet was frame {to} ({} frames apart). That is the \
+                 front end's counter starting a new epoch, not a gap, so this run's \
+                 observation of the stream is over: everything from here would be either \
+                 fabricated ({} frames of it) or discarded as before-the-start. The rows \
+                 written so far are complete and belong to the previous epoch",
+                if *back { "go backwards" } else { "jump forward" },
+                from.abs_diff(*to),
+                from.abs_diff(*to)
+            ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
             StopReason::RolloverFailed { prefix, detail } => format!(
                 "the output file set for the new local day ({prefix}) could not be opened: \
@@ -236,6 +267,15 @@ impl RunStop {
     pub fn stream_message(&self) -> Option<String> {
         match self.reason() {
             Some(r @ StopReason::StreamNotAdvancing { .. }) => Some(r.describe()),
+            _ => None,
+        }
+    }
+
+    /// The epoch change, on the same `STOPPED:` line as the rest. `corr-async`
+    /// reads this to decide whether to start again rather than to exit.
+    pub fn epoch_message(&self) -> Option<String> {
+        match self.reason() {
+            Some(r @ StopReason::CounterEpochChange { .. }) => Some(r.describe()),
             _ => None,
         }
     }

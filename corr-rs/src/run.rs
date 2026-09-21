@@ -97,6 +97,39 @@ pub(crate) fn pipeline_slots(plan: &RunPlan) -> usize {
     (plan.block_slots as usize).saturating_sub(lead).max(1)
 }
 
+/// When a packet's frame number means the front end's counter changed epoch
+/// rather than skipping a few frames.
+///
+/// Both bounds are times converted through the frame rate, because what they have
+/// to bracket is what a *legitimate* departure looks like:
+///
+/// * behind: a socket buffer holds `SO_RCVBUF` bytes, which at 24 stations is
+///   0.64 s worth of one station's packets, so a packet can arrive that far behind
+///   its neighbours and still be the same stream. Two seconds is three times that,
+///   and one row is the floor so a short-row configuration is not more twitchy than
+///   a long-row one.
+/// * ahead: a single packet more than 60 s of frames in front of the highest frame
+///   seen cannot be a gap -- the front end's own counters advance one packet at a
+///   time -- while the largest real gap measured on this front end is 3 s.
+///
+/// `CORR_EPOCH_JUMP_S` and `CORR_EPOCH_BACK_S` override the two, in seconds.
+pub(crate) fn epoch_limits(plan: &RunPlan) -> crate::assemble::EpochLimits {
+    let seconds = |name: &str, default: f64| -> f64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(default)
+    };
+    let rate = plan.frame_rate_hz.max(1.0);
+    let jump_s = seconds("CORR_EPOCH_JUMP_S", 60.0);
+    let back_s = seconds("CORR_EPOCH_BACK_S", 2.0);
+    crate::assemble::EpochLimits {
+        jump_frames: (jump_s * rate) as u64,
+        back_frames: ((back_s * rate) as u64).max(plan.n_cum as u64),
+    }
+}
+
 /// Align `frame` up to the next multiple of `n_cum`.
 pub fn align_up(frame: u64, n_cum: u64) -> u64 {
     if frame % n_cum == 0 {
@@ -660,6 +693,7 @@ pub(crate) fn run_receive_with(
         stopped_lift_exceeded: stop.lift_message(),
         stopped_stream_flat: stop.stream_message(),
         stopped_stream_quiet: stop.stream_quiet_message(),
+        stopped_epoch_change: stop.epoch_message(),
         stopped_fatal: fatal_stop,
         rows_written,
         output_dir: opts.output_dir.clone(),

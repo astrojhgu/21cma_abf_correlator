@@ -115,6 +115,9 @@ pub(crate) struct RunGeometry {
     /// Longest a station may sit in the reactor without servicing the scheduler's
     /// request. Comes from `receiver.recv_timeout_ms`.
     pub(crate) poll_interval: Duration,
+    /// When a packet's frame number means the counter changed epoch. See
+    /// [`crate::assemble::EpochLimits`].
+    pub(crate) epoch_limits: crate::assemble::EpochLimits,
 }
 
 /// One station, as handed to its task.
@@ -202,6 +205,7 @@ impl Station {
             g.start_frame,
             g.validity_offset,
             g.validity_bytes_per_slot,
+            g.epoch_limits,
         );
         // Waiting for a staging slot is being alive, not being silent -- the same
         // statement the thread path makes. Here the wait happens in this file's
@@ -312,6 +316,19 @@ impl Station {
                     Ok(FeedOutcome::SlotBusy { slot_seq }) => {
                         *parked_slot = Some(slot_seq);
                         outcome = Batch::SlotBusy;
+                        break;
+                    }
+                    Err(e @ AssembleError::CounterEpochChange { from, to, back }) => {
+                        // The run's observation is over; say so as itself, not as a
+                        // fatal error, because the caller can start again.
+                        eprintln!("corr-async: station {idx}: {e}");
+                        stop.stop(StopReason::CounterEpochChange {
+                            station: idx,
+                            from,
+                            to,
+                            back,
+                        });
+                        outcome = Batch::Fatal;
                         break;
                     }
                     Err(e) if e.is_fatal() => {

@@ -152,6 +152,7 @@ impl ReceiveBackend for AsyncBackend {
             start_frame,
             zero_fill_limit_frames: cfg.integration.zero_fill_limit_frames,
             poll_interval,
+            epoch_limits: crate::run::epoch_limits(plan),
         });
 
         // Deal the stations out, then hand each worker its own batch. The sockets

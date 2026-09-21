@@ -105,6 +105,14 @@ struct Cli {
     #[arg(long, value_name = "CPULIST")]
     worker_cpus: Option<String>,
 
+    /// How many times a run may reset itself and start again when the front end's
+    /// packet numbering changes epoch -- a counter that jumps far forward or goes
+    /// back. Each reset re-sniffs the stream, re-derives the start frame and opens
+    /// a *new* set, exactly as restarting by hand would, so the rows of the previous
+    /// epoch stay where they are. 0 stops the run instead.
+    #[arg(long, value_name = "N", default_value_t = 10)]
+    max_epoch_restarts: u32,
+
     /// Start a second file set for today even though one already exists.
     #[arg(long)]
     allow_second_set: bool,
@@ -150,14 +158,79 @@ fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let set_policy = if let Some(p) = cli.set.clone() {
+    let base_policy = if let Some(p) = cli.set.clone() {
         crate::writer::SetPolicy::Explicit(p)
     } else if cli.allow_second_set {
         crate::writer::SetPolicy::NewSet
     } else {
         crate::writer::SetPolicy::Auto
     };
-    execute(&cfg, &plan, &cli, set_policy)
+
+    // An epoch change is a reason to start over, not to stop: the operator asked
+    // for a correlator that keeps observing the sky, and a front end whose counters
+    // restart is a normal event here (it happened twice in one evening). Each reset
+    // re-sniffs, re-derives the start frame and opens a *new* set, which is exactly
+    // what restarting by hand did -- so the rows of the previous epoch stay in their
+    // own set and are still readable.
+    let total = cli.duration.map(Duration::from_secs_f64);
+    let started = std::time::Instant::now();
+    let mut restarts: u32 = 0;
+    loop {
+        let policy = if restarts == 0 {
+            base_policy.clone()
+        } else {
+            crate::writer::SetPolicy::NewSet
+        };
+        let remaining = match total {
+            None => None,
+            Some(t) => match t.checked_sub(started.elapsed()) {
+                Some(left) if left.as_secs() >= 5 => Some(left),
+                // Not enough of the operator's duration left to be worth another
+                // startup: report the reset and stop, rather than run longer than asked.
+                _ => {
+                    eprintln!(
+                        "corr-async: an epoch change arrived with less than 5s of the \
+                         requested duration left; stopping instead of starting again"
+                    );
+                    return Ok(ExitCode::from(3));
+                }
+            },
+        };
+        match execute(&cfg, &plan, &cli, policy, remaining)? {
+            Ending::Done(code) => return Ok(code),
+            Ending::EpochReset { why } => {
+                eprintln!("corr-async: {why}");
+                if restarts >= cli.max_epoch_restarts {
+                    eprintln!(
+                        "corr-async: {} epoch reset(s) already this session, which is as many \
+                         as --max-epoch-restarts allows; stopping. The rows so far are in the \
+                         sets the logs name, and every set that ended this way is complete up \
+                         to the change",
+                        cli.max_epoch_restarts
+                    );
+                    return Ok(ExitCode::from(3));
+                }
+                restarts += 1;
+                eprintln!(
+                    "corr-async: resetting the observation and starting a new set \
+                     (reset {restarts} of {})",
+                    cli.max_epoch_restarts
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// How one pass of `execute` ended.
+enum Ending {
+    /// The run finished: normal end, an operator's Ctrl-C, or a reason to stop.
+    Done(ExitCode),
+    /// The run ended because the front end's numbering changed epoch, or because
+    /// frames had stopped being placeable for the same reason. The caller resets
+    /// the observation and starts again, which is the point of separating this from
+    /// every other ending.
+    EpochReset { why: String },
 }
 
 fn execute(
@@ -165,7 +238,8 @@ fn execute(
     plan: &RunPlan,
     cli: &Cli,
     set_policy: crate::writer::SetPolicy,
-) -> Result<ExitCode> {
+    duration: Option<Duration>,
+) -> Result<Ending> {
     install_signal_handlers();
     run::require_interface(cfg)?;
 
@@ -179,7 +253,7 @@ fn execute(
     };
 
     let opts = RunOptions {
-        duration: cli.duration.map(Duration::from_secs_f64),
+        duration,
         wait_for_first_packet: Duration::from_secs_f64(
             cli.duration.unwrap_or(10.0).max(1.0) + 5.0,
         ),
@@ -229,7 +303,9 @@ fn execute(
         );
     }
 
-    let wait = Duration::from_secs_f64(cli.duration.unwrap_or(10.0).max(1.0) + 5.0);
+    let wait = Duration::from_secs_f64(
+        cli.duration.unwrap_or(10.0).max(1.0) + 5.0,
+    );
     println!("draining every station until all of them are seen (up to {wait:?})");
     let first = run::sniff_first_counters(&mut sockets, wait)?;
     for (i, c) in first.iter().enumerate() {
@@ -271,8 +347,19 @@ fn execute(
     if !report.ok() {
         bail!("the run reported truncated packets; the receive buffer is too small");
     }
+    // Before the fatal handling: these two endings are not failures, they are the
+    // signal to start again. `StreamNotAdvancing` is here because it is the same
+    // situation seen from the pipeline -- packets arriving that no frame can be
+    // built from -- and a reset fixes it the same way.
+    if let Some(why) = report
+        .stopped_epoch_change
+        .clone()
+        .or_else(|| report.stopped_stream_flat.clone())
+    {
+        return Ok(Ending::EpochReset { why });
+    }
     if let Some(why) = report.stopped_fatal.or(report.stopped_zero_fill_exceeded) {
         bail!("the run stopped early: {why}");
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(Ending::Done(ExitCode::SUCCESS))
 }
