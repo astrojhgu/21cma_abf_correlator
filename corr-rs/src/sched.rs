@@ -77,6 +77,16 @@ pub struct StationProgress {
     /// slow replay), so an arrival-time test is both finer grained and completely
     /// independent of the rate.
     last_packet_ns: AtomicU64,
+    /// Packets this station has taken off the socket, as a count.
+    ///
+    /// `last_packet_ns` cannot answer "is data arriving?" on its own: a thread
+    /// blocked on a full ring marks itself alive on purpose (see
+    /// `SlotRing::wait_free`), and so does a station answering the scheduler's
+    /// request while its stream is quiet. This counter only moves in one place --
+    /// where packets are actually read -- which is what the pipeline's watchdogs
+    /// need to tell "the front end stopped" from "the front end is sending frames
+    /// none of which can be placed".
+    packets: AtomicU64,
     /// Cumulative frames this station had to zero fill, published by the receive
     /// thread. The per-row figure is the difference across a row, which is what
     /// `blocks.csv` records.
@@ -102,6 +112,7 @@ impl StationProgress {
             progress: AtomicU64::new(first_frame_id),
             advance_to: AtomicU64::new(first_frame_id),
             last_packet_ns: AtomicU64::new(now_ns()),
+            packets: AtomicU64::new(0),
             zero_filled_frames: AtomicU64::new(0),
             lost_packets: AtomicU64::new(0),
             slot_wait_ns: AtomicU64::new(0),
@@ -138,6 +149,16 @@ impl StationProgress {
     /// Called by the receive thread after every non-empty batch.
     pub fn mark_packet(&self) {
         self.last_packet_ns.store(now_ns(), Ordering::Release);
+    }
+
+    /// Add the packets one receive batch carried.
+    pub fn add_packets(&self, n: u64) {
+        self.packets.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Packets this station has read. Only ever increases.
+    pub fn packets(&self) -> u64 {
+        self.packets.load(Ordering::Relaxed)
     }
 
     /// Nanoseconds since the last packet arrived, as of `now_ns`.
@@ -557,6 +578,12 @@ impl RowScheduler {
     }
 
     /// This station's published progress.
+    /// Packets station `i` has read off its socket. For the watchdogs that have
+    /// to tell a quiet front end from frames that cannot be placed.
+    pub fn packets_of(&self, i: usize) -> u64 {
+        self.progress[i].packets()
+    }
+
     pub fn progress_of(&self, i: usize) -> u64 {
         self.progress[i].get()
     }

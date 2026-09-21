@@ -40,6 +40,9 @@ pub struct RunReport {
     /// `Some` when the run stopped because the front end's frame numbering and the
     /// run's own had come apart (see [`crate::stop::StopReason::StreamNotAdvancing`]).
     pub stopped_stream_flat: Option<String>,
+    /// `Some` when the run stopped because the front end stopped sending (see
+    /// [`crate::stop::StopReason::StreamQuiet`]).
+    pub stopped_stream_quiet: Option<String>,
     /// Set when a receive thread hit an error the whole run had to answer -- see
     /// [`crate::assemble::AssembleError::is_fatal`]. The output is still complete
     /// rows; it just stops early and says why.
@@ -156,6 +159,9 @@ impl RunReport {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_stream_flat {
+            let _ = writeln!(s, "  STOPPED: {why}");
+        }
+        if let Some(why) = &self.stopped_stream_quiet {
             let _ = writeln!(s, "  STOPPED: {why}");
         }
         if let Some(why) = &self.stopped_fatal {

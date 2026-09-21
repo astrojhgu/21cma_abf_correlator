@@ -72,9 +72,27 @@ pub enum StopReason {
         /// The frame every station's finalized progress is stuck at.
         progress: u64,
         seconds: u64,
-        /// Stations still receiving packets, and the total, so the message can say
-        /// whether the front end went quiet instead.
-        live: usize,
+        n_station: usize,
+    },
+    /// No station has taken a packet off its socket for `seconds`.
+    ///
+    /// The front end stopped, or the path to it did. Distinct from
+    /// [`StopReason::StreamNotAdvancing`], which is the opposite situation --
+    /// packets arriving that cannot be placed -- and the reason the two have to be
+    /// told apart is on the record: on the night of 2026-09-20/21 a front end that
+    /// went quiet for the rest of the night was reported as a frame-numbering
+    /// mismatch, and a run that had produced 16404 good rows was stopped with a
+    /// paragraph about the wrong cause.
+    ///
+    /// Stopping here is a choice, not a necessity: left alone the run would wait
+    /// for the front end and, if it did not come back, spend its whole zero-fill
+    /// budget writing rows in which every frame is fabricated (marked as such in
+    /// blocks.csv, which is what that budget is for). Seconds-scale gaps are
+    /// absorbed without this firing at all.
+    StreamQuiet {
+        seconds: u64,
+        start_frame: u64,
+        progress: u64,
         n_station: usize,
     },
     /// A receive thread hit an error it could not fix.
@@ -119,20 +137,36 @@ impl StopReason {
                 start_frame,
                 progress,
                 seconds,
-                live,
                 n_station,
             } => format!(
-                "the run's frame numbering has not advanced for {seconds}s while {live} of \
-                 {n_station} stations are still receiving: the rows are numbered from frame \
+                "the run's frame numbering has not advanced for {seconds}s while packets are \
+                 still arriving at all {n_station} stations: the rows are numbered from frame \
                  {start_frame} and every station is stuck at {progress}. Packets that arrive \
                  below the start frame, or behind a frame already finalized, are dropped \
                  without being counted as lost or zero filled -- so a run in this state reads \
-                 its sockets, loses nothing on paper and writes no rows. The usual cause is \
-                 the front end's counter restarting (a new epoch) part way through, or a \
-                 resume of the day's set at a frame the stream will never reach again. Start \
-                 a new set (--allow-second-set, or NEW_SET=1 for tools/run-24-nf16384.sh) \
-                 after checking the front end, and keep this set's rows: they stop at the \
-                 epoch change"
+                 its sockets, loses nothing on paper and writes no rows. Packets are arriving \
+                 and being discarded, which is what rules out a quiet front end (that is \
+                 reported as StreamQuiet instead). The usual cause is the front end's counter \
+                 restarting (a new epoch) part way through, or a resume of the day's set at a \
+                 frame the stream will never reach again. Start a new set \
+                 (--allow-second-set, or NEW_SET=1 for tools/run-24-nf16384.sh) after \
+                 checking the front end, and keep this set's rows: they stop at the epoch \
+                 change"
+            ),
+            StopReason::StreamQuiet {
+                seconds,
+                start_frame,
+                progress,
+                n_station,
+            } => format!(
+                "no packet has arrived at any of the {n_station} stations for {seconds}s: the \
+                 front end stopped, or the path to it did (the run's rows are numbered from \
+                 frame {start_frame} and every station is parked at {progress}, waiting). \
+                 Stopping rather than waiting it out, because a front end that does not come \
+                 back would otherwise spend the whole zero-fill budget on rows where every \
+                 frame is fabricated. Check the front end, then start the run again: this \
+                 set's rows are complete up to the gap, and blocks.csv shows where it is. \
+                 CORR_STREAM_QUIET_S changes how long a quiet front end is tolerated"
             ),
             StopReason::Fatal { station, message } => format!("station {station}: {message}"),
             StopReason::RolloverFailed { prefix, detail } => format!(
@@ -202,6 +236,14 @@ impl RunStop {
     pub fn stream_message(&self) -> Option<String> {
         match self.reason() {
             Some(r @ StopReason::StreamNotAdvancing { .. }) => Some(r.describe()),
+            _ => None,
+        }
+    }
+
+    /// The front end going quiet, on the same `STOPPED:` line as the rest.
+    pub fn stream_quiet_message(&self) -> Option<String> {
+        match self.reason() {
+            Some(r @ StopReason::StreamQuiet { .. }) => Some(r.describe()),
             _ => None,
         }
     }

@@ -259,6 +259,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                 }
                 batches += 1;
                 a.prog.mark_packet();
+                a.prog.add_packets(n as u64);
                 let mut fatal_here = false;
                 for i in 0..n {
                     if let Some((counter, payload)) = sock.packet(i) {

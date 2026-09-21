@@ -498,6 +498,7 @@ impl Station {
             self.batches += 1;
             self.dbg.batches += 1;
             self.prog.mark_packet();
+            self.prog.add_packets(n as u64);
             self.have = n;
             self.next = 0;
         }

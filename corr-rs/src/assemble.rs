@@ -623,11 +623,16 @@ impl std::fmt::Display for AssembleError {
                  started at, and the staging ring only holds {window} frames, so zero \
                  filling the difference would overwrite the very frames it is filling \
                  (the range laps the ring, and the GPU would read whichever write \
-                 landed in a slot last). The run did not start on time: the sockets \
-                 filled up before the receive threads were draining them. Nothing has \
-                 been written for this run; start it again, and check what delayed the \
-                 first packet -- a slow output directory, a loaded machine, or a \
-                 station whose stream begins later than the others"
+                 landed in a slot last). Either the run did not start on time -- the \
+                 sockets filled up before the receive threads were draining them, which \
+                 points at a slow output directory, a loaded machine, or a station whose \
+                 stream begins later than the others -- or the run is continuing a set \
+                 whose frame numbering is no longer the stream's: the front end's counter \
+                 restarted (a new epoch), or it was off long enough that the frame the set \
+                 continues at has passed out of the ring. Nothing has been written for \
+                 this run. If the front end's numbering has moved on, start a new set \
+                 instead of continuing this one (--allow-second-set, or NEW_SET=1 for \
+                 tools/run-24-nf16384.sh)"
             ),
             AssembleError::ZeroFillCapExceeded { fabricated, limit } => write!(
                 f,

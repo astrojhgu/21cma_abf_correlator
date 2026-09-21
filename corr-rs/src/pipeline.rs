@@ -67,6 +67,12 @@ pub(crate) struct Pipeline<'a> {
     /// progress at all, while every station was still receiving. See
     /// [`StopReason::StreamNotAdvancing`].
     pub(crate) flat_seconds: u64,
+    /// Consecutive one-second samples in which no station read a single packet:
+    /// the front end, or the path to it, has stopped. See
+    /// [`StopReason::StreamQuiet`].
+    pub(crate) quiet_seconds: u64,
+    /// Packets read across all stations at the previous sample.
+    pub(crate) prev_packets: u64,
     pub(crate) prev_zf: u64,
     /// How many times the loop asked the scheduler for work and got nothing, and
     /// what those polls cost. The device report says how long the *library* calls
@@ -325,40 +331,63 @@ impl<'a> Pipeline<'a> {
                             self.timeline.push((d_prog / self.n_station as u64, d_lost / self.n_station as u64, d_zf / self.n_station as u64));
                         }
 
-                        // Watchdog for the one failure that leaves no trace anywhere
-                        // else: the front end keeps sending, every packet is dropped
-                        // for arriving before the run's start frame or behind an
-                        // already-finalized frame, and the run writes nothing while
-                        // reporting zero loss. See StopReason::StreamNotAdvancing for
-                        // the two ways this happened for real.
+                        // Two watchdogs for the failures that leave no trace anywhere
+                        // else, told apart by the one signal that cannot lie: how many
+                        // packets the stations actually took off their sockets.
                         //
-                        // The test is *consecutive* seconds with no progress at all,
-                        // which is what keeps it rate independent: a replay slow
-                        // enough to matter here (0.6 frames/s) still advances several
-                        // frames inside the window, so this cannot fire on a slow
-                        // front end -- only on one whose frame numbering will never
-                        // reach the run's.
-                        let live = (0..self.n_station)
-                            .filter(|i| self.sched.silence_ms(*i, now) < 500)
-                            .count();
-                        if !first && d_prog == 0 && live == self.n_station {
-                            self.flat_seconds += 1;
-                            if self.flat_seconds >= stream_flat_limit_s() {
-                                self.stop.stop(StopReason::StreamNotAdvancing {
-                                    start_frame: self.sched.row_start_frame(),
-                                    progress: self.sched.progress_of(0).min(
-                                        (0..self.n_station)
+                        // `last_packet_ns` cannot be used for this -- a thread blocked
+                        // on a full ring marks itself alive on purpose, which is right
+                        // for the stall detector and useless here. Measured the hard
+                        // way: a front end that went quiet for the night was reported
+                        // as a frame-numbering mismatch, because "silent" looked the
+                        // same as "busy".
+                        let mut packets = 0u64;
+                        for i in 0..self.n_station {
+                            packets += self.sched.packets_of(i);
+                        }
+                        let d_packets = if first { 0 } else { packets.saturating_sub(self.prev_packets) };
+                        self.prev_packets = packets;
+
+                        if !first && d_prog == 0 {
+                            if d_packets > 0 {
+                                // Packets arriving, no frame placeable: they are all
+                                // landing before the run's start frame or behind a frame
+                                // already finalized. See StreamNotAdvancing for the two
+                                // ways this happened for real. Consecutive zero-progress
+                                // samples keep it rate independent -- a deliberately slow
+                                // replay still advances several frames inside the window.
+                                self.flat_seconds += 1;
+                                self.quiet_seconds = 0;
+                                if self.flat_seconds >= stream_flat_limit_s() {
+                                    self.stop.stop(StopReason::StreamNotAdvancing {
+                                        start_frame: self.sched.row_start_frame(),
+                                        progress: (0..self.n_station)
                                             .map(|i| self.sched.progress_of(i))
                                             .min()
                                             .unwrap_or(0),
-                                    ),
-                                    seconds: self.flat_seconds,
-                                    live,
-                                    n_station: self.n_station,
-                                });
+                                        seconds: self.flat_seconds,
+                                        n_station: self.n_station,
+                                    });
+                                }
+                            } else {
+                                // Not one packet at any station: the front end stopped.
+                                self.flat_seconds = 0;
+                                self.quiet_seconds += 1;
+                                if self.quiet_seconds >= stream_quiet_limit_s() {
+                                    self.stop.stop(StopReason::StreamQuiet {
+                                        seconds: self.quiet_seconds,
+                                        start_frame: self.sched.row_start_frame(),
+                                        progress: (0..self.n_station)
+                                            .map(|i| self.sched.progress_of(i))
+                                            .min()
+                                            .unwrap_or(0),
+                                        n_station: self.n_station,
+                                    });
+                                }
                             }
                         } else {
                             self.flat_seconds = 0;
+                            self.quiet_seconds = 0;
                         }
                     }
                     if std::env::var_os("CORR_PIPE_DEBUG").is_some() {
@@ -417,6 +446,18 @@ impl<'a> Pipeline<'a> {
 ///
 /// `CORR_STREAM_FLAT_S` overrides it, for a front end slow enough to advance less
 /// than one frame per sample on purpose.
+/// How long every station may go without reading a single packet before the run
+/// stops. A front end that is coming back within seconds or a minute is common;
+/// one that is not would otherwise cost the whole zero-fill budget in rows where
+/// every frame is fabricated. `CORR_STREAM_QUIET_S` overrides it.
+fn stream_quiet_limit_s() -> u64 {
+    std::env::var("CORR_STREAM_QUIET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v >= 5)
+        .unwrap_or(60)
+}
+
 fn stream_flat_limit_s() -> u64 {
     std::env::var("CORR_STREAM_FLAT_S")
         .ok()
