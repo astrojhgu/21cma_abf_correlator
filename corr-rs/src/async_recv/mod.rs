@@ -172,6 +172,11 @@ fn run() -> Result<ExitCode> {
     // re-sniffs, re-derives the start frame and opens a *new* set, which is exactly
     // what restarting by hand did -- so the rows of the previous epoch stay in their
     // own set and are still readable.
+    // Bound once for the process, before the first pass: a reset installs its new
+    // cells into this server rather than binding the address a second time (which
+    // fails, and left a monitor reading the previous epoch's last snapshot).
+    let status = crate::status::bind(&cfg.monitoring.http);
+
     let total = cli.duration.map(Duration::from_secs_f64);
     let started = std::time::Instant::now();
     let mut restarts: u32 = 0;
@@ -196,7 +201,7 @@ fn run() -> Result<ExitCode> {
                 }
             },
         };
-        match execute(&cfg, &plan, &cli, policy, remaining)? {
+        match execute(&cfg, &plan, &cli, policy, remaining, status.as_ref())? {
             Ending::Done(code) => return Ok(code),
             Ending::EpochReset { why } => {
                 eprintln!("corr-async: {why}");
@@ -239,6 +244,7 @@ fn execute(
     cli: &Cli,
     set_policy: crate::writer::SetPolicy,
     duration: Option<Duration>,
+    status: Option<&crate::status::Server>,
 ) -> Result<Ending> {
     install_signal_handlers();
     run::require_interface(cfg)?;
@@ -342,6 +348,7 @@ fn execute(
         prepared,
         stop,
         Box::new(backend),
+        status,
     )?;
     print!("{}", report.render(plan));
     if !report.ok() {

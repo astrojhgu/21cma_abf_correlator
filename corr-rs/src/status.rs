@@ -39,29 +39,68 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A request line longer than this is not a request we answer.
 const MAX_REQUEST_BYTES: usize = 2048;
 
-/// Start serving, if the configuration asks for it.
+/// What the endpoint is serving *right now*.
 ///
-/// Called once at startup from the thread that is about to run the pipeline.
-/// Returns whether a server is now running. `cell` is `None` when the endpoint is
-/// off, and then this does nothing at all.
-pub(crate) fn serve(
-    cfg: &HttpCfg,
-    cell: Option<Arc<Cell>>,
-    autospec: Option<Arc<AutospectraCell>>,
-) -> bool {
-    if !cfg.enabled {
-        return false;
+/// One per process, not one per run. The epoch-reset loop starts a second run
+/// without the process ever exiting, and the second `bind` on the same address
+/// fails -- which is exactly what a monitor saw as a page frozen at the last
+/// snapshot of the previous epoch while the run behind it was writing rows into a
+/// new set. The serving thread outlives the pass that started it, so a pass
+/// *installs* its cells here instead of owning the socket.
+#[derive(Default)]
+pub(crate) struct Slot {
+    cell: std::sync::Mutex<Option<Arc<Cell>>>,
+    autospec: std::sync::Mutex<Option<Arc<AutospectraCell>>>,
+}
+
+impl Slot {
+    /// Publish this pass's cells as the ones being served.
+    pub(crate) fn install(&self, cell: Arc<Cell>, autospec: Option<Arc<AutospectraCell>>) {
+        if let Ok(mut slot) = self.cell.lock() {
+            *slot = Some(cell);
+        }
+        if let Ok(mut slot) = self.autospec.lock() {
+            *slot = autospec;
+        }
     }
-    let Some(cell) = cell else {
-        // The caller builds a cell whenever the endpoint is on, so reaching here
-        // means the two disagree -- a bug worth saying out loud rather than
-        // serving a page that never updates.
-        eprintln!(
-            "status     : monitoring.http.enabled is set but no status cell was created; \
-             not serving"
-        );
-        return false;
-    };
+
+    fn cell(&self) -> Option<Arc<Cell>> {
+        self.cell.lock().ok().and_then(|c| c.clone())
+    }
+
+    fn autospec(&self) -> Option<Arc<AutospectraCell>> {
+        self.autospec.lock().ok().and_then(|c| c.clone())
+    }
+}
+
+/// A bound endpoint: the address it is serving on, and the slot a pass installs
+/// its cells into. Dropping it does not close the port -- the serving thread owns
+/// the listener for the life of the process, deliberately, so a reset cannot lose
+/// the endpoint to a bind race.
+pub(crate) struct Server {
+    slot: Arc<Slot>,
+    addr: String,
+}
+
+impl Server {
+    pub(crate) fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    pub(crate) fn install(&self, cell: Arc<Cell>, autospec: Option<Arc<AutospectraCell>>) {
+        self.slot.install(cell, autospec);
+    }
+}
+
+/// Bind the endpoint once for the whole process, if the configuration asks for it.
+///
+/// Returns `None` when the endpoint is off, or when the bind failed -- a failed
+/// bind is a warning and a run that carries on, because receiving is the point and
+/// monitoring is not.
+pub(crate) fn bind(cfg: &HttpCfg) -> Option<Server> {
+    if !cfg.enabled {
+        return None;
+    }
     let listener = match TcpListener::bind(&cfg.bind) {
         Ok(listener) => listener,
         Err(e) => {
@@ -70,26 +109,27 @@ pub(crate) fn serve(
                  endpoint",
                 cfg.bind
             );
-            return false;
+            return None;
         }
     };
     let addr = listener
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| cfg.bind.clone());
-    match spawn(listener, cell, autospec) {
+    let slot = Arc::new(Slot::default());
+    match spawn(listener, slot.clone()) {
         Ok(_thread) => {
             eprintln!(
                 "status     : http://{addr}/status.json and /autospectra.json \
                  (schema {SCHEMA}, read-only)"
             );
-            true
+            Some(Server { slot, addr })
         }
         Err(e) => {
             eprintln!(
                 "status     : cannot spawn the serving thread: {e}; the run continues without it"
             );
-            false
+            None
         }
     }
 }
@@ -150,7 +190,7 @@ fn autospec_body(cell: Option<&AutospectraCell>) -> Vec<u8> {
 /// Serial, deliberately: a monitor polls once a second, and a second reader
 /// waiting a few milliseconds behind the first is a smaller problem than the
 /// bookkeeping a thread pool would add to a process whose job is receiving.
-fn handle(mut stream: TcpStream, cell: &Cell, autospec: Option<&AutospectraCell>) {
+fn handle(mut stream: TcpStream, slot: &Slot) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
 
@@ -164,9 +204,13 @@ fn handle(mut stream: TcpStream, cell: &Cell, autospec: Option<&AutospectraCell>
     let target = parts.next().unwrap_or("");
     let path = target.split('?').next().unwrap_or("");
 
+    let cell = slot.cell();
+    let autospec = slot.autospec();
     let (status, body) = match (method, path) {
-        ("GET", "/status.json") => ("200 OK", body(cell)),
-        ("GET", "/autospectra.json") => ("200 OK", autospec_body(autospec)),
+        ("GET", "/status.json") => ("200 OK", cell.as_deref().map(body).unwrap_or_else(not_ready)),
+        ("GET", "/autospectra.json") => {
+            ("200 OK", autospec_body(autospec.as_deref()))
+        }
         // `/` lists what exists, so a human who guessed the address is told where
         // to look instead of getting a bare 404. Still JSON: this endpoint never
         // serves HTML.
@@ -203,17 +247,13 @@ fn handle(mut stream: TcpStream, cell: &Cell, autospec: Option<&AutospectraCell>
 }
 
 /// The serving thread. Detached on purpose: it ends when the process does.
-fn spawn(
-    listener: TcpListener,
-    cell: Arc<Cell>,
-    autospec: Option<Arc<AutospectraCell>>,
-) -> std::io::Result<JoinHandle<()>> {
+fn spawn(listener: TcpListener, slot: Arc<Slot>) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("corr-status".to_string())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
-                    Ok(stream) => handle(stream, &cell, autospec.as_deref()),
+                    Ok(stream) => handle(stream, &slot),
                     // A failed accept is a per-connection condition (a descriptor
                     // limit, a connection reset between SYN and accept). The short
                     // sleep keeps a persistent one from spinning this thread.
@@ -245,8 +285,10 @@ mod tests {
     fn serving(cell: Arc<Cell>) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let slot = Arc::new(Slot::default());
+        slot.install(cell, None);
         // Dropped handle: the thread is detached and dies with the test process.
-        drop(spawn(listener, cell, None).expect("spawn"));
+        drop(spawn(listener, slot).expect("spawn"));
         addr
     }
 

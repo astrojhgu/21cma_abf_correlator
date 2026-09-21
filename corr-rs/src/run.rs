@@ -335,6 +335,9 @@ pub fn run_receive(
     prepared: PreparedOutput,
     stop: Arc<RunStop>,
 ) -> Result<RunReport> {
+    // The thread-per-station binary has no reset loop, so a bind per run *is* a bind
+    // per process there; `bind` is a no-op when the endpoint is off.
+    let status = crate::status::bind(&cfg.monitoring.http);
     run_receive_with(
         cfg,
         plan,
@@ -344,6 +347,7 @@ pub fn run_receive(
         prepared,
         stop,
         Box::new(ThreadBackend::new()),
+        status.as_ref(),
     )
 }
 
@@ -355,6 +359,7 @@ pub fn run_receive(
 /// through the same call the thread-per-station binary uses, so a difference
 /// between two runs is a difference in the receiver and in nothing else.
 #[allow(clippy::too_many_arguments)] // plan + sockets + counters + options + prepared + stop + backend
+#[allow(clippy::too_many_arguments)] // the argument list is the run's whole state
 pub(crate) fn run_receive_with(
     cfg: &Config,
     plan: &RunPlan,
@@ -364,6 +369,7 @@ pub(crate) fn run_receive_with(
     prepared: PreparedOutput,
     stop: Arc<RunStop>,
     mut backend: Box<dyn ReceiveBackend>,
+    status: Option<&crate::status::Server>,
 ) -> Result<RunReport> {
     let n_station = plan.n_station;
     if sockets.len() != n_station || first_counters.len() != n_station {
@@ -522,12 +528,16 @@ pub(crate) fn run_receive_with(
     // default; `--no-default-features` keeps it out of the build entirely). A bind
     // that fails is a warning and a run that carries on: receiving is the point,
     // monitoring is not.
+    // The endpoint itself is bound once per process, by the binary, and outlives
+    // this run: a reset installs its new cells into the same server instead of
+    // trying to bind the address again (which fails, and used to leave a monitor
+    // reading the previous epoch's last snapshot).
     #[cfg(feature = "status-http")]
-    let _ = crate::status::serve(
-        &cfg.monitoring.http,
-        status_cell.clone(),
-        autospec_cell.clone(),
-    );
+    if let (Some(server), Some(cell)) = (status, status_cell.clone()) {
+        server.install(cell, autospec_cell.clone());
+    }
+    #[cfg(not(feature = "status-http"))]
+    let _ = (status_cell, autospec_cell);
 
     // Everything the loop owns lives in `Pipeline`; naming it here, once, is the
     // whole of what this function has to know about the loop's state.
