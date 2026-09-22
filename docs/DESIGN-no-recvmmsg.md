@@ -7,10 +7,15 @@
 这个分解是本文档的主要产出，因为它决定了重构该往哪里下手：把 `recvmmsg` 删掉只解决
 1/5 的问题，真正可疑的是收包循环每轮那 7 次原子写。
 
-**另一个结论同样重要，而且方向相反**：以上只对**同步（线程）后端**成立。异步后端
-（`corr-async`，生产默认）照搬"每个 reactor 就绪事件收一个包"**会丢数据**——6 轮里有 2 轮
-丢了 32.6 万 / 70.7 万个包。要用异步 + 逐包 `recvfrom`，必须先让就绪分支读到 `WouldBlock`
-为止。详见 §5.2。
+**另一个结论同样重要**：以上只对**同步（线程）后端**成立。异步后端（`corr-async`，生产默认）
+照搬"每个 reactor 就绪事件收一个包"**会丢数据**——6 轮里有 3 轮丢了包，最多 77 万个。它已经
+被修好（§5.3：交给 `tokio` 持有 socket，并把一次就绪读干），但修完仍比同步贵约 0.27 个核；
+而那 0.27 个核不是可以忽略的小数，因为：
+
+**最硬的一条**：丢包的真正来源是**网卡自己的 `rx_out_of_buffer`**，它随收包路径的 CPU 开销
+而出现。同轮内 `base` 0 / `drain` 12,458 / `port` 705,001 的对比是轮转设计给出的因果证据。
+**收包路径每多烧一点 CPU，都可能以网卡丢包的形式付出代价**——这比"多占一个核"严重得多。详见
+§5.3 与 §6 第 7 条。
 
 ---
 
@@ -192,7 +197,7 @@ socket 上保留第二个入口 `recv_one_nowait(&mut self) -> io::Result<()>`�
 而 +1.00 核是"不再一次等满 32 个包"的代价。注意它比 §4.2 那一轮测到的 +1.12 略小——同一个
 效应、不同窗口，这正是为什么要看配对差值而不是单次绝对值。
 
-### 5.2 异步后端：不能用"每个就绪事件收一个包"
+### 5.2 异步后端：不能用"每个就绪事件收一个包"（已修，见 §5.3）
 
 生产默认走 `corr-async --workers 24`，而 socket 是共用的，所以直白版的改动**必然**改变异步
 后端的行为：每个 reactor 就绪事件从"最多收 32 个包"变成"收 1 个包"。这一腿必须单独测，
@@ -220,16 +225,84 @@ socket 上保留第二个入口 `recv_one_nowait(&mut self) -> io::Result<()>`�
 
 `direct` 让**每个包都走两轮完整的 `select!` + `AsyncFd::readable()` + `try_io`**：单站 30 s
 内 1180 万次 reactor 迭代（约 39 万次/s/站，24 站接近千万次/s），而基线是每 13 个包才轮一次。
-轮询开销放大 26 倍之后，机器稍有抖动就追不上，socket 缓冲一满就直接丢包——这解释了为什么
-它在 2/6 轮里崩掉，而同样的抖动在同步后端只是多花一点 CPU。
 
-**修法（本次未做，异步按要求先不改）**：reactor 的就绪分支应当**循环收到 `WouldBlock` 为止**
-（用现成的 `DRAIN_BUDGET_PACKETS` 设上限，别饿死同一 worker 上的其他站）。这本来就是边沿触发
-epoll 的要求——每次就绪必须把 socket 读干，只读一个包会留下数据而不再产生新事件。改成循环后
-reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价应当落回和同步后端同一量级
-（≈ +1 核）。**这一腿还没测，是下一个该做的实验。**
+> **订正（2026-09-22，见 §5.3）**：这里原先写的是"轮询开销放大之后机器追不上，socket 缓冲
+> 一满就丢包"。**那个机理是错的。** 后来把 `NIC rx_out_of_buffer` 增量一起测出来才看清：丢包
+> 数与应用层丢包数**逐轮精确相等**，也就是包**根本没到 kernel**，是网卡自己的 RX 描述符环空了。
+> 同轮内 `base` 0、`drain` 12,458、`port` 705,001 的对比（轮转设计给出的因果证据）指向真正
+> 的链条：**收包路径多烧的 CPU 饿死了 NIC 的 NAPI 轮询，网卡先丢包**。所以那 2/6 轮的崩掉
+> 是 CPU 开销的连带后果，不是"没把队列读干"。
 
-### 5.3 改用 `std` 的 `recvfrom`
+### 5.3 异步后端：交给 tokio 持有，然后一轮读干
+
+按 §5.2 的订正，异步后端的病根是**每包一次的 reactor 往返**，而不是"没读干"。这一节是修它
+的两步，各自一个提交。
+
+**第一步（`41113de`）：让 `tokio` 持有 socket。** 原实现把原始 fd **再注册一份**给 `AsyncFd`，
+于是同一个 fd 有两个句柄、一个只为"返回 `WouldBlock` 让 tokio 清就绪"而存在的手写 `try_io`
+闭包，以及一个必须手工摆对的析构顺序（`Station::run` 因此借用 reactor 而不是拥有它）。换成
+
+```rust
+sock.set_nonblocking(true)?;                       // from_std 拒绝阻塞 socket
+let sock = tokio::net::UdpSocket::from_std(sock.into_std())?;
+```
+
+之后这些全部消失。`set_nonblocking` 不是可选的：tokio 的 `from_std` 会先查 `O_NONBLOCK`。
+socket 归 station 所有之后，缓冲自然也归它，于是包由两个后端共用的 `Packet::parse` 解析，
+而 `MulticastSocket` 上那个只为迁就 `try_io` 而存在的两步 API（`recv_one_nowait()` +
+`packet()`）连同 `fd()` 一起删掉。`have`/`next` 塌缩成 `have_packet`；**不能跟着塌缩的是
+拒绝路径**——槽仍属管线时，包留在缓冲里等 park 之后重试，`place_one` 把这个语义写在一处。
+
+**第二步（`625b824`）：一轮读干。** 一次就绪事件现在是一"轮"：读到 socket 说干，或花完
+`DRAIN_BUDGET_PACKETS`。实测（真实 24 路，单站 25 s）：
+
+| | 迭代次数 | reactor 轮次 | **每轮拿到几个包** |
+|---|---|---|---|
+| 一包一轮（`port`） | 9,866,799 | 4,921,063 | **1.000** |
+| 一轮读干（`drain`） | 36,954 | 36,953 | **133.1** |
+
+**每轮 133 个包，迭代次数降到 1/267。** 这不是调参调出来的：它说明这个负载下 socket 里
+本来就有一个约 550 KB 的标准积压（与同步侧 socket 实测的 ~400 KB 一致），有的读，于是
+reactor 开销被它除掉了。
+
+两个让"有界的一轮"是安全的设计：
+
+- **在预算处停下不会丢唤醒**：`readable` 只在 `WouldBlock` 时才被清，所以按预算提前结束的一轮
+  之后，下一轮立刻就能开始——drain 不必穷尽，只需有界。
+- **槽被拒时轮次结束、包留在缓冲里**，循环顶部 park 再重试；积压的其余部分在再下一轮读。
+  忙的环只带来延迟，不带来丢失。
+
+`DRAIN_BUDGET_PACKETS` 现在担两件事并写在注释里：它原本是礼让阈值，同时也是"一站可以多久
+不去服务调度器请求"的上界——512 包在 195 kpps 下约 2.6 ms，对着 5 ms 的 tick。
+
+计时口径也跟着改了：`ns_recv` 现在是**等待就绪 + 收包调用**，刻意**不含**夹在中间的拼帧。
+把拼帧算进去会让报告里"等待收包"和"拼帧"两个数重叠，而这两个词正是操作者用来判断瓶颈在
+链路还是在这个任务的。
+
+**三臂结果**（6 轮 × 60 s，循环轮转，`--workers 24`）：
+
+| 指标 | `base`（recvmmsg） | `drain`（tokio + 读干） | `port`（tokio, 一包一轮） |
+|---|---|---|---|
+| 核数（监视器均值） | 13.39 | **14.62** | 14.90 |
+| Δ 核数 vs `base` | — | **+1.255**（6/6） | **+1.504**（6/6） |
+| NIC `rx_out_of_buffer` 增量 | 0（6/6 轮） | 0、0、0、**12,458**、0、0 | **4,566**、0、0、**705,001**、**279,166**、0 |
+| 60 s 内丢包 | 0、0、1、0、0、0 | 0、0、1、**12,458**、1、3 | **4,566**、0、0、**774,572**、**281,640**、0 |
+| 补零帧 | 0、0、1、0、0、0 | 0、0、1、**2,003**、1、3 | **608**、0、0、**123,519**、**44,861**、0 |
+| ≥20 ms 读停顿 | 0（6/6 轮） | **1**、0、0、**15**、0、0 | **8**、0、**1**、**30**、**11**、0 |
+| 行率 | 0.982–1.000 | 同 | 同 |
+
+三件事：
+
+1. **读干把异步后端的正确性修回来了。** `port` 在 6 轮里 3 轮丢数据（最多 77 万包），`drain`
+   只有 1 轮丢了 12,458 个——而那一轮的 NIC 增量也正好是 12,458。
+2. **它拿回了超出部分的一半**：`drain → port` = +0.293 核（6/6）。剩下一半不是 reactor 往返，
+   而是每包的固定开销（`try_recv_from` 每次都过一次 tokio 的就绪检查，加上本文件每包三处
+   `Instant::now()` 与 `dbg` 累加）。
+3. **异步仍未追平同步**：同一负载下同步的 `base → direct` 是 **+0.99 核**（§5.1，另一个窗口，
+   仅作量级参照），而异步 `base → drain` 是 +1.255。差的那 ~0.27 核就是"一套 epoll 收 N 路"
+   本身的成本——是这个后端存在的理由，不是缺陷。
+
+### 5.4 改用 `std` 的 `recvfrom`
 
 `no_recvmmsg`/`recvfrom-direct` 调的是 `libc::recvfrom`，所以即使 `recvmmsg` 没了，收包仍然是一个
 `unsafe` 块加一次手写的 `sockaddr_storage`。标准库其实有 `std::net::UdpSocket::recv_from`，
@@ -273,8 +346,8 @@ reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价�
 ## 6. 结论与建议
 
 1. **`recvmmsg` 在正确性上不必要**（同步后端），在本机当前负载下换掉它不会丢数据。
-2. **但它不是免费的**：约 1.0–1.1 个核 = 32 核机器的约 3%，或进程自身 CPU 的 +7.5%
-   （13.09 → 14.14 核）。
+2. **但它不是免费的**：同步后端约 **+1.0 核**（13.13 → 14.13），异步后端即使把就绪事件
+   读干也要 **+1.26 核**（13.39 → 14.62）。32 核机器上约 3–4%。
 3. **代价的 4/5 不在 syscall**，而在收包循环每轮的固定记账上——`recvmmsg` 的
    "阻塞到凑满整批"行为**顺带**把这个开销摊薄了 32 倍。
 4. 因此，如果目标是"精减结构、消除不必要的优化"，正确的做法**不是**只把
@@ -284,12 +357,17 @@ reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价�
      `zero_filled_frames` / `lost_packets` / `slot_wait_ns` 这类只在拼帧状态真的变了才需要
      更新的量按需发布、把 `Instant::now()` 的计时移出热路径。
    两件事一起做，1.0 个核里的大部分就回来了，而且结构比现在简单。
-5. 收包调用本身用 `std` 就够（§5.3）：`UdpSocket::recv_from` 替掉手写的
+5. 收包调用本身用 `std` 就够（§5.4）：`UdpSocket::recv_from` 替掉手写的
    `unsafe { libc::recvfrom }`、`timeval`、`fcntl` 和自己写的 `Drop`，实测零代价。
    `libc` 只剩"建 socket 与设选项"这一小块。
-6. **异步后端现在是这条路上的拦路石**：直接照搬"每就绪事件一个包"会丢数据（§5.2）。
-   要用异步 + 逐包 `recvfrom`，必须先让 reactor 的就绪分支读到 `WouldBlock` 为止。
-7. 顺带：`RecvStats` 里的 `batches` 和 `packets` 两个字段在 `net.rs` 之外无人读取；
+6. **异步后端已经能用，但要付"一套 epoll 收 N 路"的成本**（§5.3）：交给 `tokio` 持有 socket
+   消掉了双份 fd、手写 `try_io` 和手工析构顺序；把就绪事件读干（实测每轮 133 个包）修回了
+   正确性并拿回了超出部分的一半。它仍比同步贵约 0.27 核，那是这个后端存在的理由，不是缺陷。
+7. **一个与收包无关但更值钱的发现**：丢包的真正来源是**网卡的 `rx_out_of_buffer`**，而它随
+   收包路径的 CPU 开销升高而出现——同轮内 `base` 0 / `drain` 12,458 / `port` 705,001 是轮转
+   设计给出的因果证据。**收包路径每多烧一点 CPU，都会以网卡丢包的形式付出代价**，这比"多占
+   一个核"严重得多，也是"能省则省"最硬的理由。
+8. 顺带：`RecvStats` 里的 `batches` 和 `packets` 两个字段在 `net.rs` 之外无人读取；
    `report.rs` 的 `recv_batches` / `recv_packets` 也是**只写不读**（从未被渲染），而
    `recv_batches` 这个概念在直白版里已经没有意义了。这几个字段可以一起删。
    `unsafe impl Send for MulticastSocket` 在去掉 iovec/mmsghdr 后也不再需要（自动成立）。
@@ -300,14 +378,16 @@ reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价�
 - `recvfrom-direct`：在它之上把批次形状的 API 也去掉，收包变成一次 `recvfrom` 返回一个
   `Packet`。且实测与 `no_recvmmsg` 逐项相同。
 - `recvfrom-std`：再改用 `std::net::UdpSocket::recv_from`，收包路径里不再有裸描述符。实测与
-  `libc` 版无差别（§5.3），**这是收包路径该定下来的形态**。
+  `libc` 版无差别（§5.4），**这是收包路径该定下来的形态**。
+- `async-tokio`（`41113de` + `625b824`）：异步后端交给 `tokio::net::UdpSocket` 持有 socket，
+  并把"一次就绪收一个包"改成"一轮读干"（§5.3）。
 - `receiver.recvmmsg_batch` 在两支上都被保留：所有 `config/*.yaml` 都带这个键，而
   `ReceiverCfg` 是 `deny_unknown_fields`，删字段会让所有配置解析失败。等到 §6 的第 4 条
   一起做时，字段和 YAML 一起删。
 - `no_recvmmsg-looped`：**只用于分解实验**，不该合入（它把批处理形状和 32 次 syscall
   拼在一起，两头都不占优）。
-- 异步后端在 `recvfrom-direct` / `recvfrom-std` 上**只有 2 行调用点被改动**（`recv_one_nowait`
-  取包、`set_nonblocking(true)`），结构未动；但它的行为后果（§5.2）是拦路的，合入前必须先处理。
+- 异步后端在 `recvfrom-direct` / `recvfrom-std` 上只改了 2 行调用点，结构未动；到 `async-tokio`
+  才真正重写（§5.3）。
 
 **顺带发现一个既有问题（与本次改动无关）**：`cargo build --release --no-default-features`
 **编译不过**，报 `error[E0433]: cannot find status in crate`。`lib.rs:62` 用
@@ -322,11 +402,12 @@ production build entirely"）。修法是把那两处引用（以及它们所在
 
 | 项 | 为什么重要 |
 |---|---|
-| **异步后端"读到干"的版本** | **最该接着做的一腿。** §5.2 已经证明"每就绪事件收一个包"会丢数据；修法是就绪分支循环收到 `WouldBlock`。改完必须重跑一遍本档的 A/B，确认丢包消失、代价落回 ≈ +1 核。在此之前，异步后端不能用逐包 `recvfrom`。 |
-| 40 路目标 | 本机前端只有 24 路在发，40 路（设计目标）没有可用的真实负载。1.0 个核大致按站数线性放大（≈1.7 核），但没测。 |
+| **异步剩余的 0.27 核** | §5.3 说明它不是 reactor 往返，而是每包的固定开销（`try_recv_from` 过一次 tokio 就绪检查 + 本文件每包三处 `Instant::now()` 与 `dbg` 累加）。能不能省、值不值得省，都没测——而且按 §6 第 7 条，省下来的可能直接换来网卡丢包的减少，值得一试。 |
+| 40 路目标 | 本机前端只有 24 路在发，40 路（设计目标）没有可用的真实负载。同步 +1.0 核大致按站数线性放大（≈1.7 核），异步同理，但都没测。 |
 | 生产模式（带 GPU + 落盘） | dry_run 隔离了 syscall 问题，但生产里收包线程还会被拒槽、socket 缓冲会成为最后一道余量。本机 dry_run 下"等 slot"是 0.0 s/站，各臂都一样，所以这个问题在本次实验里没被触及。 |
 | 包更小的情况 | 本次全是 4104 B 的 jumbo frame。若将来帧长变小，每包 syscall 的相对代价会上升。 |
-| 每轮记账降下来之后 | §6 第 4 条的"同时把记账降下来"还没有实现，所以"1.0 个核能拿回多少"目前只是估计，不是实测。 |
+| 每轮记账降下来之后（同步路径） | §6 第 4 条的"同时把记账降下来"（`StationProgress` 加 padding、按需发布、计时移出热路径）还没有实现，所以同步那 1.0 个核能拿回多少目前只是估计。 |
+| 网卡丢包与 CPU 的关系 | §6 第 7 条只给出了一致性证据（同轮对比 + 逐轮精确相等的丢包数）与一个合理机理（NAPI 被饿死）。没有做受控实验去定位阈值——即"多烧多少 CPU 会让网卡开始丢"。 |
 
 ---
 
@@ -349,27 +430,33 @@ ARMS="base=bench/baseline-bin/corr \
       direct=bench/recvfrom-direct-bin/corr" \
   tools/recvmmsg_ab.sh 6 60
 
-# 5. std 版 vs libc 版 vs 基线（§5.3）
+# 5. std 版 vs libc 版 vs 基线（§5.4）
 ARMS="base=bench/baseline-bin/corr \
       direct=bench/recvfrom-direct-bin/corr \
       std=bench/recvfrom-std-bin/corr" \
   tools/recvmmsg_ab.sh 6 60
 
-# 6. 异步后端（§5.2）。EXTRA_ARGS 是给 corr-async 传 --workers 的
+# 6. 异步三臂：recvmmsg vs tokio 一包一轮 vs tokio 读干（§5.3）
+ARMS="base=bench/baseline-bin/corr-async \
+      port=bench/async-tokio-port-bin/corr-async \
+      drain=bench/async-tokio-drain-bin/corr-async" \
+  EXTRA_ARGS="--workers 24" tools/recvmmsg_ab.sh 6 60
+
+# 7. 异步后端（§5.2）。EXTRA_ARGS 是给 corr-async 传 --workers 的
 ARMS="base=bench/baseline-bin/corr-async \
       direct=bench/recvfrom-direct-bin/corr-async" \
   EXTRA_ARGS="--workers 24" tools/recvmmsg_ab.sh 6 60
 
-# 7. 判读（看配对差值的符号，不要看单次绝对值）
+# 8. 判读（看配对差值的符号，不要看单次绝对值）
 tools/ab_report.py bench/recvmmsg-ab/<时间戳>
 
-# 8. 单独证明 recvmmsg 的阻塞语义
+# 9. 单独证明 recvmmsg 的阻塞语义
 gcc -O2 -o /tmp/ms tools/recvmmsg-semantics.c && /tmp/ms
 
-# 9. 需要看每线程 user/sys 与 socket 积压时
+# 10. 需要看每线程 user/sys 与 socket 积压时
 tools/recv_probe.sh bench/baseline-bin/corr
 
-# 10. 异步后端的 reactor 计数器，解释 §5.2（单站一行，注意 iters/ready/pkts 三个数）
+# 11. 异步后端的 reactor 计数器，解释 §5.3（单站一行，注意 rounds 与 rx/round）
 CORR_ASYNC_STATS=1 bench/baseline-bin/corr-async \
   --config config/correlator-24-nf16384-g05.yaml --dry-run --duration 30 --workers 24
 ```
