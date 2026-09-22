@@ -113,7 +113,7 @@ pub struct StationAssembleReport {
     pub recv_batches: u64,
     pub recv_packets: u64,
     pub recv_empty_polls: u64,
-    pub recv_truncated: u64,
+    pub recv_oversized: u64,
     /// Time this station's thread spent waiting for packets, and time it spent
     /// turning them into staged frames. The split is the whole diagnosis when a
     /// run loses data: waiting means the link (or the sender) is behind, while
@@ -358,6 +358,6 @@ impl RunReport {
     }
 
     pub fn ok(&self) -> bool {
-        self.stations.iter().all(|s| s.recv_truncated == 0)
+        self.stations.iter().all(|s| s.recv_oversized == 0)
     }
 }

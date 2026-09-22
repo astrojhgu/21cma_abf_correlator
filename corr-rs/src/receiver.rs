@@ -131,7 +131,7 @@ pub(crate) struct RecvOutcome {
     pub batches: u64,
     pub packets: u64,
     pub empty_polls: u64,
-    pub truncated: u64,
+    pub oversized: u64,
     pub ns_recv: u64,
     pub ns_assemble: u64,
     /// Longest this thread went without reading a batch, and how many times it
@@ -321,7 +321,7 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
         batches,
         packets,
         empty_polls: rs.empty_polls,
-        truncated: rs.truncated,
+        oversized: rs.oversized,
         ns_recv,
         ns_assemble,
         max_stall_ms,

@@ -267,7 +267,7 @@ fn worker_main(
         for p in group {
             // The reactor needs a non-blocking descriptor: an empty socket must
             // say EAGAIN at once instead of parking the worker for SO_RCVTIMEO.
-            if let Err(e) = p.sock.set_nonblocking() {
+            if let Err(e) = p.sock.set_nonblocking(true) {
                 eprintln!(
                     "corr-async: worker {w}: station {}: cannot set O_NONBLOCK: {e}",
                     p.idx

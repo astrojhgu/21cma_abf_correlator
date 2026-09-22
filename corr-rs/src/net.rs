@@ -1,4 +1,4 @@
-//! The socket layer: one UDP multicast socket per station, batched receives.
+//! The socket layer: one UDP multicast socket per station, one packet per receive.
 //!
 //! Why these particular options, in one place:
 //!
@@ -21,13 +21,20 @@
 //!   ever: when a station goes quiet it has to notice and honour the scheduler's
 //!   request to declare the missing frames up to the next slot boundary.
 //!
+//! Only the socket's *creation and options* go through `libc`, because `std` has no
+//! API for `SO_BUSY_POLL`, `SO_RCVBUF`, `SO_REUSEADDR` or a multicast membership.
+//! The receive call, the read timeout and non-blocking mode are all `std`'s
+//! ([`UdpSocket`]), so nothing in this module reads or writes a raw descriptor
+//! except to hand it to that type.
+//!
 //! `IP_ADD_MEMBERSHIP` binds the group to `receiver.interface_ip`, not to
 //! `INADDR_ANY`: with several interfaces on the host, joining on the wrong one
 //! silently receives nothing.
 
 use std::io;
-use std::net::Ipv4Addr;
-use std::os::unix::io::RawFd;
+use std::net::{Ipv4Addr, UdpSocket};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::time::Duration;
 
 use crate::config::ReceiverCfg;
 
@@ -38,6 +45,17 @@ pub const PAYLOAD_BYTES: usize = 4096;
 /// What a whole packet must be able to hold.
 pub const PACKET_BYTES: usize = COUNTER_BYTES + PAYLOAD_BYTES;
 
+/// The largest datagram UDP can carry, rounded up to a power of two.
+///
+/// The receive buffer is this big rather than `PACKET_BYTES`-sized because
+/// [`UdpSocket::recv_from`] has no `MSG_TRUNC`: a datagram larger than the buffer
+/// comes back silently shortened, with no way to tell. A buffer that can hold any
+/// datagram cannot shorten one, which is a stronger guarantee than counting the
+/// times it did -- so what is checked instead is whether what arrived is *longer
+/// than the packet layout this program was built for*, which is the thing that
+/// actually matters and which `MSG_TRUNC` never caught anyway.
+const RECV_BUF_BYTES: usize = 65536;
+
 /// `SO_BUSY_POLL` is 46 on Linux; spelled out because the libc crate does not
 /// expose it on every target.
 const SO_BUSY_POLL: libc::c_int = 46;
@@ -47,8 +65,10 @@ pub struct RecvStats {
     /// Times the receive call came back empty: the receive timeout expired, or a
     /// non-blocking socket had nothing to give.
     pub empty_polls: u64,
-    /// Packets the kernel reported as truncated, i.e. the buffer was too small.
-    pub truncated: u64,
+    /// Datagrams longer than [`PACKET_BYTES`]. Nothing can carry that many samples
+    /// in one packet, so this means the stream does not match the layout, not that
+    /// the buffer was too small.
+    pub oversized: u64,
 }
 
 /// One received packet: the counter that prefixes it, and the samples behind it.
@@ -66,15 +86,20 @@ pub struct Packet<'a> {
     pub samples: &'a [u8],
 }
 
-/// One UDP multicast socket, with room for one packet.
+/// One UDP multicast socket, with room for one datagram.
+///
+/// The descriptor is created and configured through `libc`, because the options
+/// this needs -- `SO_BUSY_POLL`, `SO_RCVBUF`, `SO_REUSEADDR`, the multicast
+/// membership -- have no `std` API, and it is handed straight to a `UdpSocket`
+/// which then owns it. Everything after that is `std`: the receive call, the read
+/// timeout and non-blocking mode all come from `UdpSocket`, so this module has no
+/// raw descriptor to close and no `fcntl` of its own.
 pub struct MulticastSocket {
-    fd: RawFd,
-    /// One datagram, with a little slack over the nominal payload so an oversized
-    /// frame is detected as truncated rather than as a short read.
+    sock: UdpSocket,
+    /// One datagram. Sized so it cannot be too small (see [`RECV_BUF_BYTES`]), and
+    /// reused for every receive.
     buf: Vec<u8>,
-    /// Datagram length reported by the last `recvfrom`. `MSG_TRUNC` makes this the
-    /// datagram's real length even when it did not fit, which is what makes
-    /// truncation visible instead of silently arriving as a short packet.
+    /// Datagram length the last receive reported.
     len: usize,
     stats: RecvStats,
     /// Whether the kernel accepted `SO_BUSY_POLL`. Reported rather than assumed:
@@ -85,18 +110,18 @@ pub struct MulticastSocket {
 impl MulticastSocket {
     /// Open and join `group`:`port` on `cfg.interface_ip`.
     pub fn open(cfg: &ReceiverCfg, group: Ipv4Addr, port: u16) -> io::Result<Self> {
-        // A little slack over the nominal payload so an oversized frame is
-        // detected as truncated rather than as a short read.
-        let stride = PACKET_BYTES.next_multiple_of(64) + 64;
-
-        // SAFETY: a plain socket(2) call.
+        // SAFETY: a plain socket(2) call, whose descriptor is immediately given to
+        // a `UdpSocket` that will close it exactly once.
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: `fd` came from socket(2), is owned by nothing else, and is not
+        // used directly anywhere after this.
+        let sock = unsafe { UdpSocket::from_raw_fd(fd) };
         let mut sock = MulticastSocket {
-            fd,
-            buf: vec![0u8; stride],
+            sock,
+            buf: vec![0u8; RECV_BUF_BYTES],
             len: 0,
             stats: RecvStats::default(),
             busy_poll_granted: false,
@@ -107,15 +132,10 @@ impl MulticastSocket {
     }
 
     fn configure(&mut self, cfg: &ReceiverCfg, group: Ipv4Addr, port: u16) -> io::Result<()> {
+        let fd = self.sock.as_raw_fd();
+        set_int_opt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1, "SO_REUSEADDR")?;
         set_int_opt(
-            self.fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            1,
-            "SO_REUSEADDR",
-        )?;
-        set_int_opt(
-            self.fd,
+            fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             cfg.recv_buffer_bytes as libc::c_int,
@@ -126,7 +146,7 @@ impl MulticastSocket {
             // hard failure here would make the correlator unusable as jhgu for a
             // latency optimisation it can live without.
             self.busy_poll_granted = set_int_opt(
-                self.fd,
+                fd,
                 libc::SOL_SOCKET,
                 SO_BUSY_POLL,
                 cfg.busy_poll_us as libc::c_int,
@@ -135,23 +155,9 @@ impl MulticastSocket {
             .is_ok();
         }
         // A short receive timeout is what lets a quiet station be noticed.
-        let tv = libc::timeval {
-            tv_sec: 0,
-            tv_usec: (cfg.recv_timeout_ms * 1000) as libc::suseconds_t,
-        };
-        // SAFETY: tv is a properly initialised timeval.
-        if unsafe {
-            libc::setsockopt(
-                self.fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        // `std`'s version is the same `SO_RCVTIMEO` this used to set by hand.
+        self.sock
+            .set_read_timeout(Some(Duration::from_millis(cfg.recv_timeout_ms)))?;
 
         let addr = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
@@ -164,7 +170,7 @@ impl MulticastSocket {
         // SAFETY: addr is a fully initialised sockaddr_in of the given length.
         if unsafe {
             libc::bind(
-                self.fd,
+                fd,
                 &addr as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
             )
@@ -188,7 +194,7 @@ impl MulticastSocket {
         // SAFETY: mreq is a fully initialised ip_mreqn.
         if unsafe {
             libc::setsockopt(
-                self.fd,
+                fd,
                 libc::IPPROTO_IP,
                 libc::IP_ADD_MEMBERSHIP,
                 &mreq as *const _ as *const libc::c_void,
@@ -209,7 +215,7 @@ impl MulticastSocket {
         // SAFETY: v and len are valid.
         if unsafe {
             libc::getsockopt(
-                self.fd,
+                self.sock.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
                 &mut v as *mut _ as *mut libc::c_void,
@@ -266,7 +272,7 @@ impl MulticastSocket {
     /// So the bytes stay in the socket's buffer and are read back with
     /// [`Self::packet`], which is what that backend already did.
     ///
-    /// Requires the socket to be non-blocking ([`Self::set_nonblocking`]),
+    /// Requires the socket to be non-blocking ([`UdpSocket::set_nonblocking`]),
     /// otherwise an empty socket blocks for `SO_RCVTIMEO` before it says so.
     pub(crate) fn recv_one_nowait(&mut self) -> io::Result<()> {
         self.recv_from()
@@ -274,36 +280,18 @@ impl MulticastSocket {
 
     /// The syscall itself: one datagram into this socket's buffer.
     fn recv_from(&mut self) -> io::Result<()> {
-        let mut src: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-        // SAFETY: `buf` is `buf.len()` bytes of storage this socket owns, `src` is
-        // a fully sized sockaddr_storage, and `slen` says so. `MSG_TRUNC` makes the
-        // return value the datagram's real length even when it did not fit, so an
-        // oversized frame is counted instead of arriving as a silent short packet.
-        let n = unsafe {
-            libc::recvfrom(
-                self.fd,
-                self.buf.as_mut_ptr() as *mut libc::c_void,
-                self.buf.len(),
-                libc::MSG_TRUNC,
-                &mut src as *mut _ as *mut libc::sockaddr,
-                &mut slen,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        self.len = n as usize;
-        if self.len > self.buf.len() {
-            self.stats.truncated += 1;
+        // The peer address is not read and not wanted: the source is the front end
+        // board, and which board it is comes from the group this socket joined. The
+        // call returns it anyway, which is the price of the standard library's
+        // signature rather than this program's choice.
+        let (n, _peer) = self.sock.recv_from(&mut self.buf)?;
+        self.len = n;
+        if n > PACKET_BYTES {
+            self.stats.oversized += 1;
         }
         Ok(())
     }
 
-    #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
-    // Unused only when `async-recv` is off (`--no-default-features`): it exists for
-    // the readiness-driven backend, and the test below exercises it either way.
     /// Put the socket in non-blocking mode.
     ///
     /// Needed by any readiness-based receiver: with `SO_RCVTIMEO` still in force
@@ -312,19 +300,13 @@ impl MulticastSocket {
     /// would then be a wait the reactor did not know about. Calling this twice is
     /// a no-op, and `SO_BUSY_POLL` keeps working: it is the socket receive path
     /// that spins in the driver, not the syscall.
-    pub(crate) fn set_nonblocking(&self) -> io::Result<()> {
-        // SAFETY: fcntl(F_GETFL/F_SETFL) on a descriptor this socket owns.
-        let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if flags & libc::O_NONBLOCK != 0 {
-            return Ok(());
-        }
-        if unsafe { libc::fcntl(self.fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+    ///
+    /// Public rather than crate-private on purpose: [`crate::backend`] exists so
+    /// that "how packets are received" can be replaced without touching the
+    /// orchestration, and a backend living outside this crate needs this to set its
+    /// sockets up. Both backends in the tree are inside it today.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.sock.set_nonblocking(nonblocking)
     }
 
     /// The packet the last receive put in this socket's buffer.
@@ -335,13 +317,12 @@ impl MulticastSocket {
     /// outcome the batched receive path had, which returned `None` here for the
     /// same reason.
     pub fn packet(&self) -> Option<Packet<'_>> {
-        // A truncated datagram is longer than the buffer: clip it rather than
-        // index past the end. The assembler then sees a short payload and rejects
-        // it, which is the same outcome `recvmmsg` produced from `msg_flags`.
-        let len = self.len.min(self.buf.len());
+        let len = self.len;
         if len < COUNTER_BYTES {
             return None;
         }
+        // `len` is always inside `buf`: the buffer holds any datagram UDP can
+        // carry, so the receive cannot have written past it or shortened one.
         let bytes = &self.buf[..len];
         let mut c = [0u8; 8];
         c.copy_from_slice(&bytes[..COUNTER_BYTES]);
@@ -353,22 +334,18 @@ impl MulticastSocket {
         })
     }
 
+    /// The descriptor, for the one caller that has to register it with a reactor
+    /// ([`crate::async_recv`]) rather than receive through it.
     pub fn fd(&self) -> RawFd {
-        self.fd
+        self.sock.as_raw_fd()
     }
 }
 
-// `MulticastSocket` needs no `unsafe impl Send`: it owns its descriptor and its
-// packet buffer, both of which are `Send`, so moving the whole struct to another
-// thread moves the only references to it. One thread receiving per socket is a
-// design rule, not a safety one -- every receive entry point takes `&mut self`.
-
-impl Drop for MulticastSocket {
-    fn drop(&mut self) {
-        // SAFETY: fd came from socket(2) and is closed exactly once.
-        unsafe { libc::close(self.fd) };
-    }
-}
+// `MulticastSocket` needs no `unsafe impl Send`: it holds a `UdpSocket` and a
+// `Vec<u8>`, both `Send`, so moving the whole struct to another thread moves the
+// only references to it. One thread receiving per socket is a design rule, not a
+// safety one -- every receive entry point takes `&mut self`. The descriptor is
+// closed by `UdpSocket`'s own `Drop`, which is why nothing here closes it.
 
 /// Whether a receive error means "the socket had nothing", as opposed to a real
 /// failure. `SO_RCVTIMEO` expiring and a non-blocking socket finding nothing are
@@ -601,8 +578,9 @@ mod tests {
                 return;
             }
         };
-        sock.set_nonblocking().expect("O_NONBLOCK is unprivileged");
-        sock.set_nonblocking().expect("setting it twice is a no-op");
+        sock.set_nonblocking(true).expect("O_NONBLOCK is unprivileged");
+        sock.set_nonblocking(true)
+            .expect("setting it twice is a no-op");
 
         let t0 = std::time::Instant::now();
         let e = sock

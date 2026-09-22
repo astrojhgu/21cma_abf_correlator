@@ -229,6 +229,47 @@ epoll 的要求——每次就绪必须把 socket 读干，只读一个包会留
 reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价应当落回和同步后端同一量级
 （≈ +1 核）。**这一腿还没测，是下一个该做的实验。**
 
+### 5.3 改用 `std` 的 `recvfrom`
+
+`no_recvmmsg`/`recvfrom-direct` 调的是 `libc::recvfrom`，所以即使 `recvmmsg` 没了，收包仍然是一个
+`unsafe` 块加一次手写的 `sockaddr_storage`。标准库其实有 `std::net::UdpSocket::recv_from`，
+换成它之后：
+
+| 项 | 改成 | 效果 |
+|---|---|---|
+| 描述符归属 | `UdpSocket::from_raw_fd(fd)` | 删掉自己写的 `Drop`（原来手动 `libc::close`） |
+| 收包 | `self.sock.recv_from(&mut self.buf)` | 删掉 `unsafe { libc::recvfrom(…) }` 和手写的 `sockaddr_storage`/`socklen_t` |
+| `SO_RCVTIMEO` | `sock.set_read_timeout(Some(Duration))` | 删掉手写的 `libc::timeval` + `setsockopt` |
+| 非阻塞 | `sock.set_nonblocking(true)` | 删掉手写的 `fcntl(F_GETFL/F_SETFL)` |
+
+`libc` 只留在**建 socket 与设选项**上（`SO_BUSY_POLL` / `SO_RCVBUF` / `SO_REUSEADDR` /
+`IP_ADD_MEMBERSHIP` 都没有 std API），建好之后立刻交给 `UdpSocket` 持有。`net.rs` 净减 27 行，
+模块里再没有裸描述符的读写（除了把 fd 交给 reactor 注册的那一处）。
+
+**代价：丢掉了 `MSG_TRUNC`。** std 的 `recv_from` 固定 `flags = 0`，所以「数据报比缓冲大」会被
+**静默截短**，无法察觉。处理方式是把它变成不可能：接收缓冲开成 **65536 字节**（UDP 单报上限
+65507），能装下任何数据报的缓冲就不可能截短任何数据报——这比"数一数截短了几次"是更强的保证。
+换来的检查顺带**更准确**了：现在比的是「到达长度 > `PACKET_BYTES`」，也就是**流与这份配置的报文
+布局不符**，而 `MSG_TRUNC` 从来查不出这件事（它只查缓冲够不够大）。所以 `RecvStats.truncated`
+改名为 `oversized`，两处面向操作者的报错文案（`bin/corr.rs`、`async_recv/mod.rs`）也从
+"接收缓冲太小"改成"前端与本配置不符"。
+
+**实测：免费。** 6 轮 × 60 s 三臂轮转：
+
+| 对比 | Δ 核数（中位数） | 符号一致性 | 判读 |
+|---|---|---|---|
+| `base → std` | **+1.05** | 6/6 | 与 `base → direct`（+1.04）相同：多出来的仍是"不再等满一批"的代价 |
+| `direct → std` | **+0.049** | 符号混合 | **换 std 本身测量不到代价**（`sys` 中位数 +3.2 s、`user` 中位数 −0.9 s、合计在噪声内） |
+
+归因层面也是零：`direct → std` 在「收包调用内耗时」（0 s）、「收包调用后耗时」（0 s）、
+「拼帧占比」（0%）三项上都完全相同。唯一的结构性代价是 `recv_from` 会**返回对端地址**（本程序
+丢弃不用——来源由加入的组决定），每包多一次 `sockaddr_storage` 填充与转换；在这个负载下它没有
+测出来。
+
+> 校验方式记一笔：`[profile.release] debug = 1`，所以二进制里带 DWARF 行号，**任何源码行变动**
+> （哪怕只改文档注释）都会改变文件哈希。要确认"机器码没变"必须比 `.text`/`.rodata` 段本身，
+> 不能比文件哈希。本节的 A/B 用的二进制与提交源码的 `.text` 逐字节一致。
+
 ## 6. 结论与建议
 
 1. **`recvmmsg` 在正确性上不必要**（同步后端），在本机当前负载下换掉它不会丢数据。
@@ -243,9 +284,12 @@ reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价�
      `zero_filled_frames` / `lost_packets` / `slot_wait_ns` 这类只在拼帧状态真的变了才需要
      更新的量按需发布、把 `Instant::now()` 的计时移出热路径。
    两件事一起做，1.0 个核里的大部分就回来了，而且结构比现在简单。
-5. **异步后端现在是这条路上的拦路石**：直接照搬"每就绪事件一个包"会丢数据（§5.2）。
+5. 收包调用本身用 `std` 就够（§5.3）：`UdpSocket::recv_from` 替掉手写的
+   `unsafe { libc::recvfrom }`、`timeval`、`fcntl` 和自己写的 `Drop`，实测零代价。
+   `libc` 只剩"建 socket 与设选项"这一小块。
+6. **异步后端现在是这条路上的拦路石**：直接照搬"每就绪事件一个包"会丢数据（§5.2）。
    要用异步 + 逐包 `recvfrom`，必须先让 reactor 的就绪分支读到 `WouldBlock` 为止。
-6. 顺带：`RecvStats` 里的 `batches` 和 `packets` 两个字段在 `net.rs` 之外无人读取；
+7. 顺带：`RecvStats` 里的 `batches` 和 `packets` 两个字段在 `net.rs` 之外无人读取；
    `report.rs` 的 `recv_batches` / `recv_packets` 也是**只写不读**（从未被渲染），而
    `recv_batches` 这个概念在直白版里已经没有意义了。这几个字段可以一起删。
    `unsafe impl Send for MulticastSocket` 在去掉 iovec/mmsghdr 后也不再需要（自动成立）。
@@ -254,14 +298,23 @@ reactor 轮转回到"每 N 个包一次"，syscall 仍是每包一次，代价�
 
 - `no_recvmmsg`（`f2b927c`）：只换收包系统调用，**其余结构未动**，所以它是干净的 A/B 变体。
 - `recvfrom-direct`：在它之上把批次形状的 API 也去掉，收包变成一次 `recvfrom` 返回一个
-  `Packet`。**这是"直白地调用 recvfrom"的形态**，且实测与 `no_recvmmsg` 逐项相同。
+  `Packet`。且实测与 `no_recvmmsg` 逐项相同。
+- `recvfrom-std`：再改用 `std::net::UdpSocket::recv_from`，收包路径里不再有裸描述符。实测与
+  `libc` 版无差别（§5.3），**这是收包路径该定下来的形态**。
 - `receiver.recvmmsg_batch` 在两支上都被保留：所有 `config/*.yaml` 都带这个键，而
   `ReceiverCfg` 是 `deny_unknown_fields`，删字段会让所有配置解析失败。等到 §6 的第 4 条
   一起做时，字段和 YAML 一起删。
 - `no_recvmmsg-looped`：**只用于分解实验**，不该合入（它把批处理形状和 32 次 syscall
   拼在一起，两头都不占优）。
-- 异步后端在 `recvfrom-direct` 上**只有 2 行调用点被改动**，结构未动；但它的行为后果
-  （§5.2）是拦路的，合入前必须先处理。
+- 异步后端在 `recvfrom-direct` / `recvfrom-std` 上**只有 2 行调用点被改动**（`recv_one_nowait`
+  取包、`set_nonblocking(true)`），结构未动；但它的行为后果（§5.2）是拦路的，合入前必须先处理。
+
+**顺带发现一个既有问题（与本次改动无关）**：`cargo build --release --no-default-features`
+**编译不过**，报 `error[E0433]: cannot find status in crate`。`lib.rs:62` 用
+`#[cfg(feature = "status-http")]` 门控了 `mod status`，但 `run.rs:340` 与 `run.rs:372` 无条件
+引用了 `crate::status`。在未改动的基线 `fdd8e15` 上完全相同，所以不是本次引入的。而
+`Cargo.toml` 把 `--no-default-features` 写成受支持的配置（"keeps HTTP and JSON out of a
+production build entirely"）。修法是把那两处引用（以及它们所在的函数/结构体）也门控起来。
 
 ---
 
@@ -296,21 +349,27 @@ ARMS="base=bench/baseline-bin/corr \
       direct=bench/recvfrom-direct-bin/corr" \
   tools/recvmmsg_ab.sh 6 60
 
-# 5. 异步后端（§5.2）。EXTRA_ARGS 是给 corr-async 传 --workers 的
+# 5. std 版 vs libc 版 vs 基线（§5.3）
+ARMS="base=bench/baseline-bin/corr \
+      direct=bench/recvfrom-direct-bin/corr \
+      std=bench/recvfrom-std-bin/corr" \
+  tools/recvmmsg_ab.sh 6 60
+
+# 6. 异步后端（§5.2）。EXTRA_ARGS 是给 corr-async 传 --workers 的
 ARMS="base=bench/baseline-bin/corr-async \
       direct=bench/recvfrom-direct-bin/corr-async" \
   EXTRA_ARGS="--workers 24" tools/recvmmsg_ab.sh 6 60
 
-# 6. 判读（看配对差值的符号，不要看单次绝对值）
+# 7. 判读（看配对差值的符号，不要看单次绝对值）
 tools/ab_report.py bench/recvmmsg-ab/<时间戳>
 
-# 7. 单独证明 recvmmsg 的阻塞语义
+# 8. 单独证明 recvmmsg 的阻塞语义
 gcc -O2 -o /tmp/ms tools/recvmmsg-semantics.c && /tmp/ms
 
-# 8. 需要看每线程 user/sys 与 socket 积压时
+# 9. 需要看每线程 user/sys 与 socket 积压时
 tools/recv_probe.sh bench/baseline-bin/corr
 
-# 9. 异步后端的 reactor 计数器，解释 §5.2（单站一行，注意 iters/ready/pkts 三个数）
+# 10. 异步后端的 reactor 计数器，解释 §5.2（单站一行，注意 iters/ready/pkts 三个数）
 CORR_ASYNC_STATS=1 bench/baseline-bin/corr-async \
   --config config/correlator-24-nf16384-g05.yaml --dry-run --duration 30 --workers 24
 ```

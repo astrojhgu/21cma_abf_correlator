@@ -606,7 +606,7 @@ pub(crate) fn run_receive_with(
             recv_batches: o.batches,
             recv_packets: o.packets,
             recv_empty_polls: o.empty_polls,
-            recv_truncated: o.truncated,
+            recv_oversized: o.oversized,
             ns_recv: o.ns_recv,
             ns_assemble: o.ns_assemble,
             ns_slot_wait: o.stats.ns_slot_wait,

@@ -556,7 +556,7 @@ impl Station {
             // that the reactor can clear its readiness. An empty poll is counted
             // where it now happens -- waiting in the reactor.
             empty_polls: self.idle_polls,
-            truncated: rs.truncated,
+            oversized: rs.oversized,
             ns_recv: self.ns_recv,
             ns_assemble: self.ns_assemble,
             max_stall_ms: self.max_stall_ms,

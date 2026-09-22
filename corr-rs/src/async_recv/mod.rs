@@ -352,7 +352,7 @@ fn execute(
     )?;
     print!("{}", report.render(plan));
     if !report.ok() {
-        bail!("the run reported truncated packets; the receive buffer is too small");
+        bail!("the run reported packets larger than one packet can hold; the front end does not match this configuration");
     }
     // Before the fatal handling: these two endings are not failures, they are the
     // signal to start again. `StreamNotAdvancing` is here because it is the same

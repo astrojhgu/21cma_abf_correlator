@@ -278,7 +278,7 @@ fn execute(
     let report = run::run_receive(cfg, plan, sockets, &first, opts, prepared, stop)?;
     print!("{}", report.render(plan));
     if !report.ok() {
-        bail!("the run reported truncated packets; the receive buffer is too small");
+        bail!("the run reported packets larger than one packet can hold; the front end does not match this configuration");
     }
     // A run that stopped itself -- the staging geometry never agreed with the
     // front end's counter, or a station was zero filled past the cap -- is not a
