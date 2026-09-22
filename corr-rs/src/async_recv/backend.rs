@@ -40,10 +40,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use tokio::io::unix::AsyncFd;
+use tokio::net::UdpSocket;
 
 use crate::backend::{RecvSetup, ReceiveBackend};
-use crate::net::{pin_to_cpu, MulticastSocket};
+use crate::net::{pin_to_cpu, MulticastSocket, RECV_BUF_BYTES};
 use crate::receiver::RecvOutcome;
 use crate::run::StagingPtr;
 
@@ -267,6 +267,8 @@ fn worker_main(
         for p in group {
             // The reactor needs a non-blocking descriptor: an empty socket must
             // say EAGAIN at once instead of parking the worker for SO_RCVTIMEO.
+            // `from_std` requires it too -- tokio refuses to register a socket it
+            // finds in blocking mode.
             if let Err(e) = p.sock.set_nonblocking(true) {
                 eprintln!(
                     "corr-async: worker {w}: station {}: cannot set O_NONBLOCK: {e}",
@@ -274,17 +276,18 @@ fn worker_main(
                 );
                 continue;
             }
-            let fd = p.sock.fd();
-            match AsyncFd::new(fd) {
-                Ok(afd) => ready.push((
-                    StationInit {
-                        idx: p.idx,
-                        sock: p.sock,
-                        staging: p.staging,
-                        progress: p.progress,
-                    },
-                    afd,
-                )),
+            // `tokio`'s socket owns the descriptor *and* its reactor registration,
+            // so there is no second handle to keep in step and no drop order to get
+            // right: the previous version registered a copy of the raw fd and had
+            // to arrange for the registration to go first.
+            match UdpSocket::from_std(p.sock.into_std()) {
+                Ok(sock) => ready.push(StationInit {
+                    idx: p.idx,
+                    sock,
+                    buf: vec![0u8; RECV_BUF_BYTES],
+                    staging: p.staging,
+                    progress: p.progress,
+                }),
                 Err(e) => eprintln!(
                     "corr-async: worker {w}: station {}: cannot register with the reactor: {e}",
                     p.idx
@@ -293,8 +296,8 @@ fn worker_main(
         }
 
         let mut set = tokio::task::JoinSet::new();
-        for (init, afd) in ready {
-            set.spawn(station_task(init, g.clone(), afd));
+        for init in ready {
+            set.spawn(station_task(init, g.clone()));
         }
         let mut out = Vec::with_capacity(set.len());
         while let Some(joined) = set.join_next().await {

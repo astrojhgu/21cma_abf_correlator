@@ -26,14 +26,14 @@
 //! * the park delay, which is the async stand-in for the condition variable's
 //!   1 ms backstop and is deliberately shorter (200 us).
 
-use std::os::unix::io::RawFd;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::unix::AsyncFd;
+use tokio::net::UdpSocket;
 
 use crate::assemble::{AssembleError, FeedOutcome, SlotRing, StationAssembler};
-use crate::net::MulticastSocket;
+use crate::net::{Packet, PACKET_BYTES};
 use crate::receiver::RecvOutcome;
 use crate::run::StagingPtr;
 use crate::sched::StationProgress;
@@ -123,7 +123,13 @@ pub(crate) struct RunGeometry {
 /// One station, as handed to its task.
 pub(crate) struct StationInit {
     pub(crate) idx: usize,
-    pub(crate) sock: MulticastSocket,
+    /// The socket, owned by `tokio` from here on: it holds the descriptor and its
+    /// reactor registration together.
+    pub(crate) sock: UdpSocket,
+    /// Where the socket receives into. `std`'s and `tokio`'s sockets both take the
+    /// buffer from the caller rather than lending one, which is what keeps a
+    /// datagram from being copied into an owned item.
+    pub(crate) buf: Vec<u8>,
     pub(crate) staging: StagingPtr,
     pub(crate) progress: Arc<StationProgress>,
 }
@@ -148,7 +154,6 @@ pub(crate) struct TaskStats {
     pub(crate) iterations: u64,
     pub(crate) tick_fires: u64,
     pub(crate) ready_events: u64,
-    pub(crate) not_ready: u64,
     pub(crate) dry_reads: u64,
     pub(crate) batches: u64,
     pub(crate) yields: u64,
@@ -160,14 +165,20 @@ pub(crate) struct TaskStats {
 
 struct Station {
     idx: usize,
-    sock: MulticastSocket,
+    sock: UdpSocket,
+    /// One datagram, received by [`Station::receive_one`] and placed by
+    /// [`Station::place_one`]. It holds a packet that a busy staging slot has not
+    /// let through yet: nothing receives into it again until that packet is placed,
+    /// which is what makes a refusal a retry rather than a loss.
+    buf: Vec<u8>,
+    /// How many bytes of `buf` the last receive filled.
+    len: usize,
+    /// Whether `buf` holds a packet that has not been placed yet.
+    have_packet: bool,
     asm: StationAssembler,
     prog: Arc<StationProgress>,
     stop: Arc<RunStop>,
     g: Arc<RunGeometry>,
-    /// Packets currently in the socket's batch buffers, and how many are placed.
-    have: usize,
-    next: usize,
     /// Packets left before this task yields to its siblings.
     budget: u64,
     /// The slot the last refusal was about, which is what a park waits for.
@@ -180,6 +191,9 @@ struct Station {
     // the numbers mean the same thing.
     batches: u64,
     packets: u64,
+    /// Datagrams longer than one packet can hold. Counted here rather than in the
+    /// socket because this backend's socket is `tokio`'s; see `net::RecvStats`.
+    oversized: u64,
     idle_polls: u64,
     ns_recv: u64,
     ns_assemble: u64,
@@ -215,17 +229,19 @@ impl Station {
         Station {
             idx: init.idx,
             sock: init.sock,
+            buf: init.buf,
+            len: 0,
+            have_packet: false,
             asm,
             prog: init.progress,
             stop: g.stop.clone(),
             g,
-            have: 0,
-            next: 0,
             budget: DRAIN_BUDGET_PACKETS,
             parked_slot: None,
             ns_slot_wait: 0,
             batches: 0,
             packets: 0,
+            oversized: 0,
             idle_polls: 0,
             ns_recv: 0,
             ns_assemble: 0,
@@ -277,74 +293,63 @@ impl Station {
         }
     }
 
-    /// Walk the packets buffered in the socket, stopping at the first one whose
-    /// frame has no writable staging slot yet.
-    fn consume(&mut self) -> Batch {
+    /// Place the one packet this station is holding, if it is holding one.
+    ///
+    /// A refusal is not consumption: the packet stays in the buffer and the caller
+    /// retries it after parking, which is what the thread path's `wait_free` loop
+    /// does with its own packet.
+    fn place_one(&mut self) -> Batch {
         let t0 = Instant::now();
         let mut outcome = Batch::Drained;
-        {
-            // Split borrows: the packet buffer lives in the socket, the placement
-            // decision in the assembler, and the two are disjoint fields.
-            let Station {
-                idx,
-                sock,
-                asm,
-                next,
-                have,
-                packets,
-                budget,
-                parked_slot,
-                stop,
-                ..
-            } = self;
-            let idx = *idx;
-            while *next < *have {
-                let Some(pkt) = sock.packet() else {
-                    // Shorter than a counter: the thread path ignores it too, and
-                    // counting it as anything else would make the two reports
-                    // disagree on a case neither can do anything about.
-                    *next += 1;
-                    continue;
-                };
-                match asm.try_on_packet(pkt.counter, pkt.samples) {
-                    Ok(FeedOutcome::Taken) => {
-                        *packets += 1;
-                        *next += 1;
-                        *budget = budget.saturating_sub(1);
-                    }
-                    Ok(FeedOutcome::SlotBusy { slot_seq }) => {
-                        *parked_slot = Some(slot_seq);
-                        outcome = Batch::SlotBusy;
-                        break;
-                    }
-                    Err(e @ AssembleError::CounterEpochChange { from, to, back }) => {
-                        // The run's observation is over; say so as itself, not as a
-                        // fatal error, because the caller can start again.
-                        eprintln!("corr-async: station {idx}: {e}");
-                        stop.stop(StopReason::CounterEpochChange {
-                            station: idx,
-                            from,
-                            to,
-                            back,
+        if self.have_packet {
+            // Split borrows: the packet borrows the receive buffer, the placement
+            // decision is the assembler's, and the two are disjoint fields.
+            let Some(pkt) = Packet::parse(&self.buf, self.len) else {
+                // Shorter than a counter: the thread path ignores it too, and
+                // counting it as anything else would make the two reports disagree
+                // on a case neither can do anything about.
+                self.have_packet = false;
+                self.publish();
+                self.ns_assemble += t0.elapsed().as_nanos() as u64;
+                return Batch::Drained;
+            };
+            match self.asm.try_on_packet(pkt.counter, pkt.samples) {
+                Ok(FeedOutcome::Taken) => {
+                    self.packets += 1;
+                    self.budget = self.budget.saturating_sub(1);
+                    self.have_packet = false;
+                }
+                Ok(FeedOutcome::SlotBusy { slot_seq }) => {
+                    // Nothing consumed: `have_packet` stays set so the packet is
+                    // tried again once the slot is released.
+                    self.parked_slot = Some(slot_seq);
+                    outcome = Batch::SlotBusy;
+                }
+                Err(e @ AssembleError::CounterEpochChange { from, to, back }) => {
+                    // The run's observation is over; say so as itself, not as a
+                    // fatal error, because the caller can start again.
+                    eprintln!("corr-async: station {}: {e}", self.idx);
+                    self.stop.stop(StopReason::CounterEpochChange {
+                        station: self.idx,
+                        from,
+                        to,
+                        back,
+                    });
+                    outcome = Batch::Fatal;
+                }
+                Err(e) if e.is_fatal() => {
+                    if !matches!(e, AssembleError::Aborted) {
+                        eprintln!("corr-async: station {}: {e}", self.idx);
+                        self.stop.stop(StopReason::Fatal {
+                            station: self.idx,
+                            message: e.to_string(),
                         });
-                        outcome = Batch::Fatal;
-                        break;
                     }
-                    Err(e) if e.is_fatal() => {
-                        if !matches!(e, AssembleError::Aborted) {
-                            eprintln!("corr-async: station {idx}: {e}");
-                            stop.stop(StopReason::Fatal {
-                                station: idx,
-                                message: e.to_string(),
-                            });
-                        }
-                        outcome = Batch::Fatal;
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("corr-async: station {idx}: {e}");
-                        *next += 1;
-                    }
+                    outcome = Batch::Fatal;
+                }
+                Err(e) => {
+                    eprintln!("corr-async: station {}: {e}", self.idx);
+                    self.have_packet = false;
                 }
             }
         }
@@ -354,9 +359,9 @@ impl Station {
         // Publish *before* the caller can wait, whatever stopped the walk --
         // including a refused slot. This is invariant 1 (docs/ARCHITECTURE.md
         // section 3) and it is what the thread path gets for free by publishing at
-        // the end of every batch: the scheduler's permission to release the slot
+        // the end of every packet: the scheduler's permission to release the slot
         // this station is about to wait for is derived from the progress published
-        // here. Parking without publishing is the documented "one batch short of
+        // here. Parking without publishing is the documented "one packet short of
         // the boundary" deadlock, and on the 16384-channel profile it cost the run
         // its rows entirely: the watermark stalled, releases stopped, and the only
         // thing that moved the run along was the 200 ms stall detector.
@@ -364,15 +369,38 @@ impl Station {
         outcome
     }
 
+    /// One datagram off the socket, if it has one.
+    ///
+    /// `Ok(false)` is a dry socket. That is not just information for this loop:
+    /// `tokio` holds readiness in a cache of its own and clears it when an
+    /// operation says `WouldBlock`, so this is also how the reactor learns that it
+    /// has to wait for the next edge.
+    fn receive_one(&mut self) -> io::Result<bool> {
+        match self.sock.try_recv_from(&mut self.buf) {
+            Ok((n, _peer)) => {
+                // The peer address is discarded: which board a stream comes from is
+                // decided by the group this socket joined, not by the datagram.
+                self.len = n;
+                if n > PACKET_BYTES {
+                    self.oversized += 1;
+                }
+                self.dbg.ready_events += 1;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The station's task, from the first poll to the last.
     ///
-    /// The reactor is borrowed rather than owned on purpose: the caller drops it
-    /// *before* the socket, so the descriptor is deregistered while it is still
-    /// open. Owning it here would leave the drop order to the language's rules,
-    /// and one of the two orders closes a descriptor that tokio still has in its
-    /// epoll set -- a bug that would show up as a deregistration of whatever file
-    /// the process opened next, in a run that otherwise looks healthy.
-    async fn run(&mut self, afd: &AsyncFd<RawFd>) -> RecvOutcome {
+    /// The socket is owned here, and so is its reactor registration: `tokio`'s
+    /// `UdpSocket` holds the descriptor. That is what makes the drop order somebody
+    /// else's problem -- the version before this one registered a *copy* of the raw
+    /// fd with `AsyncFd` and had to borrow it rather than own it, so that the
+    /// registration went first. Getting that wrong deregisters whatever file the
+    /// process opens next, in a run that otherwise looks healthy.
+    async fn run(&mut self) -> RecvOutcome {
         let mut tick = tokio::time::interval(self.g.poll_interval);
         // Late ticks must not stack up: a worker that was busy for 10 ms would
         // otherwise fire ten immediate ticks, each of which would run a full
@@ -403,13 +431,11 @@ impl Station {
                 break;
             }
 
-            if self.next < self.have {
-                match self.consume() {
+            if self.have_packet {
+                match self.place_one() {
                     Batch::Drained => {
-                        self.have = 0;
-                        self.next = 0;
                         park_rounds = 0;
-                        // The publish is inside `consume`, before anything can wait.
+                        // The publish is inside `place_one`, before anything can wait.
                     }
                     Batch::SlotBusy => {
                         // The ring belongs to the pipeline. Park *this* station:
@@ -461,42 +487,47 @@ impl Station {
                 continue;
             }
 
-            // Nothing buffered: wait for the socket, but never for ever. The tick
-            // is what bounds how long a silent station may ignore a request.
+            // Nothing held: wait for the socket, but never for ever. The tick is
+            // what bounds how long a silent station may ignore a request.
+            //
+            // The tick's own counter is bumped after the select rather than inside
+            // its branch body: `self.sock.readable()` holds a borrow of a field of
+            // `self` for as long as the select lasts, and keeping the bodies to
+            // plain locals keeps that from mattering.
             let t0 = Instant::now();
-            let n = tokio::select! {
+            let mut ticked = false;
+            let ready = tokio::select! {
                 _ = tick.tick() => {
-                    self.dbg.tick_fires += 1;
-                    0
+                    ticked = true;
+                    None
                 }
-                ready = afd.readable() => match ready {
-                    Ok(mut guard) => match guard.try_io(|_| self.sock.recv_one_nowait()) {
-                        Ok(Ok(())) => {
-                            self.dbg.ready_events += 1;
-                            // One syscall, one packet: the packet is now in the
-                            // socket's buffer and `consume` reads it from there.
-                            1
-                        }
-                        Ok(Err(e)) => {
-                            eprintln!("corr-async: station {}: receive error: {e}", self.idx);
-                            0
-                        }
-                        // The readiness was taken between the poll and the read;
-                        // there is nothing to do but ask again.
-                        Err(_not_ready) => {
-                            self.dbg.not_ready += 1;
-                            0
-                        }
-                    },
+                r = self.sock.readable() => Some(r),
+            };
+            if ticked {
+                self.dbg.tick_fires += 1;
+            }
+            let dry = match ready {
+                // A tick: not a packet, but not nothing either -- the loop goes
+                // round and services the scheduler's request, which is the point.
+                None => true,
+                Some(Err(e)) => {
+                    eprintln!("corr-async: station {}: reactor error: {e}", self.idx);
+                    true
+                }
+                // Readable. One packet now; draining the rest of what the socket
+                // holds is the next thing to try, and the counters are here to say
+                // whether it is worth it.
+                Some(Ok(())) => match self.receive_one() {
+                    Ok(got) => !got,
                     Err(e) => {
-                        eprintln!("corr-async: station {}: reactor error: {e}", self.idx);
-                        0
+                        eprintln!("corr-async: station {}: receive error: {e}", self.idx);
+                        true
                     }
                 },
             };
             let waited = t0.elapsed().as_nanos() as u64;
             self.ns_recv += waited;
-            if n == 0 {
+            if dry {
                 // A tick, or a readiness that yielded nothing: either way the
                 // socket was dry, which is what an empty poll means here.
                 self.dbg.ns_wait += waited;
@@ -516,22 +547,20 @@ impl Station {
             self.batches += 1;
             self.dbg.batches += 1;
             self.prog.mark_packet();
-            self.prog.add_packets(n as u64);
-            self.have = n;
-            self.next = 0;
+            self.prog.add_packets(1);
+            self.have_packet = true;
         }
 
         if std::env::var_os("CORR_ASYNC_STATS").is_some() {
             let d = self.dbg;
             eprintln!(
-                "corr-async: station {:2}: iters={} ticks={} ready={} not_ready={} dry={} \
+                "corr-async: station {:2}: iters={} ticks={} ready={} dry={} \
                  batches={} yields={} parks={} consume={:.3}s wait={:.3}s pkts={} \
                  ring_refusals={} ring_wait_polls={}",
                 self.idx,
                 d.iterations,
                 d.tick_fires,
                 d.ready_events,
-                d.not_ready,
                 d.dry_reads,
                 d.batches,
                 d.yields,
@@ -545,18 +574,17 @@ impl Station {
         }
         // One last publish, so the report reflects everything consumed.
         self.prog.set(self.asm.progress());
-        let rs = self.sock.stats();
         RecvOutcome {
             stats: self.asm.stats(),
             progress: self.asm.progress(),
             batches: self.batches,
             packets: self.packets,
-            // The socket's own counter stays zero here: this path reads through
-            // `recv_batch_nowait`, which reports a dry socket as `WouldBlock` so
-            // that the reactor can clear its readiness. An empty poll is counted
-            // where it now happens -- waiting in the reactor.
+            // The socket's own counter stays zero here, and always did: this path
+            // reads through its own non-blocking calls, and an empty socket is an
+            // empty poll. What it does not have that the socket would is a place to
+            // count an oversized datagram, so this station counts its own.
             empty_polls: self.idle_polls,
-            oversized: rs.oversized,
+            oversized: self.oversized,
             ns_recv: self.ns_recv,
             ns_assemble: self.ns_assemble,
             max_stall_ms: self.max_stall_ms,
@@ -567,16 +595,11 @@ impl Station {
 
 /// Run one station to completion. Never returns an error: a failure that ends the
 /// run is reported through `RunStop`, exactly as the thread path does it.
-pub(crate) async fn station_task(
-    init: StationInit,
-    g: Arc<RunGeometry>,
-    afd: AsyncFd<RawFd>,
-) -> (usize, RecvOutcome) {
+pub(crate) async fn station_task(init: StationInit, g: Arc<RunGeometry>) -> (usize, RecvOutcome) {
     let idx = init.idx;
+    // No drop dance here any more: the socket carries its own reactor
+    // registration, so the order they go in cannot be got wrong.
     let mut station = Station::new(init, g);
-    let outcome = station.run(&afd).await;
-    // Deregister before the socket closes; see `Station::run`.
-    drop(afd);
-    drop(station);
+    let outcome = station.run().await;
     (idx, outcome)
 }

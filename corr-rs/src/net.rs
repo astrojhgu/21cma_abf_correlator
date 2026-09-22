@@ -54,7 +54,11 @@ pub const PACKET_BYTES: usize = COUNTER_BYTES + PAYLOAD_BYTES;
 /// times it did -- so what is checked instead is whether what arrived is *longer
 /// than the packet layout this program was built for*, which is the thing that
 /// actually matters and which `MSG_TRUNC` never caught anyway.
-const RECV_BUF_BYTES: usize = 65536;
+///
+/// Exported because the readiness-driven backend receives into a buffer of its own
+/// (its socket belongs to `tokio`, which has no buffer to lend) and has to size it
+/// by the same rule.
+pub const RECV_BUF_BYTES: usize = 65536;
 
 /// `SO_BUSY_POLL` is 46 on Linux; spelled out because the libc crate does not
 /// expose it on every target.
@@ -84,6 +88,36 @@ pub struct Packet<'a> {
     /// datagram was short or truncated; the assembler rejects anything that cannot
     /// fill one.
     pub samples: &'a [u8],
+}
+
+impl<'a> Packet<'a> {
+    /// Split a datagram that has just been received into `buf` into a packet.
+    ///
+    /// `None` means the datagram was too short to hold the counter every packet
+    /// starts with. There is no counter to report and the samples behind it cannot
+    /// be placed without one, so such a datagram is dropped.
+    ///
+    /// This is a free function on the type rather than a method on the socket
+    /// because both backends need it and only one of them keeps a
+    /// [`MulticastSocket`]: the readiness-driven backend receives into a buffer of
+    /// its own, through `tokio`'s socket, and parses with this.
+    pub fn parse(buf: &'a [u8], len: usize) -> Option<Packet<'a>> {
+        // `len` is always inside `buf`: a receive buffer holds any datagram UDP can
+        // carry, so a receive cannot have written past it or shortened one.
+        let len = len.min(buf.len());
+        if len < COUNTER_BYTES {
+            return None;
+        }
+        let bytes = &buf[..len];
+        let mut c = [0u8; COUNTER_BYTES];
+        c.copy_from_slice(&bytes[..COUNTER_BYTES]);
+        // Little endian, verified against the front end: the counter is
+        // contiguous as a uint64 LE and not as a BE.
+        Some(Packet {
+            counter: u64::from_le_bytes(c),
+            samples: &bytes[COUNTER_BYTES..],
+        })
+    }
 }
 
 /// One UDP multicast socket, with room for one datagram.
@@ -248,34 +282,13 @@ impl MulticastSocket {
     /// quiet.
     pub fn recv_one(&mut self) -> io::Result<Option<Packet<'_>>> {
         match self.recv_from() {
-            Ok(()) => Ok(self.packet()),
+            Ok(()) => Ok(Packet::parse(&self.buf, self.len)),
             Err(e) if is_empty_socket(&e) => {
                 self.stats.empty_polls += 1;
                 Ok(None)
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// Receive one packet, reporting an empty socket as `WouldBlock`.
-    ///
-    /// The same single `recvfrom` as [`Self::recv_one`]. It exists separately
-    /// because the readiness-driven backend cannot take a borrowed packet, and
-    /// neither reason for that is a preference:
-    ///
-    /// * a reactor (epoll, and therefore anything built on it) clears an
-    ///   edge-triggered readiness only when the caller says the socket ran dry, so
-    ///   an empty socket has to reach it as an `Err` rather than as "no packet";
-    /// * the packet has to be carried out of a `try_io` closure and across a
-    ///   `select!` before it can be used, which a borrow of this socket cannot do.
-    ///
-    /// So the bytes stay in the socket's buffer and are read back with
-    /// [`Self::packet`], which is what that backend already did.
-    ///
-    /// Requires the socket to be non-blocking ([`UdpSocket::set_nonblocking`]),
-    /// otherwise an empty socket blocks for `SO_RCVTIMEO` before it says so.
-    pub(crate) fn recv_one_nowait(&mut self) -> io::Result<()> {
-        self.recv_from()
     }
 
     /// The syscall itself: one datagram into this socket's buffer.
@@ -309,35 +322,17 @@ impl MulticastSocket {
         self.sock.set_nonblocking(nonblocking)
     }
 
-    /// The packet the last receive put in this socket's buffer.
+    /// Give the socket up, for a backend that wants to own it rather than receive
+    /// through this type.
     ///
-    /// `None` means that datagram was too short to hold the counter every packet
-    /// starts with. There is no counter to report and the samples behind it
-    /// cannot be placed without one, so such a packet is dropped -- the same
-    /// outcome the batched receive path had, which returned `None` here for the
-    /// same reason.
-    pub fn packet(&self) -> Option<Packet<'_>> {
-        let len = self.len;
-        if len < COUNTER_BYTES {
-            return None;
-        }
-        // `len` is always inside `buf`: the buffer holds any datagram UDP can
-        // carry, so the receive cannot have written past it or shortened one.
-        let bytes = &self.buf[..len];
-        let mut c = [0u8; 8];
-        c.copy_from_slice(&bytes[..COUNTER_BYTES]);
-        // Little endian, verified against the front end: the counter is
-        // contiguous as a uint64 LE and not as a BE.
-        Some(Packet {
-            counter: u64::from_le_bytes(c),
-            samples: &bytes[COUNTER_BYTES..],
-        })
-    }
-
-    /// The descriptor, for the one caller that has to register it with a reactor
-    /// ([`crate::async_recv`]) rather than receive through it.
-    pub fn fd(&self) -> RawFd {
-        self.sock.as_raw_fd()
+    /// The readiness-driven backend hands it to `tokio::net::UdpSocket`, which
+    /// owns both the descriptor and its reactor registration -- that is what makes
+    /// the drop order between the two somebody else's problem. The counters and the
+    /// `SO_BUSY_POLL` answer collected here are *not* carried over: they describe
+    /// this wrapper, and the caller has already reported them by the time it hands
+    /// the socket on.
+    pub fn into_std(self) -> std::net::UdpSocket {
+        self.sock
     }
 }
 
@@ -427,7 +422,6 @@ mod tests {
         let s = MulticastSocket::open(&cfg, Ipv4Addr::new(239, 255, 0, 1), 29999);
         match s {
             Ok(sock) => {
-                assert!(sock.fd() >= 0);
                 let granted = sock.rcvbuf().expect("SO_RCVBUF should be readable");
                 assert!(granted > 0, "kernel granted a zero receive buffer");
             }
@@ -563,13 +557,15 @@ mod tests {
         pin_to_cpu(0).expect("sched_setaffinity(0) should work unprivileged");
     }
 
-    /// The reactor's contract: an empty non-blocking socket says `WouldBlock`
-    /// *immediately*, while the blocking flavour still folds that into `Ok(None)`.
-    /// A reactor that got `Ok(None)` instead could not tell "empty" from "a
-    /// zero-length datagram arrived" and would never clear its readiness, which is
-    /// a busy loop that looks like a hot socket.
+    /// An empty non-blocking socket must say so *at once* rather than parking the
+    /// caller for `SO_RCVTIMEO`.
+    ///
+    /// This is what the readiness-driven backend relies on before it hands the
+    /// socket over: `tokio`'s `from_std` refuses a descriptor it finds in blocking
+    /// mode, and once registered, an empty socket has to come back as `WouldBlock`
+    /// so the reactor can clear its readiness instead of spinning on it.
     #[test]
-    fn a_nonblocking_socket_reports_an_empty_poll_as_would_block() {
+    fn a_nonblocking_socket_says_empty_at_once() {
         let cfg = test_receiver_cfg();
         let mut sock = match MulticastSocket::open(&cfg, Ipv4Addr::new(239, 255, 0, 3), 29997) {
             Ok(s) => s,
@@ -582,20 +578,20 @@ mod tests {
         sock.set_nonblocking(true)
             .expect("setting it twice is a no-op");
 
+        // The test socket's SO_RCVTIMEO is 20 ms, so returning well inside that is
+        // the difference between non-blocking and blocking.
         let t0 = std::time::Instant::now();
-        let e = sock
-            .recv_one_nowait()
-            .expect_err("nothing was sent, so the reactor must be told the socket is dry");
-        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let got = sock.recv_one().expect("an empty poll is not an error");
+        let dt = t0.elapsed();
+        assert!(got.is_none(), "nothing was sent, so nothing should arrive");
         assert!(
-            t0.elapsed() < std::time::Duration::from_millis(5),
-            "a non-blocking poll must not wait for SO_RCVTIMEO, took {:?}",
-            t0.elapsed()
+            dt < std::time::Duration::from_millis(5),
+            "a non-blocking poll must not wait for SO_RCVTIMEO, took {dt:?}"
         );
 
-        // The blocking-flavoured entry point still reports the same empty poll as
-        // `Ok(None)` and counts it, which is what the thread-per-station path
-        // relies on to notice that it should service other work.
+        // The blocking flavour folds the same empty poll into `Ok(None)` and counts
+        // it, which is what the thread-per-station path relies on to notice that it
+        // should service other work.
         let before = sock.stats().empty_polls;
         assert!(sock
             .recv_one()
