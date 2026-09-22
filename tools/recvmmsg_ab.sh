@@ -39,6 +39,16 @@
 #   ARMS="base=bench/baseline-bin/corr single=bench/no-recvmmsg-bin/corr" \
 #     tools/recvmmsg_ab.sh 6 60
 #
+#   # the direct-call build, with the intermediate one kept as a control that the
+#   # API change itself is performance-neutral (docs/DESIGN-no-recvmmsg.md 5.1)
+#   ARMS="base=bench/baseline-bin/corr single=bench/no-recvmmsg-bin/corr \
+#         direct=bench/recvfrom-direct-bin/corr" tools/recvmmsg_ab.sh 6 60
+#
+#   # the readiness-driven backend, which needs its worker count
+#   ARMS="base=bench/baseline-bin/corr-async \
+#         direct=bench/recvfrom-direct-bin/corr-async" \
+#     EXTRA_ARGS="--workers 24" tools/recvmmsg_ab.sh 6 60
+#
 # Read the result with tools/ab_report.py <output dir>.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -52,6 +62,10 @@ NIC=${NIC:-ens2f0np0}
 ARMS_SPEC=${ARMS:-"base=bench/baseline-bin/corr \
 looped=bench/no-recvmmsg-looped-corr \
 single=bench/no-recvmmsg-bin/corr"}
+
+# Extra arguments passed to every arm, which is how the readiness-driven binary is
+# driven: EXTRA_ARGS="--workers 24" tools/recvmmsg_ab.sh 6 60
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 NAMES=(); PATHS=()
 for spec in $ARMS_SPEC; do
@@ -83,10 +97,10 @@ run_arm() { # <index> <round>
   local log="$OUT/r${round}-${arm}.log" d0 d1 t0 t1
   d0=$(nic_drops); t0=$(date +%s.%N)
   timeout $((DUR + 60)) /usr/bin/time -v "$bin" \
-      --config "$CFG" --dry-run --duration "$DUR" >"$log" 2>&1 || true
+      --config "$CFG" --dry-run --duration "$DUR" $EXTRA_ARGS >"$log" 2>&1 || true
   t1=$(date +%s.%N); d1=$(nic_drops)
   {
-    echo "arm=$arm binary=$bin round=$round duration=$DUR"
+    echo "arm=$arm binary=$bin round=$round duration=$DUR extra_args='$EXTRA_ARGS'"
     echo "wall_s=$(echo "$t1 - $t0" | bc)"
     # The condition both arms share: this card drops on its own at this rate, and a
     # comparison that ignored it would blame the receiver for the NIC's losses.

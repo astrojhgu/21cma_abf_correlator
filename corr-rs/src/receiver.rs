@@ -83,22 +83,19 @@ pub fn sniff_first_counters(
         }
         let mut progressed = false;
         for i in 0..n {
-            let got = sockets[i].recv_batch()?;
-            if got > 0 {
-                // The last packet of the batch is the station's latest counter;
-                // see the note above on why the first one is not good enough.
-                if let Some((c, _)) = sockets[i].packet(got - 1) {
-                    // Count the station, not the batch. Decrementing on every batch
-                    // let one busy station drive `remaining` to zero on its own, so
-                    // the loop stopped early and the code below unwrapped a station
-                    // that had never been heard from -- a panic during start-up,
-                    // reachable whenever one station comes up late.
-                    if latest[i].is_none() {
-                        remaining = remaining.saturating_sub(1);
-                    }
-                    latest[i] = Some(c);
-                    progressed = true;
+            // One packet per call, so the counter kept is always the latest seen --
+            // which is why this reads the packet rather than the first of a batch.
+            if let Some(pkt) = sockets[i].recv_one()? {
+                // Count the station, not the packet. Decrementing on every packet
+                // let one busy station drive `remaining` to zero on its own, so
+                // the loop stopped early and the code below unwrapped a station
+                // that had never been heard from -- a panic during start-up,
+                // reachable whenever one station comes up late.
+                if latest[i].is_none() {
+                    remaining = remaining.saturating_sub(1);
                 }
+                latest[i] = Some(pkt.counter);
+                progressed = true;
             }
         }
         if remaining == 0 && settle_until.is_none() {
@@ -247,12 +244,15 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
         }
 
         let t_recv = Instant::now();
-        let batch = sock.recv_batch();
+        let got = sock.recv_one();
         ns_recv += t_recv.elapsed().as_nanos() as u64;
         let t_assemble = Instant::now();
-        match batch {
-            Ok(0) => {}
-            Ok(n) => {
+        match got {
+            // Nothing to place: the socket was empty for the whole timeout, or a
+            // datagram arrived too short to hold a counter. Both mean the loop
+            // goes round again, and the second is what `packet` already dropped.
+            Ok(None) => {}
+            Ok(Some(pkt)) => {
                 let stall_ms = last_read.elapsed().as_millis() as u64;
                 last_read = Instant::now();
                 if stall_ms > max_stall_ms {
@@ -263,42 +263,36 @@ pub(crate) fn recv_thread(a: RecvThreadArgs) -> RecvOutcome {
                 }
                 batches += 1;
                 a.prog.mark_packet();
-                a.prog.add_packets(n as u64);
+                a.prog.add_packets(1);
                 let mut fatal_here = false;
-                for i in 0..n {
-                    if let Some((counter, payload)) = sock.packet(i) {
-                        match asm.on_packet(counter, payload) {
-                            Ok(()) => packets += 1,
-                            Err(e @ crate::assemble::AssembleError::CounterEpochChange {
-                                from,
-                                to,
-                                back,
-                            }) => {
-                                eprintln!("corr: station {}: {e}", a.idx);
-                                a.stop.stop(StopReason::CounterEpochChange {
-                                    station: a.idx,
-                                    from,
-                                    to,
-                                    back,
-                                });
-                                fatal_here = true;
-                                break;
-                            }
-                            // Shutting down: stop parsing this batch and unwind.
-                            Err(e) if e.is_fatal() => {
-                                if !matches!(e, crate::assemble::AssembleError::Aborted) {
-                                    eprintln!("corr: station {}: {e}", a.idx);
-                                    a.stop.stop(StopReason::Fatal {
-                                        station: a.idx,
-                                        message: e.to_string(),
-                                    });
-                                }
-                                fatal_here = true;
-                                break;
-                            }
-                            Err(e) => eprintln!("corr: station {}: {e}", a.idx),
-                        }
+                match asm.on_packet(pkt.counter, pkt.samples) {
+                    Ok(()) => packets += 1,
+                    Err(e @ crate::assemble::AssembleError::CounterEpochChange {
+                        from,
+                        to,
+                        back,
+                    }) => {
+                        eprintln!("corr: station {}: {e}", a.idx);
+                        a.stop.stop(StopReason::CounterEpochChange {
+                            station: a.idx,
+                            from,
+                            to,
+                            back,
+                        });
+                        fatal_here = true;
                     }
+                    // Shutting down: stop parsing and unwind.
+                    Err(e) if e.is_fatal() => {
+                        if !matches!(e, crate::assemble::AssembleError::Aborted) {
+                            eprintln!("corr: station {}: {e}", a.idx);
+                            a.stop.stop(StopReason::Fatal {
+                                station: a.idx,
+                                message: e.to_string(),
+                            });
+                        }
+                        fatal_here = true;
+                    }
+                    Err(e) => eprintln!("corr: station {}: {e}", a.idx),
                 }
                 a.prog.set(asm.progress());
                 a.prog.set_zero_filled_frames(asm.stats().zero_filled_frames);

@@ -299,15 +299,14 @@ impl Station {
             } = self;
             let idx = *idx;
             while *next < *have {
-                let i = *next;
-                let Some((counter, payload)) = sock.packet(i) else {
+                let Some(pkt) = sock.packet() else {
                     // Shorter than a counter: the thread path ignores it too, and
                     // counting it as anything else would make the two reports
                     // disagree on a case neither can do anything about.
                     *next += 1;
                     continue;
                 };
-                match asm.try_on_packet(counter, payload) {
+                match asm.try_on_packet(pkt.counter, pkt.samples) {
                     Ok(FeedOutcome::Taken) => {
                         *packets += 1;
                         *next += 1;
@@ -471,10 +470,12 @@ impl Station {
                     0
                 }
                 ready = afd.readable() => match ready {
-                    Ok(mut guard) => match guard.try_io(|_| self.sock.recv_batch_nowait()) {
-                        Ok(Ok(n)) => {
+                    Ok(mut guard) => match guard.try_io(|_| self.sock.recv_one_nowait()) {
+                        Ok(Ok(())) => {
                             self.dbg.ready_events += 1;
-                            n
+                            // One syscall, one packet: the packet is now in the
+                            // socket's buffer and `consume` reads it from there.
+                            1
                         }
                         Ok(Err(e)) => {
                             eprintln!("corr-async: station {}: receive error: {e}", self.idx);

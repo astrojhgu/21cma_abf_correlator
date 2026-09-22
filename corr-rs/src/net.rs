@@ -51,6 +51,21 @@ pub struct RecvStats {
     pub truncated: u64,
 }
 
+/// One received packet: the counter that prefixes it, and the samples behind it.
+///
+/// Borrows the socket's receive buffer, which the next receive overwrites, so a
+/// packet cannot outlive the call that produced it. That is the point: there is no
+/// second buffer, no batch, and nothing to index.
+pub struct Packet<'a> {
+    /// The front end's packet counter, little endian on the wire. It is a global
+    /// counter shared by the boards, not a per-station one.
+    pub counter: u64,
+    /// Sample bytes, as many as arrived. Shorter than a full sample block when the
+    /// datagram was short or truncated; the assembler rejects anything that cannot
+    /// fill one.
+    pub samples: &'a [u8],
+}
+
 /// One UDP multicast socket, with room for one packet.
 pub struct MulticastSocket {
     fd: RawFd,
@@ -217,21 +232,20 @@ impl MulticastSocket {
         self.stats
     }
 
-    /// Receive one packet: `Ok(1)` if one arrived, `Ok(0)` if the socket was dry.
+    /// Receive one packet, waiting for one for up to `SO_RCVTIMEO`.
     ///
-    /// `WouldBlock`/`TimedOut` are returned as `Ok(0)`: an empty poll is the
-    /// normal way a receive thread notices that it should service other work.
-    pub fn recv_batch(&mut self) -> io::Result<usize> {
-        match self.recv_batch_nowait() {
-            Ok(n) => Ok(n),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
+    /// `Ok(None)` means there was nothing to place: the socket stayed empty for
+    /// the whole timeout, or a datagram arrived too short to carry the counter
+    /// every packet is prefixed with. An empty socket is not an error here -- it
+    /// is the normal way a receive thread notices that it should service other
+    /// work, such as the scheduler's request to zero fill a station that has gone
+    /// quiet.
+    pub fn recv_one(&mut self) -> io::Result<Option<Packet<'_>>> {
+        match self.recv_from() {
+            Ok(()) => Ok(self.packet()),
+            Err(e) if is_empty_socket(&e) => {
                 self.stats.empty_polls += 1;
-                Ok(0)
+                Ok(None)
             }
             Err(e) => Err(e),
         }
@@ -239,17 +253,27 @@ impl MulticastSocket {
 
     /// Receive one packet, reporting an empty socket as `WouldBlock`.
     ///
-    /// The difference from [`Self::recv_batch`] is not cosmetic and is not a
-    /// preference: a readiness-based reactor (epoll, and therefore anything built
-    /// on it) only clears an edge-triggered socket's readiness when the caller
-    /// says the socket ran dry. `recv_batch` folds "empty" into `Ok(0)`, which a
-    /// reactor cannot tell from "a zero-length packet arrived", so a level of the
-    /// pipeline that speaks to epoll has to see the `Err`. This is
-    /// [`Self::recv_batch`]'s own implementation, with the error left alone.
+    /// The same single `recvfrom` as [`Self::recv_one`]. It exists separately
+    /// because the readiness-driven backend cannot take a borrowed packet, and
+    /// neither reason for that is a preference:
+    ///
+    /// * a reactor (epoll, and therefore anything built on it) clears an
+    ///   edge-triggered readiness only when the caller says the socket ran dry, so
+    ///   an empty socket has to reach it as an `Err` rather than as "no packet";
+    /// * the packet has to be carried out of a `try_io` closure and across a
+    ///   `select!` before it can be used, which a borrow of this socket cannot do.
+    ///
+    /// So the bytes stay in the socket's buffer and are read back with
+    /// [`Self::packet`], which is what that backend already did.
     ///
     /// Requires the socket to be non-blocking ([`Self::set_nonblocking`]),
     /// otherwise an empty socket blocks for `SO_RCVTIMEO` before it says so.
-    pub(crate) fn recv_batch_nowait(&mut self) -> io::Result<usize> {
+    pub(crate) fn recv_one_nowait(&mut self) -> io::Result<()> {
+        self.recv_from()
+    }
+
+    /// The syscall itself: one datagram into this socket's buffer.
+    fn recv_from(&mut self) -> io::Result<()> {
         let mut src: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
@@ -274,11 +298,7 @@ impl MulticastSocket {
         if self.len > self.buf.len() {
             self.stats.truncated += 1;
         }
-        // One call, one datagram. A zero-length datagram is still one packet that
-        // arrived: `packet` rejects it for being too short to hold a counter, and
-        // counting it as an empty poll would make a live but malformed stream look
-        // silent to every watchdog that differences arrivals.
-        Ok(1)
+        Ok(())
     }
 
     #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
@@ -307,20 +327,14 @@ impl MulticastSocket {
         Ok(())
     }
 
-    /// The packet received by the last call, as `(counter, samples)`.
+    /// The packet the last receive put in this socket's buffer.
     ///
-    /// Only index 0 exists, because one call receives one packet. The index is
-    /// kept rather than dropped because both receive backends walk a return value
-    /// that used to be a batch count, and `packet(i)` reads the same in either
-    /// shape.
-    ///
-    /// Returns `None` for a packet too short to hold a counter, and a payload of
-    /// whatever length arrived otherwise; the assembler rejects anything shorter
-    /// than a full sample block.
-    pub fn packet(&self, i: usize) -> Option<(u64, &[u8])> {
-        if i != 0 {
-            return None;
-        }
+    /// `None` means that datagram was too short to hold the counter every packet
+    /// starts with. There is no counter to report and the samples behind it
+    /// cannot be placed without one, so such a packet is dropped -- the same
+    /// outcome the batched receive path had, which returned `None` here for the
+    /// same reason.
+    pub fn packet(&self) -> Option<Packet<'_>> {
         // A truncated datagram is longer than the buffer: clip it rather than
         // index past the end. The assembler then sees a short payload and rejects
         // it, which is the same outcome `recvmmsg` produced from `msg_flags`.
@@ -333,7 +347,10 @@ impl MulticastSocket {
         c.copy_from_slice(&bytes[..COUNTER_BYTES]);
         // Little endian, verified against the front end: the counter is
         // contiguous as a uint64 LE and not as a BE.
-        Some((u64::from_le_bytes(c), &bytes[COUNTER_BYTES..]))
+        Some(Packet {
+            counter: u64::from_le_bytes(c),
+            samples: &bytes[COUNTER_BYTES..],
+        })
     }
 
     pub fn fd(&self) -> RawFd {
@@ -351,6 +368,17 @@ impl Drop for MulticastSocket {
         // SAFETY: fd came from socket(2) and is closed exactly once.
         unsafe { libc::close(self.fd) };
     }
+}
+
+/// Whether a receive error means "the socket had nothing", as opposed to a real
+/// failure. `SO_RCVTIMEO` expiring and a non-blocking socket finding nothing are
+/// the same situation seen from two different sockets, and both callers treat it
+/// the same way.
+fn is_empty_socket(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
 }
 
 fn set_int_opt(
@@ -445,14 +473,110 @@ mod tests {
             }
         };
         let t0 = std::time::Instant::now();
-        let n = sock.recv_batch().expect("an empty poll is not an error");
-        assert_eq!(n, 0, "nothing was sent, so nothing should arrive");
+        let got = sock.recv_one().expect("an empty poll is not an error");
+        assert!(got.is_none(), "nothing was sent, so nothing should arrive");
         let dt = t0.elapsed();
         assert!(
             dt < std::time::Duration::from_secs(2),
             "SO_RCVTIMEO should have cut the wait short, took {dt:?}"
         );
         assert_eq!(sock.stats().empty_polls, 1);
+    }
+
+    /// The whole point of the direct call: one datagram in, its counter and its
+    /// samples out.
+    ///
+    /// Nothing covered the success path before -- the batched receive was only
+    /// ever exercised by a real run -- so a refactor of it had nothing to fail
+    /// against. This sends one datagram to the group the socket joined, over the
+    /// interface it joined it on, and reads it back.
+    #[test]
+    fn one_datagram_arrives_with_its_counter_and_samples() {
+        let cfg = test_receiver_cfg();
+        let group = Ipv4Addr::new(239, 255, 0, 4);
+        let port: u16 = 29996;
+        let mut sock = match MulticastSocket::open(&cfg, group, port) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping: cannot open a multicast socket here: {e}");
+                return;
+            }
+        };
+
+        // A counter that is not palindromic in either byte order, so reading it big
+        // endian instead of little endian cannot pass by accident.
+        let counter: u64 = 0x0123_4567_89ab_cdef;
+        let payload: Vec<u8> = (0..64u8).collect();
+        let mut msg = counter.to_le_bytes().to_vec();
+        msg.extend_from_slice(&payload);
+
+        // SAFETY: a plain sending socket, its options, and one sendto; every
+        // buffer passed is owned by this function and sized as the call is told.
+        let sent = unsafe {
+            let tx = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if tx < 0 {
+                eprintln!("skipping: cannot create a sending socket here");
+                return;
+            }
+            let one: libc::c_int = 1;
+            let loopback = libc::in_addr {
+                s_addr: u32::from(Ipv4Addr::LOCALHOST).to_be(),
+            };
+            libc::setsockopt(
+                tx,
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_LOOP,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+            libc::setsockopt(
+                tx,
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_IF,
+                &loopback as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::in_addr>() as libc::socklen_t,
+            );
+            let dst = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: port.to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from(group).to_be(),
+                },
+                sin_zero: [0; 8],
+            };
+            let n = libc::sendto(
+                tx,
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                0,
+                &dst as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            );
+            let err = io::Error::last_os_error();
+            libc::close(tx);
+            if n < 0 {
+                eprintln!("skipping: cannot send to a multicast group here: {err}");
+                return;
+            }
+            n as usize
+        };
+        assert_eq!(sent, msg.len());
+
+        // The test socket's `SO_RCVTIMEO` is 20 ms, so this polls rather than
+        // waiting on one long call -- and it must fail rather than hang if the
+        // datagram never comes back.
+        for _ in 0..20 {
+            match sock.recv_one() {
+                Ok(Some(pkt)) => {
+                    assert_eq!(pkt.counter, counter, "the counter is little endian");
+                    assert_eq!(pkt.samples, &payload[..], "the samples follow it");
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => panic!("receive error: {e}"),
+            }
+        }
+        panic!("a datagram sent to the group this socket joined never arrived");
     }
 
     #[test]
@@ -463,10 +587,10 @@ mod tests {
     }
 
     /// The reactor's contract: an empty non-blocking socket says `WouldBlock`
-    /// *immediately*, and `recv_batch` still folds that into `Ok(0)`. A reactor
-    /// that got `Ok(0)` instead could not tell "empty" from "a zero-length
-    /// datagram" and would never clear its readiness, which is a busy loop that
-    /// looks like a hot socket.
+    /// *immediately*, while the blocking flavour still folds that into `Ok(None)`.
+    /// A reactor that got `Ok(None)` instead could not tell "empty" from "a
+    /// zero-length datagram arrived" and would never clear its readiness, which is
+    /// a busy loop that looks like a hot socket.
     #[test]
     fn a_nonblocking_socket_reports_an_empty_poll_as_would_block() {
         let cfg = test_receiver_cfg();
@@ -482,8 +606,8 @@ mod tests {
 
         let t0 = std::time::Instant::now();
         let e = sock
-            .recv_batch_nowait()
-            .expect_err("nothing was sent, so the batch must report a dry socket");
+            .recv_one_nowait()
+            .expect_err("nothing was sent, so the reactor must be told the socket is dry");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
         assert!(
             t0.elapsed() < std::time::Duration::from_millis(5),
@@ -492,10 +616,13 @@ mod tests {
         );
 
         // The blocking-flavoured entry point still reports the same empty poll as
-        // `Ok(0)` and counts it, which is what the thread-per-station path relies
-        // on to notice that it should service other work.
+        // `Ok(None)` and counts it, which is what the thread-per-station path
+        // relies on to notice that it should service other work.
         let before = sock.stats().empty_polls;
-        assert_eq!(sock.recv_batch().expect("an empty poll is not an error"), 0);
+        assert!(sock
+            .recv_one()
+            .expect("an empty poll is not an error")
+            .is_none());
         assert_eq!(sock.stats().empty_polls, before + 1);
     }
 }
