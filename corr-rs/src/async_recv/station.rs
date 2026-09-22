@@ -39,15 +39,21 @@ use crate::run::StagingPtr;
 use crate::sched::StationProgress;
 use crate::stop::{RunStop, StopReason};
 
-/// How many packets one station may place before it yields to its siblings.
+/// How many packets one station may place before it yields to its siblings, and
+/// how deep one drain round may go.
 ///
-/// Not an optimisation: it is what keeps one busy stream from monopolising the
-/// worker it shares. A socket that always has data -- which is the normal state of
-/// a 195 kpps stream -- means `AsyncFd::readable` is ready on every poll, so a
-/// task that never yields would never let the reactor run another station's task.
-/// 512 packets is about 2 MB of copying, tens of microseconds: short enough that
-/// five stations on one worker interleave finely, long enough that the yield is
-/// not itself the cost.
+/// Two jobs, both about not monopolising the worker, and neither an optimisation:
+///
+/// * **Fairness.** A socket that always has data -- the normal state of a 195 kpps
+///   stream -- keeps `readable` ready, so a task that never yields would never let
+///   the reactor run another station's task. 512 packets is about 2 MB of copying,
+///   tens of microseconds: short enough that five stations on one worker
+///   interleave finely, long enough that the yield is not itself the cost.
+/// * **A bound on the round.** One readiness event now drains until the socket is
+///   dry or this budget runs out, so this is also the longest a station can go
+///   without servicing the scheduler's request -- which is what the tick interval
+///   is for, and the budget has to stay well inside it. At 195 kpps 512 packets is
+///   about 2.6 ms against a 5 ms tick.
 const DRAIN_BUDGET_PACKETS: u64 = 512;
 
 /// Consecutive refusals to spin through before parking on the ring's release.
@@ -153,7 +159,13 @@ enum Batch {
 pub(crate) struct TaskStats {
     pub(crate) iterations: u64,
     pub(crate) tick_fires: u64,
-    pub(crate) ready_events: u64,
+    /// Reactor rounds entered: one `select!` each, so `received / rounds` is how
+    /// many packets one turn of the reactor is worth -- the number this backend
+    /// lives or dies by.
+    pub(crate) rounds: u64,
+    /// Datagrams taken off the socket. Counted per packet rather than per round,
+    /// because one round now takes as many as are there.
+    pub(crate) received: u64,
     pub(crate) dry_reads: u64,
     pub(crate) batches: u64,
     pub(crate) yields: u64,
@@ -384,7 +396,7 @@ impl Station {
                 if n > PACKET_BYTES {
                     self.oversized += 1;
                 }
-                self.dbg.ready_events += 1;
+                self.dbg.received += 1;
                 Ok(true)
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(false),
@@ -494,7 +506,8 @@ impl Station {
             // its branch body: `self.sock.readable()` holds a borrow of a field of
             // `self` for as long as the select lasts, and keeping the bodies to
             // plain locals keeps that from mattering.
-            let t0 = Instant::now();
+            self.dbg.rounds += 1;
+            let t_wait = Instant::now();
             let mut ticked = false;
             let ready = tokio::select! {
                 _ = tick.tick() => {
@@ -506,61 +519,102 @@ impl Station {
             if ticked {
                 self.dbg.tick_fires += 1;
             }
-            let dry = match ready {
-                // A tick: not a packet, but not nothing either -- the loop goes
-                // round and services the scheduler's request, which is the point.
-                None => true,
-                Some(Err(e)) => {
-                    eprintln!("corr-async: station {}: reactor error: {e}", self.idx);
-                    true
-                }
-                // Readable. One packet now; draining the rest of what the socket
-                // holds is the next thing to try, and the counters are here to say
-                // whether it is worth it.
-                Some(Ok(())) => match self.receive_one() {
-                    Ok(got) => !got,
-                    Err(e) => {
-                        eprintln!("corr-async: station {}: receive error: {e}", self.idx);
-                        true
+            // The wait for readiness belongs to `ns_recv`: on the thread path that
+            // counter is the time inside a blocking receive, and this is the same
+            // time spent the same way. The placement below does not -- it is the
+            // assembler's, and counting it twice would make the report's
+            // "waiting for packets" and "assembling them" add up to more than the
+            // run and stop meaning what the two words say.
+            let mut recv_ns = t_wait.elapsed().as_nanos() as u64;
+
+            // One readiness event is one *round*: take as much as the socket is
+            // holding, not one packet. This is the whole point of the round. A
+            // reactor turn costs a task poll, a `select!`, and a trip through
+            // tokio's readiness bookkeeping, and paying that per packet is what
+            // made this backend cost more than the thread-per-station one -- the
+            // previous version got its batching by accident, from `recvmmsg`
+            // blocking until a batch was full, and gave it up when that call did.
+            //
+            // The budget bounds a round, so a station cannot hold its worker past
+            // the tick it has to service; `readable` stays ready when the round
+            // stops early, so nothing is left waiting for an edge that will not
+            // come.
+            let mut taken = 0u64;
+            if let Some(Ok(())) = ready {
+                loop {
+                    let t_rx = Instant::now();
+                    let got = self.receive_one();
+                    recv_ns += t_rx.elapsed().as_nanos() as u64;
+                    match got {
+                        Ok(true) => {}
+                        // Dry: this is also what tells tokio's readiness cache to
+                        // let go, so the next `readable` waits for a real edge.
+                        Ok(false) => break,
+                        Err(e) => {
+                            eprintln!("corr-async: station {}: receive error: {e}", self.idx);
+                            break;
+                        }
                     }
-                },
-            };
-            let waited = t0.elapsed().as_nanos() as u64;
-            self.ns_recv += waited;
-            if dry {
-                // A tick, or a readiness that yielded nothing: either way the
-                // socket was dry, which is what an empty poll means here.
-                self.dbg.ns_wait += waited;
-                self.idle_polls += 1;
-                self.dbg.dry_reads += 1;
-                continue;
+                    taken += 1;
+                    // The packet is in the buffer from here on.
+                    let stall_ms = self.last_read.elapsed().as_millis() as u64;
+                    self.last_read = Instant::now();
+                    if stall_ms > self.max_stall_ms {
+                        self.max_stall_ms = stall_ms;
+                    }
+                    if stall_ms >= 20 {
+                        self.stalls_over_20ms += 1;
+                    }
+                    self.batches += 1;
+                    self.dbg.batches += 1;
+                    self.prog.mark_packet();
+                    self.prog.add_packets(1);
+                    self.have_packet = true;
+
+                    match self.place_one() {
+                        Batch::Drained => {}
+                        // Refused a slot: leave the packet where it is and go back
+                        // to the top, which parks and retries it. The rest of the
+                        // socket's backlog is read on the round after that, so a
+                        // busy ring costs a delay rather than a loss.
+                        Batch::SlotBusy => break,
+                        Batch::Fatal => break,
+                    }
+                    if !self.stop.is_stopped() && self.budget == 0 {
+                        // Fairness, not throughput: see DRAIN_BUDGET_PACKETS.
+                        self.budget = DRAIN_BUDGET_PACKETS;
+                        self.dbg.yields += 1;
+                        tokio::task::yield_now().await;
+                        break;
+                    }
+                }
+            } else if let Some(Err(e)) = ready {
+                eprintln!("corr-async: station {}: reactor error: {e}", self.idx);
             }
 
-            let stall_ms = self.last_read.elapsed().as_millis() as u64;
-            self.last_read = Instant::now();
-            if stall_ms > self.max_stall_ms {
-                self.max_stall_ms = stall_ms;
+            self.ns_recv += recv_ns;
+            if taken == 0 {
+                // A tick, a reactor error, or a readiness that yielded nothing:
+                // either way the socket was dry for this round, which is what an
+                // empty poll means here.
+                self.dbg.ns_wait += recv_ns;
+                self.idle_polls += 1;
+                self.dbg.dry_reads += 1;
             }
-            if stall_ms >= 20 {
-                self.stalls_over_20ms += 1;
-            }
-            self.batches += 1;
-            self.dbg.batches += 1;
-            self.prog.mark_packet();
-            self.prog.add_packets(1);
-            self.have_packet = true;
         }
 
         if std::env::var_os("CORR_ASYNC_STATS").is_some() {
             let d = self.dbg;
             eprintln!(
-                "corr-async: station {:2}: iters={} ticks={} ready={} dry={} \
-                 batches={} yields={} parks={} consume={:.3}s wait={:.3}s pkts={} \
-                 ring_refusals={} ring_wait_polls={}",
+                "corr-async: station {:2}: iters={} ticks={} rounds={} received={} \
+                 rx/round={:.3} dry={} batches={} yields={} parks={} consume={:.3}s \
+                 wait={:.3}s pkts={} ring_refusals={} ring_wait_polls={}",
                 self.idx,
                 d.iterations,
                 d.tick_fires,
-                d.ready_events,
+                d.rounds,
+                d.received,
+                d.received as f64 / d.rounds.max(1) as f64,
                 d.dry_reads,
                 d.batches,
                 d.yields,
