@@ -10,9 +10,13 @@
 //!   microseconds before sleeping, which removes the wake-up latency that
 //!   otherwise shows up as jitter at 195 kpps. `net.core.busy_poll` defaults to 0
 //!   but the per-socket value is not bound by it.
-//! * `recvmmsg` amortises one syscall over a batch of packets. At 195 kpps per
-//!   station a syscall per packet would spend a measurable fraction of a core on
-//!   entry and exit alone.
+//! * **one `recvfrom` per packet.** This used to be `recvmmsg`, amortising one
+//!   syscall over a batch of up to 32 packets, on the argument that at 195 kpps a
+//!   syscall per packet spends a measurable fraction of a core on entry and exit
+//!   alone. That argument was made for 1500-byte frames and a packet rate that no
+//!   longer exists: the front end sends 4104-byte datagrams over jumbo frames, so
+//!   the per-packet syscall is amortised over 2.7x the bytes it was sized for.
+//!   The measurement that decided it is in `docs/DESIGN-no-recvmmsg.md`.
 //! * `SO_RCVTIMEO` is deliberately short. A receive thread must not block for
 //!   ever: when a station goes quiet it has to notice and honour the scheduler's
 //!   request to declare the missing frames up to the next slot boundary.
@@ -40,25 +44,23 @@ const SO_BUSY_POLL: libc::c_int = 46;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RecvStats {
-    /// Batches returned by `recvmmsg`.
-    pub batches: u64,
-    /// Packets returned.
-    pub packets: u64,
-    /// Times `recvmmsg` came back empty (the receive timeout expired).
+    /// Times the receive call came back empty: the receive timeout expired, or a
+    /// non-blocking socket had nothing to give.
     pub empty_polls: u64,
     /// Packets the kernel reported as truncated, i.e. the buffer was too small.
     pub truncated: u64,
 }
 
-/// One UDP multicast socket, with room for a batch of packets.
+/// One UDP multicast socket, with room for one packet.
 pub struct MulticastSocket {
     fd: RawFd,
-    /// One slot per packet in the batch, each `stride` bytes.
+    /// One datagram, with a little slack over the nominal payload so an oversized
+    /// frame is detected as truncated rather than as a short read.
     buf: Vec<u8>,
-    stride: usize,
-    iovecs: Vec<libc::iovec>,
-    hdrs: Vec<libc::mmsghdr>,
-    vlen: usize,
+    /// Datagram length reported by the last `recvfrom`. `MSG_TRUNC` makes this the
+    /// datagram's real length even when it did not fit, which is what makes
+    /// truncation visible instead of silently arriving as a short packet.
+    len: usize,
     stats: RecvStats,
     /// Whether the kernel accepted `SO_BUSY_POLL`. Reported rather than assumed:
     /// it needs a privilege this host's user does not have.
@@ -68,8 +70,6 @@ pub struct MulticastSocket {
 impl MulticastSocket {
     /// Open and join `group`:`port` on `cfg.interface_ip`.
     pub fn open(cfg: &ReceiverCfg, group: Ipv4Addr, port: u16) -> io::Result<Self> {
-        assert!(cfg.recvmmsg_batch >= 1, "recvmmsg batch must be >= 1");
-        let vlen = cfg.recvmmsg_batch as usize;
         // A little slack over the nominal payload so an oversized frame is
         // detected as truncated rather than as a short read.
         let stride = PACKET_BYTES.next_multiple_of(64) + 64;
@@ -81,17 +81,8 @@ impl MulticastSocket {
         }
         let mut sock = MulticastSocket {
             fd,
-            buf: vec![0u8; stride * vlen],
-            stride,
-            iovecs: vec![
-                libc::iovec {
-                    iov_base: std::ptr::null_mut(),
-                    iov_len: 0,
-                };
-                vlen
-            ],
-            hdrs: vec![unsafe { std::mem::zeroed() }; vlen],
-            vlen,
+            buf: vec![0u8; stride],
+            len: 0,
             stats: RecvStats::default(),
             busy_poll_granted: false,
         };
@@ -226,7 +217,7 @@ impl MulticastSocket {
         self.stats
     }
 
-    /// Receive up to one batch. Returns the number of packets, or an error.
+    /// Receive one packet: `Ok(1)` if one arrived, `Ok(0)` if the socket was dry.
     ///
     /// `WouldBlock`/`TimedOut` are returned as `Ok(0)`: an empty poll is the
     /// normal way a receive thread notices that it should service other work.
@@ -246,55 +237,48 @@ impl MulticastSocket {
         }
     }
 
-    /// Receive up to one batch, reporting an empty socket as `WouldBlock`.
+    /// Receive one packet, reporting an empty socket as `WouldBlock`.
     ///
     /// The difference from [`Self::recv_batch`] is not cosmetic and is not a
     /// preference: a readiness-based reactor (epoll, and therefore anything built
     /// on it) only clears an edge-triggered socket's readiness when the caller
     /// says the socket ran dry. `recv_batch` folds "empty" into `Ok(0)`, which a
-    /// reactor cannot tell from "one zero-length packet", so a level of the
-    /// pipeline that speaks to epoll has to see the `Err`. The batching, the
-    /// counters and the buffer layout are otherwise identical -- this is
+    /// reactor cannot tell from "a zero-length packet arrived", so a level of the
+    /// pipeline that speaks to epoll has to see the `Err`. This is
     /// [`Self::recv_batch`]'s own implementation, with the error left alone.
     ///
     /// Requires the socket to be non-blocking ([`Self::set_nonblocking`]),
     /// otherwise an empty socket blocks for `SO_RCVTIMEO` before it says so.
     pub(crate) fn recv_batch_nowait(&mut self) -> io::Result<usize> {
-        for i in 0..self.vlen {
-            let base = self.buf.as_mut_ptr().wrapping_add(i * self.stride);
-            self.iovecs[i].iov_base = base as *mut libc::c_void;
-            self.iovecs[i].iov_len = self.stride;
-            self.hdrs[i].msg_hdr.msg_iov = &mut self.iovecs[i] as *mut libc::iovec;
-            self.hdrs[i].msg_hdr.msg_iovlen = 1;
-            self.hdrs[i].msg_hdr.msg_namelen = 0;
-            self.hdrs[i].msg_hdr.msg_controllen = 0;
-            self.hdrs[i].msg_hdr.msg_flags = 0;
-            self.hdrs[i].msg_len = 0;
-        }
+        let mut src: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut slen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
-        // SAFETY: hdrs has vlen entries, each pointing at a distinct iovec whose
-        // base is inside `buf`.
+        // SAFETY: `buf` is `buf.len()` bytes of storage this socket owns, `src` is
+        // a fully sized sockaddr_storage, and `slen` says so. `MSG_TRUNC` makes the
+        // return value the datagram's real length even when it did not fit, so an
+        // oversized frame is counted instead of arriving as a silent short packet.
         let n = unsafe {
-            libc::recvmmsg(
+            libc::recvfrom(
                 self.fd,
-                self.hdrs.as_mut_ptr(),
-                self.vlen as libc::c_uint,
-                0,
-                std::ptr::null_mut(),
+                self.buf.as_mut_ptr() as *mut libc::c_void,
+                self.buf.len(),
+                libc::MSG_TRUNC,
+                &mut src as *mut _ as *mut libc::sockaddr,
+                &mut slen,
             )
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        let n = n as usize;
-        self.stats.batches += 1;
-        self.stats.packets += n as u64;
-        for i in 0..n {
-            if self.hdrs[i].msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
-                self.stats.truncated += 1;
-            }
+        self.len = n as usize;
+        if self.len > self.buf.len() {
+            self.stats.truncated += 1;
         }
-        Ok(n)
+        // One call, one datagram. A zero-length datagram is still one packet that
+        // arrived: `packet` rejects it for being too short to hold a counter, and
+        // counting it as an empty poll would make a live but malformed stream look
+        // silent to every watchdog that differences arrivals.
+        Ok(1)
     }
 
     #[cfg_attr(not(feature = "async-recv"), allow(dead_code))]
@@ -323,21 +307,28 @@ impl MulticastSocket {
         Ok(())
     }
 
-    /// The `i`-th packet of the last batch, as `(counter, samples)`.
+    /// The packet received by the last call, as `(counter, samples)`.
+    ///
+    /// Only index 0 exists, because one call receives one packet. The index is
+    /// kept rather than dropped because both receive backends walk a return value
+    /// that used to be a batch count, and `packet(i)` reads the same in either
+    /// shape.
     ///
     /// Returns `None` for a packet too short to hold a counter, and a payload of
     /// whatever length arrived otherwise; the assembler rejects anything shorter
     /// than a full sample block.
     pub fn packet(&self, i: usize) -> Option<(u64, &[u8])> {
-        if i >= self.vlen {
+        if i != 0 {
             return None;
         }
-        let len = self.hdrs[i].msg_len as usize;
+        // A truncated datagram is longer than the buffer: clip it rather than
+        // index past the end. The assembler then sees a short payload and rejects
+        // it, which is the same outcome `recvmmsg` produced from `msg_flags`.
+        let len = self.len.min(self.buf.len());
         if len < COUNTER_BYTES {
             return None;
         }
-        let base = i * self.stride;
-        let bytes = &self.buf[base..base + len];
+        let bytes = &self.buf[..len];
         let mut c = [0u8; 8];
         c.copy_from_slice(&bytes[..COUNTER_BYTES]);
         // Little endian, verified against the front end: the counter is
@@ -350,12 +341,10 @@ impl MulticastSocket {
     }
 }
 
-// SAFETY: the socket owns its descriptor and its packet buffers outright; the
-// raw pointers inside `iovecs` all point into that same `buf`. Moving the whole
-// struct to another thread therefore moves the only references to it, which is
-// what `Send` means. It is deliberately not `Sync`: exactly one thread receives
-// on a socket, which is the whole design.
-unsafe impl Send for MulticastSocket {}
+// `MulticastSocket` needs no `unsafe impl Send`: it owns its descriptor and its
+// packet buffer, both of which are `Send`, so moving the whole struct to another
+// thread moves the only references to it. One thread receiving per socket is a
+// design rule, not a safety one -- every receive entry point takes `&mut self`.
 
 impl Drop for MulticastSocket {
     fn drop(&mut self) {

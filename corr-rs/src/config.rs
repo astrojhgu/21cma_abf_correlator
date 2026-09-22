@@ -73,6 +73,14 @@ pub struct ReceiverCfg {
     pub interface_ip: Ipv4Addr,
     pub recv_buffer_bytes: usize,
     pub busy_poll_us: u32,
+    /// Accepted, and no longer used for anything.
+    ///
+    /// It used to be the `recvmmsg` batch depth. The receive path takes one
+    /// packet per `recvfrom` now (`corr-rs/src/net.rs`), so nothing reads this
+    /// beyond the `>= 1` check below. It is kept only so that the shipped
+    /// configurations, which all still carry the key under
+    /// `deny_unknown_fields`, keep parsing; delete it here and in `config/*.yaml`
+    /// in one go.
     pub recvmmsg_batch: u32,
     /// `SO_RCVTIMEO` for the receive socket. Short by design: an idle poll is how
     /// a receive thread notices that it should service other work, such as the
