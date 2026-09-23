@@ -336,6 +336,15 @@ struct GpuState {
     cudaStream_t copy_stream = nullptr;     // host -> device
     cudaStream_t compute_stream = nullptr;  // convert, FFT, correlate, scale
     cudaStream_t fetch_stream = nullptr;    // device -> host
+    /// Carries nothing but `cudaStreamWaitEvent` and the host callback queued
+    /// behind it, for callers that would rather be told than wait.
+    ///
+    /// A stream of its own, not the one that recorded the event: the copy stream
+    /// has several slots' copies in flight at once, and a callback queued behind
+    /// them would fire only after every later copy had finished too -- which is
+    /// not the condition any caller is waiting for. Waiting on the *event*
+    /// instead is what makes "this slot is done" mean this slot.
+    cudaStream_t notify_stream = nullptr;
 
     std::vector<cudaEvent_t> h2d_done;      // per staging slot
     std::vector<cudaEvent_t> copy_done;     // per device buffer
@@ -360,6 +369,7 @@ void free_all(GpuState *g) {
         if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : g->compute_done)
         if (e) cudaEventDestroy(e);
+    if (g->notify_stream) cudaStreamDestroy(g->notify_stream);
     if (g->fetch_stream) cudaStreamDestroy(g->fetch_stream);
     if (g->compute_stream) cudaStreamDestroy(g->compute_stream);
     if (g->copy_stream) cudaStreamDestroy(g->copy_stream);
@@ -377,6 +387,30 @@ void free_all(GpuState *g) {
 /// Record an event on `s` so that a later wait on it does not block.
 corr_status prime_event(cudaEvent_t e, cudaStream_t s) {
     return cuda_check(cudaEventRecord(e, s), "cudaEventRecord(prime)");
+}
+
+/// Queue `fn(user)` on the notify stream, to run once `ev` has completed.
+///
+/// The event is what is waited on, not the stream that recorded it: see the
+/// comment on `GpuState::notify_stream`.
+///
+/// `fn` is handed to CUDA as the host function itself rather than through a
+/// trampoline, because `corr_notify_fn` is already the `void (*)(void *)` that
+/// `cudaLaunchHostFunc` takes -- on this platform its calling convention is the
+/// default one, so the cast is a formality. That leaves nothing to allocate and
+/// nothing to free on a thread that is not ours.
+corr_status gpu_notify_on(GpuState *g, cudaEvent_t ev, corr_notify_fn fn, void *user) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_notify_on: null state");
+    if (fn == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_notify_on: no callback");
+    corr_status st = cuda_check(cudaStreamWaitEvent(g->notify_stream, ev, 0),
+                                "cudaStreamWaitEvent(notify)");
+    if (st != CORR_OK) return st;
+    cudaError_t e = cudaLaunchHostFunc(g->notify_stream,
+                                       reinterpret_cast<cudaHostFn_t>(fn), user);
+    if (e != cudaSuccess)
+        return gpu_fail(CORR_ERR_CUDA,
+                        std::string("cudaLaunchHostFunc: ") + cudaGetErrorString(e));
+    return CORR_OK;
 }
 
 } // namespace
@@ -544,7 +578,9 @@ corr_status gpu_create(const corr_config &cfg, const GpuPlacement &pl,
                  cudaStreamCreateWithFlags(&g->compute_stream, cudaStreamNonBlocking),
                  "cudaStreamCreate(compute)")) != CORR_OK ||
         (st = cuda_check(cudaStreamCreateWithFlags(&g->fetch_stream, cudaStreamNonBlocking),
-                         "cudaStreamCreate(fetch)")) != CORR_OK) {
+                         "cudaStreamCreate(fetch)")) != CORR_OK ||
+        (st = cuda_check(cudaStreamCreateWithFlags(&g->notify_stream, cudaStreamNonBlocking),
+                         "cudaStreamCreate(notify)")) != CORR_OK) {
         free_all(g);
         return st;
     }
@@ -809,6 +845,13 @@ corr_status gpu_slot_free(GpuState *g, int32_t slot) {
                       "cudaEventSynchronize(h2d_done)");
 }
 
+corr_status gpu_slot_free_submit(GpuState *g, int32_t slot, corr_notify_fn fn, void *user) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_slot_free_submit: null state");
+    if (slot < 0 || slot >= g->cfg.block_slots)
+        return gpu_fail(CORR_ERR_ARG, "gpu_slot_free_submit: slot out of range");
+    return gpu_notify_on(g, g->h2d_done[(size_t)slot], fn, user);
+}
+
 // ---------------------------------------------------------------------------
 // row lifecycle
 // ---------------------------------------------------------------------------
@@ -845,6 +888,24 @@ corr_status gpu_rows_wait(GpuState *g) {
     // The scale kernels all run on one ordered stream, so the last recorded
     // event covers every earlier row as well.
     return cuda_check(cudaEventSynchronize(g->row_done), "cudaEventSynchronize(row_done)");
+}
+
+corr_status gpu_rows_wait_submit(GpuState *g, corr_notify_fn fn, void *user) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_rows_wait_submit: null state");
+    return gpu_notify_on(g, g->row_done, fn, user);
+}
+
+corr_status gpu_rows_ready(GpuState *g) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_rows_ready: null state");
+    // `cudaEventQuery` is the non-blocking form of the wait above: it answers
+    // "has it happened yet", and -- because a host callback has no way to report
+    // a failure -- this is also the only place a failed scaling kernel can be
+    // seen after the fact.
+    cudaError_t e = cudaEventQuery(g->row_done);
+    if (e == cudaSuccess) return CORR_OK;
+    if (e == cudaErrorNotReady) return CORR_ERR_BUSY;
+    return gpu_fail(CORR_ERR_CUDA, std::string("cudaEventQuery(row_done): ") +
+                                       cudaGetErrorString(e));
 }
 
 corr_status gpu_rows_pending(GpuState *g, int32_t *out_pending) {

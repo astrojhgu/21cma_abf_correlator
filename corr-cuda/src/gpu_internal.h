@@ -93,6 +93,18 @@ corr_status gpu_accumulate(GpuState *g, const StagingLayout &layout, int32_t slo
 /// the receive thread may write that slot again.
 corr_status gpu_slot_free(GpuState *g, int32_t slot);
 
+/// The same condition, without the block: queue `fn(user)` to run once the copy
+/// of `slot` has completed. Nothing about the GPU or the host state is the same
+/// when it fires -- `fn` runs on a CUDA-internal thread and must only signal.
+corr_status gpu_slot_free_submit(GpuState *g, int32_t slot, corr_notify_fn fn, void *user);
+
+/// Queue `fn(user)` to run once every closed row's scaling kernels have finished.
+corr_status gpu_rows_wait_submit(GpuState *g, corr_notify_fn fn, void *user);
+
+/// Non-blocking completion test for the wait above: 0 when done and clean,
+/// CORR_ERR_BUSY while running, the CUDA status otherwise.
+corr_status gpu_rows_ready(GpuState *g);
+
 /// Divide the accumulator by `frames` on the compute stream and record the row.
 corr_status gpu_row_end(GpuState *g, uint64_t frames);
 

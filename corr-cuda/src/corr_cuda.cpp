@@ -14,10 +14,12 @@
 #include <cufft.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -83,6 +85,31 @@ struct Context {
     /// What each device was given, kept so the caller can see the split.
     std::vector<corr::GpuPlacement> plans;
     std::vector<SlotState> slots;
+
+    /// What an asynchronous release still owes, one entry per physical slot.
+    ///
+    /// A slot is released once *every* device that read it has finished its copy,
+    /// and with more than one device that is several separate completions. The
+    /// count is what turns them back into the single callback the caller asked
+    /// for. It is decremented from CUDA's callback threads, which is why it is
+    /// atomic and why nothing else here is touched from those threads.
+    ///
+    /// `cb` and `user` are written by the submitting thread before any callback
+    /// for that slot can run -- the callbacks are ordered behind the copies, which
+    /// are ordered behind the submit -- and read back by the last one to arrive.
+    struct SlotNotify {
+        std::atomic<int32_t> outstanding{0};
+        corr_notify_fn cb = nullptr;
+        void *user = nullptr;
+    };
+    /// A plain array rather than a vector: `SlotNotify` holds an atomic, which
+    /// makes it neither copyable nor movable, and a vector that cannot move its
+    /// elements cannot resize.
+    std::unique_ptr<SlotNotify[]> slot_notify;
+
+    /// The same, for the once-per-row wait. Rows are strictly sequential, so one
+    /// counter covers them all; see SlotNotify for the ordering argument.
+    SlotNotify row_notify;
     /// Cumulative time this thread spent inside each fan-out call, per device.
     /// Written only by the thread that drives the context, like the counters in
     /// the device state.
@@ -617,6 +644,8 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
     // and starting from a known state makes an accidental unwritten frame show
     // up as silence rather than as garbage.
     ctx->slots.assign(static_cast<size_t>(cfg->block_slots), SlotState::kFree);
+    ctx->slot_notify = std::make_unique<Context::SlotNotify[]>(
+        static_cast<size_t>(cfg->block_slots));
 
     // Who computes what. Deterministic and derived from the configuration, never
     // from a hard-coded card count.
@@ -808,6 +837,61 @@ extern "C" corr_status corr_row_accumulate(void *h, int64_t slot_seq, int32_t fr
     return st;
 }
 
+/// Which devices have to be done with `slot_seq` before it may be written again.
+///
+/// Under the time-slice split exactly one device ever read the slot; under the
+/// others every device holding a copy did. Both callers below need the same
+/// answer, and getting it from one place is what keeps them from drifting.
+static void slot_readers(const Context *ctx, int64_t slot_seq, int *first, int *last) {
+    const bool single = ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE;
+    *first = single ? static_cast<int>(slot_seq % ctx->n_devices()) : 0;
+    *last = single ? *first + 1 : ctx->n_devices();
+}
+
+/// The half of a slot release that follows the copy: hand the validity mask back,
+/// then mark the slot writable again.
+///
+/// Split out because there are now two ways to learn that the copy is done -- the
+/// blocking wait and a callback -- and the state they leave behind has to be
+/// identical. `corr_row_slot_free()` and `corr_row_slot_free_finish()` are the two
+/// callers and there is no third thing either of them does.
+///
+/// Only now may the receive thread write this slot again -- and it has to find an
+/// empty validity mask when it gets there. The clear is here rather than in the
+/// receive thread for two reasons: the copies that read this mask are known to be
+/// finished, and the receiver cannot be writing this slot yet (it is still marked
+/// busy, and the caller only releases the ring after this returns). It also covers
+/// what the receive thread cannot: a station that sends nothing at all for a whole
+/// slot runs no code that would clear it, so the next lap would inherit this lap's
+/// bits and have the GPU correlate stale samples as if they were data.
+static void release_slot_after_copy(Context *ctx, int32_t slot) {
+    for (int station = 0; station < ctx->cfg.n_station; ++station) {
+        int8_t *mask = ctx->layout.base +
+                       static_cast<size_t>(station) * ctx->layout.station_stride +
+                       ctx->layout.validity_offset +
+                       static_cast<size_t>(slot) * ctx->layout.validity_bytes_per_slot;
+        std::memset(mask, 0, ctx->layout.validity_bytes_per_slot);
+    }
+    std::lock_guard<std::mutex> lock(ctx->mu);
+    ctx->slots[static_cast<size_t>(slot)] = SlotState::kFree;
+}
+
+/// The callback a slot's several devices collapse into, and the one a row's do.
+///
+/// It runs on a CUDA-internal thread, so it does the least possible: decrement,
+/// and if it was the last one, hand the caller its notification. It takes no lock
+/// on purpose -- the submitting thread may be holding `ctx->mu`, and reaching for
+/// it here is exactly the deadlock this submit/finish split exists to avoid.
+static void notify_when_last(void *raw) {
+    auto *n = static_cast<Context::SlotNotify *>(raw);
+    if (n->outstanding.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    corr_notify_fn cb = n->cb;
+    void *user = n->user;
+    n->cb = nullptr;
+    n->user = nullptr;
+    if (cb != nullptr) cb(user);
+}
+
 extern "C" corr_status corr_row_slot_free(void *h, int64_t slot_seq) {
     Context *ctx = as_ctx(h);
     if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
@@ -822,13 +906,10 @@ extern "C" corr_status corr_row_slot_free(void *h, int64_t slot_seq) {
                          (long long)slot_seq);
     }
 
-    // Who has to be done with this slot? Under the time-slice split exactly one
-    // device ever read it, and under the others every device holding a copy did;
-    // either way each gpu_slot_free waits on that device's own copy event, so the
-    // loop returns when the slowest reader is done.
-    const bool single = ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE;
-    const int first = single ? static_cast<int>(slot_seq % ctx->n_devices()) : 0;
-    const int last = single ? first + 1 : ctx->n_devices();
+    // Each device waits on its own copy event, so the loop returns when the
+    // slowest reader is done.
+    int first = 0, last = 0;
+    slot_readers(ctx, slot_seq, &first, &last);
     for (int d = first; d < last; ++d) {
         corr_status st = select_device(ctx, d);
         if (st != CORR_OK) return st;
@@ -838,25 +919,71 @@ extern "C" corr_status corr_row_slot_free(void *h, int64_t slot_seq) {
         if (st != CORR_OK) return st;
     }
 
-    // Only now may the receive thread write this slot again -- and it has to find
-    // an empty validity mask when it gets there. The clear is here rather than in
-    // the receive thread for two reasons: the copies that read this mask are known
-    // to be finished (the events above), and the receiver cannot be writing this
-    // slot yet (it is still marked busy, and the caller only releases the ring
-    // after this returns). It also covers what the receive thread cannot: a station
-    // that sends nothing at all for a whole slot runs no code that would clear it,
-    // so the next lap would inherit this lap's bits and have the GPU correlate
-    // stale samples as if they were data.
-    for (int station = 0; station < ctx->cfg.n_station; ++station) {
-        int8_t *mask = ctx->layout.base +
-                       static_cast<size_t>(station) * ctx->layout.station_stride +
-                       ctx->layout.validity_offset +
-                       static_cast<size_t>(slot) * ctx->layout.validity_bytes_per_slot;
-        std::memset(mask, 0, ctx->layout.validity_bytes_per_slot);
+    release_slot_after_copy(ctx, slot);
+    return CORR_OK;
+}
+
+extern "C" corr_status corr_row_slot_free_submit(void *h, int64_t slot_seq,
+                                                 corr_notify_fn cb, void *user) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    if (cb == nullptr) return fail(CORR_ERR_ARG, "cb is NULL");
+    if (slot_seq < 0)
+        return failf(CORR_ERR_ARG, "slot_seq=%lld is negative", (long long)slot_seq);
+    const int32_t slot = static_cast<int32_t>(slot_seq % ctx->cfg.block_slots);
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->mu);
+        if (ctx->slots[static_cast<size_t>(slot)] != SlotState::kCoping)
+            return failf(CORR_ERR_STATE, "slot %d (sequence %lld) was not submitted", slot,
+                         (long long)slot_seq);
     }
 
-    std::lock_guard<std::mutex> lock(ctx->mu);
-    ctx->slots[static_cast<size_t>(slot)] = SlotState::kFree;
+    int first = 0, last = 0;
+    slot_readers(ctx, slot_seq, &first, &last);
+
+    // The whole release is armed before the first device is asked to report, so
+    // that a completion which arrives while the loop is still running -- the copy
+    // may already be finished -- finds the count and the caller's callback in
+    // place rather than halfway there.
+    //
+    // A failure part way through leaves the release incomplete rather than
+    // pretending otherwise: a submit only fails on a CUDA error that makes the
+    // context unusable, so the caller tears the run down instead of retrying, and
+    // the stale count goes with it.
+    Context::SlotNotify &n = ctx->slot_notify[static_cast<size_t>(slot)];
+    n.cb = cb;
+    n.user = user;
+    n.outstanding.store(last - first, std::memory_order_release);
+
+    for (int d = first; d < last; ++d) {
+        corr_status st = select_device(ctx, d);
+        if (st != CORR_OK) return st;
+        const uint64_t t0 = now_ns();
+        st = corr::gpu_slot_free_submit(ctx->gpus[static_cast<size_t>(d)], slot,
+                                        notify_when_last, &n);
+        ctx->timing[static_cast<size_t>(d)].slot_free += now_ns() - t0;
+        if (st != CORR_OK) return st;
+    }
+    return CORR_OK;
+}
+
+extern "C" corr_status corr_row_slot_free_finish(void *h, int64_t slot_seq) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    if (slot_seq < 0)
+        return failf(CORR_ERR_ARG, "slot_seq=%lld is negative", (long long)slot_seq);
+    const int32_t slot = static_cast<int32_t>(slot_seq % ctx->cfg.block_slots);
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->mu);
+        if (ctx->slots[static_cast<size_t>(slot)] != SlotState::kCoping)
+            return failf(CORR_ERR_STATE,
+                         "slot %d (sequence %lld) was not submitted, or its release has "
+                         "already been finished",
+                         slot, (long long)slot_seq);
+    }
+    release_slot_after_copy(ctx, slot);
     return CORR_OK;
 }
 
@@ -922,6 +1049,42 @@ extern "C" corr_status corr_rows_wait(void *h) {
         st = corr::gpu_rows_wait(ctx->gpus[static_cast<size_t>(d)]);
         ctx->timing[static_cast<size_t>(d)].rows_wait += now_ns() - t0;
         if (st != CORR_OK) return st;
+    }
+    return CORR_OK;
+}
+
+extern "C" corr_status corr_rows_wait_submit(void *h, corr_notify_fn cb, void *user) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    if (cb == nullptr) return fail(CORR_ERR_ARG, "cb is NULL");
+
+    // Armed before the first device is asked, for the same reason as the slot
+    // release: a completion can arrive while this loop is still running.
+    Context::SlotNotify &n = ctx->row_notify;
+    n.cb = cb;
+    n.user = user;
+    n.outstanding.store(ctx->n_devices(), std::memory_order_release);
+
+    for (int d = 0; d < ctx->n_devices(); ++d) {
+        corr_status st = select_device(ctx, d);
+        if (st != CORR_OK) return st;
+        const uint64_t t0 = now_ns();
+        st = corr::gpu_rows_wait_submit(ctx->gpus[static_cast<size_t>(d)],
+                                        notify_when_last, &n);
+        ctx->timing[static_cast<size_t>(d)].rows_wait += now_ns() - t0;
+        if (st != CORR_OK) return st;
+    }
+    return CORR_OK;
+}
+
+extern "C" corr_status corr_rows_ready(void *h) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    for (int d = 0; d < ctx->n_devices(); ++d) {
+        corr_status st = select_device(ctx, d);
+        if (st != CORR_OK) return st;
+        if ((st = corr::gpu_rows_ready(ctx->gpus[static_cast<size_t>(d)])) != CORR_OK)
+            return st;
     }
     return CORR_OK;
 }

@@ -83,6 +83,16 @@ target_compile_options(abi_smoke PRIVATE -Wall -Wextra)
 
 add_test(NAME abi_smoke COMMAND abi_smoke)
 
+# The non-blocking half of the slot release and the row wait: that a submit
+# returns without waiting, that the callback arrives, and that nothing is wedged
+# while it is pending. Tested here rather than through Rust because it is the one
+# piece of the ABI that behaves differently depending on who is calling it.
+add_executable(async_notify tests/async_notify.c)
+target_link_libraries(async_notify PRIVATE corr_cuda)
+target_compile_options(async_notify PRIVATE -Wall -Wextra)
+
+add_test(NAME async_notify COMMAND async_notify)
+
 # The multi-device path: one correct answer out of N cards. It skips itself with a
 # message when fewer than two devices are visible, so on a single-card machine it
 # says so instead of passing vacuously.

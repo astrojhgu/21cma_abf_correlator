@@ -371,6 +371,47 @@ corr_status corr_row_accumulate(void *ctx, int64_t slot_seq, int32_t frames);
 corr_status corr_row_slot_free(void *ctx, int64_t slot_seq);
 
 /*
+ * The same release, split so that neither half blocks the calling thread.
+ *
+ * The pair exists for a caller built on an async runtime. Waiting on an event is
+ * the one thing a task cannot do without occupying a thread, so the wait becomes
+ * a callback and the work that followed it becomes an explicit second call.
+ *
+ * `cb(user)` is invoked from a CUDA-internal thread once every device that reads
+ * this slot has finished its copy -- exactly the condition corr_row_slot_free()
+ * waits for. Two rules follow from where it runs, and both matter:
+ *
+ *   * it must only signal. It may not call any CUDA API, and it may not take a
+ *     lock the submitting thread could be holding;
+ *   * whatever it wakes must call corr_row_slot_free_finish() to complete the
+ *     release. The callback fires *before* the validity mask has been cleared and
+ *     before the slot is marked free, and both have to happen before the receive
+ *     side may write the slot again.
+ *
+ * A slot must not be released through the blocking call and this pair at the same
+ * time: they share the per-slot state that says which devices still owe a copy.
+ * Pick one per slot and stay with it.
+ *
+ * `corr_notify_fn` is a plain C function pointer, which is what the CUDA runtime
+ * calls on this platform. The callback runs on a thread this library does not
+ * own, so `user` has to keep the caller's data alive until it fires.
+ */
+typedef void (*corr_notify_fn)(void *user);
+
+corr_status corr_row_slot_free_submit(void *ctx, int64_t slot_seq,
+                                      corr_notify_fn cb, void *user);
+
+/*
+ * The rest of the release: clear the slot's validity masks and mark it free.
+ *
+ * Call once per successful submit, after -- and only after -- `cb` has fired.
+ * Reports the same errors the blocking call would, minus the ones that need a
+ * GPU wait. In particular this is where a failed copy becomes visible: the
+ * callback has no way to report one.
+ */
+corr_status corr_row_slot_free_finish(void *ctx, int64_t slot_seq);
+
+/*
  * Close the current row. `frames` is the number of FFT frames that were actually
  * accumulated into it, and the row is divided by it.
  *
@@ -391,6 +432,24 @@ corr_status corr_row_end(void *ctx, uint64_t frames);
  * of their scaling kernels have run.
  */
 corr_status corr_rows_wait(void *ctx);
+
+/*
+ * The same wait without the wait: `cb(user)` fires, from a CUDA-internal thread,
+ * once every closed but unfetched row is complete. Same rules as
+ * corr_row_slot_free_submit: signal only, and no lock the submitter may hold.
+ *
+ * There is no finish half. The blocking call has nothing after its wait, so what
+ * follows the callback here is entirely the caller's -- except that it should ask
+ * corr_rows_ready() why it was called, since a callback cannot report a failure.
+ */
+corr_status corr_rows_wait_submit(void *ctx, corr_notify_fn cb, void *user);
+
+/*
+ * Non-blocking: 0 when the rows this wait was about are complete and their
+ * kernels reported no error, CORR_ERR_BUSY when they are still running, and the
+ * CUDA status when they finished badly.
+ */
+corr_status corr_rows_ready(void *ctx);
 
 /*
  * How many closed rows are sitting in the stack waiting to be fetched, in
