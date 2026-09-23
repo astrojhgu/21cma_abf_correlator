@@ -284,14 +284,40 @@ impl<'a> Pipeline<'a> {
                     // The live line, on its own interval (monitoring.interval_ms).
                     // Printed from here because this is the one thread that is idle
                     // by construction, and because both receivers reach it.
-                    if let Some(m) = self.monitor.as_mut() {
+                    // `due` first, and only then read the counters: the device
+                    // counters are a call into the CUDA library, and reading them
+                    // per pipeline iteration (rather than once an interval) is what
+                    // an earlier version of this did by accident.
+                    let sample_due = self.monitor.as_ref().map(|m| m.due(now)).unwrap_or(false);
+                    if let (true, Some(m)) = (sample_due, self.monitor.as_mut()) {
                         // The set tag is read live rather than captured once: the
                         // thread opens the next set at a day boundary, and a monitor
                         // showing the previous set's name is worse than none.
-                        // Everything the sampler needs to know about the writer,
-                        // read once: the set tag (a rollover changes it mid-run),
-                        // how full the queue is (the early warning) and how many rows
-                        // it has had to drop (the damage).
+                        // Everything the sampler needs to know about the device and
+                        // the writer, read once each, as plain data: the sampler
+                        // does not see the `Correlator` at all, so a binary with no
+                        // device does not link the C++ library in just to print a
+                        // line. The writer's set tag is read live rather than
+                        // captured once -- the thread opens the next set at a day
+                        // boundary, and a monitor showing the previous set's name is
+                        // worse than none.
+                        let gstat = {
+                            let mut g = crate::monitor::GpuStatus {
+                                present: self.gpu.is_some(),
+                                ..Default::default()
+                            };
+                            if let Some(corr) = self.gpu.as_ref() {
+                                if let Ok(place) = corr.placement() {
+                                    for i in 0..place.len() {
+                                        if let Ok(st) = corr.device_stats(i as i32) {
+                                            g.h2d_bytes += st.bytes_h2d;
+                                            g.slot_free_ns += st.ns_slot_free;
+                                        }
+                                    }
+                                }
+                            }
+                            g
+                        };
                         let wstat = self.writer.as_ref().map(|w| crate::monitor::WriterStatus {
                             set_tag: w.current_set_tag(),
                             queued: w.queued(),
@@ -303,7 +329,7 @@ impl<'a> Pipeline<'a> {
                             &self.sched,
                             self.progress,
                             self.ring.as_ref(),
-                            self.gpu.as_ref(),
+                            gstat,
                             wstat.as_ref(),
                             now,
                         );

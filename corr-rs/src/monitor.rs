@@ -56,7 +56,6 @@ use serde::Serialize;
 
 use crate::assemble::SlotRing;
 use crate::config::RunPlan;
-use crate::gpu::Correlator;
 use crate::sched::{now_ns, system_ms, RowScheduler, StationProgress};
 
 /// At what fraction of a ceiling a resource is called exhausted.
@@ -304,6 +303,30 @@ pub(crate) struct Station {
     pub silence_s: f64,
 }
 
+/// What the device knows, as the sampler sees it.
+///
+/// Plain data, like [`WriterStatus`], and for the same reason: the sampler's job is
+/// to difference counters, not to talk to the GPU. It matters more than tidiness
+/// here -- this type is what keeps `Monitor` free of any reference to
+/// [`crate::gpu::Correlator`], and therefore free of the C++ library: a correlator
+/// with no device -- a dry run, or any other binary that samples without a
+/// correlator -- has to be able to do so without `libcorr_cuda.so` being linked
+/// into it at all. The first version took `Option<&Correlator>` and did exactly
+/// the opposite: it dragged the shared library into a binary that had never
+/// needed it, and a missing runpath is how that surfaced.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct GpuStatus {
+    /// Whether this run has a device at all. A dry run does not, and the link
+    /// ratio is only meaningful when one exists -- `is_some()` on the old
+    /// `Option<&Correlator>` said the same thing.
+    pub present: bool,
+    /// Bytes copied host-to-device since the run started.
+    pub h2d_bytes: u64,
+    /// Time the pipeline spent waiting for a staging slot to be freed for the
+    /// device, summed over devices, in nanoseconds.
+    pub slot_free_ns: u64,
+}
+
 /// What the writer handle knows, as the sampler sees it.
 ///
 /// Built by the pipeline at each tick: the only thing monitor.rs needs to know
@@ -523,7 +546,7 @@ impl Monitor {
         sched: &RowScheduler,
         progress: &[Arc<StationProgress>],
         ring: &SlotRing,
-        gpu: Option<&Correlator>,
+        gpu: GpuStatus,
         dropped: u64,
         at: Instant,
     ) -> Snap {
@@ -534,22 +557,7 @@ impl Monitor {
             slot_wait_ns += p.slot_wait_ns();
             zero_filled += p.zero_filled_frames();
         }
-        let (h2d_bytes, slot_free_ns) = match gpu {
-            Some(corr) => {
-                let mut bytes = 0;
-                let mut slot_free = 0;
-                if let Ok(place) = corr.placement() {
-                    for i in 0..place.len() {
-                        if let Ok(st) = corr.device_stats(i as i32) {
-                            bytes += st.bytes_h2d;
-                            slot_free += st.ns_slot_free;
-                        }
-                    }
-                }
-                (bytes, slot_free)
-            }
-            None => (0, 0),
-        };
+        let (h2d_bytes, slot_free_ns) = (gpu.h2d_bytes, gpu.slot_free_ns);
         Snap {
             at,
             rows,
@@ -567,6 +575,20 @@ impl Monitor {
         }
     }
 
+    /// Whether a sample is due.
+    ///
+    /// Public because building the sampler's inputs is not free for every caller:
+    /// the device counters cost a call into the CUDA library, and the first
+    /// version of this took them straight in `tick`'s argument list, which read
+    /// them on *every* pipeline iteration instead of once an interval. Ask this
+    /// first, then build what `tick` needs.
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        match self.prev {
+            Some(p) => now.duration_since(p.at) >= self.interval,
+            None => true,
+        }
+    }
+
     /// Sample and publish if the interval has elapsed. One `Instant::now()` when
     /// it has not.
     pub(crate) fn tick(
@@ -574,15 +596,11 @@ impl Monitor {
         sched: &RowScheduler,
         progress: &[Arc<StationProgress>],
         ring: &SlotRing,
-        gpu: Option<&Correlator>,
+        gpu: GpuStatus,
         writer: Option<&WriterStatus>,
         now: Instant,
     ) {
-        let due = match self.prev {
-            Some(p) => now.duration_since(p.at) >= self.interval,
-            None => true,
-        };
-        if !due {
+        if !self.due(now) {
             return;
         }
         let dropped = writer.map(|w| w.dropped).unwrap_or(0);
@@ -630,7 +648,7 @@ impl Monitor {
         } else {
             0.0
         };
-        let link_ratio = if self.required_bytes_per_s > 0.0 && gpu.is_some() {
+        let link_ratio = if self.required_bytes_per_s > 0.0 && gpu.present {
             h2d_gbs * 1e9 / self.required_bytes_per_s
         } else {
             0.0
