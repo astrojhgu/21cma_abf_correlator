@@ -302,6 +302,179 @@ static void test_rows_wait(const char *what, int n_devices) {
     g_ctx = NULL;
 }
 
+/* Fill every station's staging with a deterministic non-trivial pattern, and
+ * mark every frame valid. A fetch of all-zero input would agree with itself no
+ * matter what it did. */
+static void fill_pattern(void *ctx, const corr_config *c) {
+    for (int32_t g = 0; g < c->n_station; ++g) {
+        corr_staging st;
+        if (corr_staging_info(ctx, g, &st) != CORR_OK) return;
+        for (size_t i = 0; i < st.validity_offset; ++i)
+            st.base[i] = (int8_t)((i * 31 + (size_t)g * 7) % 9 - 4);
+        memset(st.base + st.validity_offset, 0xFF, st.total_bytes - st.validity_offset);
+    }
+}
+
+/* One row's worth of work: every slot accumulated and released, then closed. */
+static corr_status accumulate_one_row(void *ctx, const corr_config *c, int64_t first_seq) {
+    for (int32_t i = 0; i < c->block_slots; ++i) {
+        const int64_t seq = first_seq + i;
+        /* Re-mark every lap: releasing a slot clears its validity mask, and an
+         * unmarked slot is silence. Without this both rows would be all zeros and
+         * the comparison below would pass for the wrong reason. */
+        mark_all_valid(ctx, c, (int32_t)(seq % c->block_slots));
+        corr_status s = corr_row_accumulate(ctx, seq, c->frames_per_slot);
+        if (s != CORR_OK) return s;
+        s = corr_row_slot_free(ctx, seq);
+        if (s != CORR_OK) return s;
+    }
+    return corr_row_end(ctx, (uint64_t)c->frames_per_slot * (uint64_t)c->block_slots);
+}
+
+/* The claim: the fetch can hand the row back without the caller waiting for it,
+ * and the bytes it produces are the bytes the blocking call produces. */
+static void test_fetch(const char *what, int n_devices, int split) {
+    printf("fetch without waiting, %s\n", what);
+    corr_config c = make_config(n_devices);
+    c.split_mode = split;
+    void *ctx = NULL;
+    corr_status s = corr_create(&c, &ctx);
+    if (s != CORR_OK) {
+        printf("  FAIL corr_create: %s (%s)\n", status_name(s), corr_last_error());
+        ++g_failures;
+        return;
+    }
+    g_ctx = ctx;
+    fill_pattern(ctx, &c);
+
+    const size_t row_bytes = (size_t)corr_n_baseline(c.n_station) * (size_t)c.n_freq * 8;
+    const size_t bytes = row_bytes * (size_t)c.rows_per_fetch;
+    void *out = malloc(bytes);
+    void *ref = malloc(bytes);
+    CHECK(out != NULL && ref != NULL, "cannot allocate the spectrum buffers");
+    if (out == NULL || ref == NULL) { free(out); free(ref); corr_destroy(ctx); return; }
+
+    /* The blocking call first, as the reference for what the row should be. */
+    int32_t ref_rows = -1;
+    CHECK(accumulate_one_row(ctx, &c, 0) == CORR_OK, "accumulate failed: %s",
+          corr_last_error());
+    s = corr_rows_fetch(ctx, ref, bytes, &ref_rows);
+    CHECK(s == CORR_OK, "the blocking fetch failed: %s", corr_last_error());
+    CHECK(ref_rows == c.rows_per_fetch, "the blocking fetch returned %d rows, expected %d",
+          ref_rows, c.rows_per_fetch);
+
+    /* The same work again, fetched without waiting for it. */
+    CHECK(accumulate_one_row(ctx, &c, c.block_slots) == CORR_OK, "accumulate failed: %s",
+          corr_last_error());
+    memset(out, 0xA5, bytes);
+    __atomic_store_n(&g_callbacks, 0, __ATOMIC_SEQ_CST);
+    int32_t rows = -1;
+    s = corr_rows_fetch_submit(ctx, out, bytes, &rows, on_done, NULL);
+    CHECK(s == CORR_OK, "rows_fetch_submit failed: %s", corr_last_error());
+    /* The count is knowable before the copy starts, so a caller can size whatever
+     * depends on it while the transfer is in flight. */
+    CHECK(rows == c.rows_per_fetch, "out_rows must be filled at submit: got %d, expected %d",
+          rows, c.rows_per_fetch);
+    CHECK(wait_for(1, 10.0) == 0, "no fetch callback within 10 s");
+    CHECK(callbacks() == 1, "expected exactly 1 fetch callback, got %d", callbacks());
+    s = corr_rows_fetch_ready(ctx);
+    CHECK(s == CORR_OK, "rows_fetch_ready after the callback: %s", status_name(s));
+
+    /* And a third round through the blocking call, because "the row fetched
+     * without waiting is the row" is a claim about the *path*, not about two
+     * laps agreeing with each other. Comparing against a fresh blocking fetch of
+     * an equivalent row tests the path; comparing against lap 1 would also be
+     * testing that two laps produce identical spectra, which is a different
+     * question and not this test's. */
+    void *ref2 = malloc(bytes);
+    CHECK(ref2 != NULL, "cannot allocate the third buffer");
+    int32_t ref2_rows = -1;
+    if (ref2 != NULL) {
+        CHECK(accumulate_one_row(ctx, &c, 2 * c.block_slots) == CORR_OK,
+              "accumulate failed: %s", corr_last_error());
+        s = corr_rows_fetch(ctx, ref2, bytes, &ref2_rows);
+        CHECK(s == CORR_OK && ref2_rows == c.rows_per_fetch,
+              "the third fetch failed: %s", corr_last_error());
+    }
+
+    /* Compare as samples, not as bytes.
+     *
+     * Under the time-slice split two laps are not byte-identical by construction:
+     * which device a frame is grouped with changes from lap to lap, and summing
+     * the same frames in a different order rounds differently. That is a property
+     * of the split, not of the path under test -- multi_device makes exactly this
+     * comparison and allows exactly this difference. What this test is about is
+     * whether fetching without waiting hands back the row that fetching with
+     * waiting does, so the tolerance is the same one, and the first pair below is
+     * printed to show the size of the difference the split alone accounts for. */
+    {
+        const float *f1 = (const float *)ref, *f3 = (const float *)ref2,
+                    *fa = (const float *)out;
+        const size_t n = bytes / sizeof(float);
+        double lap = 0, path = 0, scale = 0;
+        for (size_t i = 0; i < n; ++i) {
+            double a = f1[i] < 0 ? -f1[i] : f1[i];
+            double d_lap = f3[i] - f1[i], d_path = fa[i] - f3[i];
+            if (d_lap < 0) d_lap = -d_lap;
+            if (d_path < 0) d_path = -d_path;
+            if (d_lap > lap) lap = d_lap;
+            if (d_path > path) path = d_path;
+            if (a > scale) scale = a;
+        }
+        /* Two blocking laps are the baseline for what this split can be asked to
+         * reproduce. Under the time-slice split they are not bit-identical: which
+         * device a frame is grouped with changes from lap to lap, and the row is
+         * the sum of the partials. Whatever that costs in reproducibility, the
+         * path under test may not cost more -- and this pair of numbers says
+         * whether it does. Under a split with one device, or one where each device
+         * owns its own baselines, the baseline is zero and so is the tolerance. */
+        printf("    two blocking laps differ by at most %.3e (this split's own spread)\n",
+               lap);
+        printf("    without waiting vs with waiting differ by at most %.3e\n", path);
+        if (lap == 0.0) {
+            CHECK(path == 0.0,
+                  "the two fetches disagree although two blocking laps do not: %.3e",
+                  path);
+        } else {
+            CHECK(path <= lap,
+                  "fetching without waiting differs from fetching with waiting by "
+                  "%.3e, more than two blocking laps differ from each other (%.3e)",
+                  path, lap);
+        }
+        CHECK(scale > 0.0, "the row is all zeros, so this proved nothing");
+    }
+    free(ref2);
+
+    free(out);
+    free(ref);
+    CHECK(corr_destroy(ctx) == CORR_OK, "corr_destroy failed");
+    g_ctx = NULL;
+}
+
+/* The pair-covering split places baselines into the row on the host after the
+ * transfer, so there is no completion to signal. It has to say so rather than
+ * hand back a row that is still being assembled. */
+static void test_scattered_fetch_is_refused(void) {
+    printf("fetch without waiting, pair covering\n");
+    corr_config c = make_config(2);
+    c.split_mode = CORR_SPLIT_PAIR_COVERING;
+    void *ctx = NULL;
+    if (corr_create(&c, &ctx) != CORR_OK) {
+        printf("  FAIL corr_create: %s\n", corr_last_error());
+        ++g_failures;
+        return;
+    }
+    const size_t row_bytes = (size_t)corr_n_baseline(c.n_station) * (size_t)c.n_freq * 8;
+    void *out = malloc(row_bytes);
+    int32_t rows = -1;
+    corr_status s = corr_rows_fetch_submit(ctx, out, row_bytes, &rows, on_done, NULL);
+    CHECK(s == CORR_ERR_NOT_IMPL,
+          "the scattered fetch should be refused with CORR_ERR_NOT_IMPL, got %s",
+          status_name(s));
+    free(out);
+    CHECK(corr_destroy(ctx) == CORR_OK, "corr_destroy failed");
+}
+
 static void test_argument_checking(void) {
     printf("argument checking\n");
     corr_config c = make_config(1);
@@ -333,6 +506,17 @@ int main(void) {
     test_argument_checking();
     test_submit_does_not_wait("1 device", 1);
     test_rows_wait("1 device", 1);
+    test_fetch("1 device, baseline range", 1, CORR_SPLIT_BASELINE_RANGE);
+    /* One device under the time-slice split: the same row arithmetic with no peer
+     * to add, which is what isolates the combine from the rest. */
+    test_fetch("1 device, time slice", 1, CORR_SPLIT_TIME_SLICE);
+    /* Two devices, baselines split between them: no cross-device sum at all, so
+     * this is the exact case that exercises the counting path. */
+    test_fetch("2 devices, baseline range", 2, CORR_SPLIT_BASELINE_RANGE);
+    /* Two devices, frames split: the peers' partial rows are summed, and the sum
+     * is where the split's own lap-to-lap spread comes from. */
+    test_fetch("2 devices, time slice", 2, CORR_SPLIT_TIME_SLICE);
+    test_scattered_fetch_is_refused();
     /* Several devices read the same slot under this split, so this is the case
      * where the counted notification has to collapse them into one. */
     test_submit_does_not_wait("2 devices", 2);

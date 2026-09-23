@@ -23,6 +23,7 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace corr {
@@ -86,30 +87,36 @@ struct Context {
     std::vector<corr::GpuPlacement> plans;
     std::vector<SlotState> slots;
 
-    /// What an asynchronous release still owes, one entry per physical slot.
+    /// Several completions collapsed into the one callback a caller asked for.
     ///
     /// A slot is released once *every* device that read it has finished its copy,
-    /// and with more than one device that is several separate completions. The
-    /// count is what turns them back into the single callback the caller asked
-    /// for. It is decremented from CUDA's callback threads, which is why it is
-    /// atomic and why nothing else here is touched from those threads.
+    /// and a fetch is done once every device that wrote a slice of the row has
+    /// handed it over; with more than one device either is several separate
+    /// completions, and the count is what turns them back into one.
+    ///
+    /// It is decremented from CUDA's callback threads, which is why it is atomic
+    /// and why nothing else in this struct is touched from those threads.
     ///
     /// `cb` and `user` are written by the submitting thread before any callback
-    /// for that slot can run -- the callbacks are ordered behind the copies, which
-    /// are ordered behind the submit -- and read back by the last one to arrive.
-    struct SlotNotify {
+    /// can run -- the callbacks are ordered behind the copies, which are ordered
+    /// behind the submits -- and read back by the last one to arrive.
+    struct NotifyCount {
         std::atomic<int32_t> outstanding{0};
         corr_notify_fn cb = nullptr;
         void *user = nullptr;
     };
-    /// A plain array rather than a vector: `SlotNotify` holds an atomic, which
+    /// A plain array rather than a vector: `NotifyCount` holds an atomic, which
     /// makes it neither copyable nor movable, and a vector that cannot move its
     /// elements cannot resize.
-    std::unique_ptr<SlotNotify[]> slot_notify;
+    std::unique_ptr<NotifyCount[]> slot_notify;
 
-    /// The same, for the once-per-row wait. Rows are strictly sequential, so one
-    /// counter covers them all; see SlotNotify for the ordering argument.
-    SlotNotify row_notify;
+    /// The same, for the waits that happen once per row. Rows are strictly
+    /// sequential, so one counter covers them all; see NotifyCount for the
+    /// ordering argument.
+    NotifyCount row_notify;
+    /// ...and for the fetch, where under the time-slice split only device 0
+    /// reports: its copy is ordered behind every peer's.
+    NotifyCount fetch_notify;
     /// Cumulative time this thread spent inside each fan-out call, per device.
     /// Written only by the thread that drives the context, like the counters in
     /// the device state.
@@ -644,7 +651,7 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
     // and starting from a known state makes an accidental unwritten frame show
     // up as silence rather than as garbage.
     ctx->slots.assign(static_cast<size_t>(cfg->block_slots), SlotState::kFree);
-    ctx->slot_notify = std::make_unique<Context::SlotNotify[]>(
+    ctx->slot_notify = std::make_unique<Context::NotifyCount[]>(
         static_cast<size_t>(cfg->block_slots));
 
     // Who computes what. Deterministic and derived from the configuration, never
@@ -910,7 +917,7 @@ static void release_slot_after_copy(Context *ctx, int32_t slot) {
 /// on purpose -- the submitting thread may be holding `ctx->mu`, and reaching for
 /// it here is exactly the deadlock this submit/finish split exists to avoid.
 static void notify_when_last(void *raw) {
-    auto *n = static_cast<Context::SlotNotify *>(raw);
+    auto *n = static_cast<Context::NotifyCount *>(raw);
     if (n->outstanding.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
     corr_notify_fn cb = n->cb;
     void *user = n->user;
@@ -978,7 +985,7 @@ extern "C" corr_status corr_row_slot_free_submit(void *h, int64_t slot_seq,
     // pretending otherwise: a submit only fails on a CUDA error that makes the
     // context unusable, so the caller tears the run down instead of retrying, and
     // the stale count goes with it.
-    Context::SlotNotify &n = ctx->slot_notify[static_cast<size_t>(slot)];
+    Context::NotifyCount &n = ctx->slot_notify[static_cast<size_t>(slot)];
     n.cb = cb;
     n.user = user;
     n.outstanding.store(last - first, std::memory_order_release);
@@ -1041,7 +1048,11 @@ namespace {
 struct FetchDebug {
     uint64_t calls = 0;
     uint64_t ns_transfer = 0;   // cudaMemcpyAsync plus its synchronisation
-    uint64_t ns_sum = 0;        // the host-side copy/add into the caller's buffer
+    /// The host-side copy/add into the caller's buffer. The add left the host
+    /// when the time-slice sum moved to the device, so this stays zero except
+    /// under the pair-covering split, whose placement loop is host work by
+    /// construction. A report that prints 0.0 here is saying so.
+    uint64_t ns_sum = 0;
     uint64_t bytes = 0;
 };
 FetchDebug g_fetch_dbg;
@@ -1049,6 +1060,21 @@ FetchDebug g_fetch_dbg;
 bool fetch_debug_on() {
     static const bool on = std::getenv("CORR_FETCH_DEBUG") != nullptr;
     return on;
+}
+
+void fetch_debug_report();
+
+/// Time-based, not call-based: a one-second integration makes a handful of calls
+/// a minute and a 40.96 us row makes twenty thousand a second, and both are worth
+/// seeing.
+void fetch_debug_maybe_report() {
+    if (!fetch_debug_on()) return;
+    static uint64_t last_report_ns = 0;
+    const uint64_t now = now_ns();
+    if (now - last_report_ns >= 1000000000ull) {
+        last_report_ns = now;
+        fetch_debug_report();
+    }
 }
 
 void fetch_debug_report() {
@@ -1087,7 +1113,7 @@ extern "C" corr_status corr_rows_wait_submit(void *h, corr_notify_fn cb, void *u
 
     // Armed before the first device is asked, for the same reason as the slot
     // release: a completion can arrive while this loop is still running.
-    Context::SlotNotify &n = ctx->row_notify;
+    Context::NotifyCount &n = ctx->row_notify;
     n.cb = cb;
     n.user = user;
     n.outstanding.store(ctx->n_devices(), std::memory_order_release);
@@ -1144,61 +1170,107 @@ extern "C" corr_status corr_rows_pending(void *h, int32_t *out_pending) {
     return CORR_OK;
 }
 
-extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
-                                       int32_t *out_rows) {
+/// The pair-covering split's fetch, which has no asynchronous form.
+///
+/// It transfers each device's slice into pinned scratch and then places the
+/// baselines into the row one at a time, on the host. There is no completion to
+/// signal: the placement is the last thing that happens and it happens here. So
+/// it keeps its own path rather than being half-supported by the asynchronous
+/// entry point, which refuses it by name.
+static corr_status fetch_scattered_all(Context *ctx, void *out, int32_t *out_rows) {
+    const size_t pitch = ctx->row_bytes();
+    const size_t baseline_bytes = static_cast<size_t>(ctx->cfg.n_freq) * sizeof(float) * 2;
+    char *base = static_cast<char *>(out);
+    int32_t rows = -1;
+    for (int d = 0; d < ctx->n_devices(); ++d) {
+        corr_status st = select_device(ctx, d);
+        if (st != CORR_OK) return st;
+        const corr::GpuPlacement &pl = ctx->plans[static_cast<size_t>(d)];
+        const size_t slice = ctx->slice_bytes(d);
+        const uint64_t tf0 = now_ns();
+        if (ctx->scatter == nullptr ||
+            ctx->scatter_bytes < slice * static_cast<size_t>(ctx->cfg.rows_per_fetch))
+            return fail(CORR_ERR_INTERNAL, "scatter buffer is missing or too small");
+        int32_t got = 0;
+        if ((st = corr::gpu_row_fetch_scattered(ctx->gpus[static_cast<size_t>(d)],
+                                                pl.baselines.data(), base, pitch,
+                                                baseline_bytes, ctx->scatter,
+                                                ctx->scatter_bytes, &got)) != CORR_OK)
+            return st;
+        ctx->timing[static_cast<size_t>(d)].fetch += now_ns() - tf0;
+        if (rows < 0) {
+            rows = got;
+        } else if (got != rows) {
+            return failf(CORR_ERR_INTERNAL,
+                         "devices disagree on fetched rows: device %d returned %d, "
+                         "an earlier device returned %d", d, got, rows);
+        }
+    }
+    *out_rows = rows < 0 ? 0 : rows;
+    return CORR_OK;
+}
+
+/// True when the split places baselines on the host, which is what makes the
+/// fetch unable to be asynchronous.
+static bool split_fetches_on_the_host(const Context *ctx) {
+    if (ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE) return false;
+    for (const corr::GpuPlacement &pl : ctx->plans)
+        if (!pl.baselines_are_contiguous) return true;
+    return false;
+}
+
+extern "C" corr_status corr_rows_fetch_submit(void *h, void *out, size_t out_bytes,
+                                              int32_t *out_rows, corr_notify_fn cb,
+                                              void *user) {
     Context *ctx = as_ctx(h);
     if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
     if (out == nullptr) return fail(CORR_ERR_ARG, "out is NULL");
     if (out_rows == nullptr) return fail(CORR_ERR_ARG, "out_rows is NULL");
+    if (cb == nullptr) return fail(CORR_ERR_ARG, "cb is NULL");
 
     const size_t need = ctx->out_bytes();
     if (out_bytes < need)
         return failf(CORR_ERR_ARG,
                      "out_bytes=%zu but %zu are required for rows_per_fetch=%d",
                      out_bytes, need, ctx->cfg.rows_per_fetch);
+    if (split_fetches_on_the_host(ctx))
+        return fail(CORR_ERR_NOT_IMPL,
+                    "this split places baselines into the row on the host after the "
+                    "transfer, so it has no completion to signal; corr_rows_fetch() "
+                    "is the way to fetch under it");
 
     // Each device writes its own baseline slice into the one contiguous row
     // buffer the caller supplied, at the offset its slice starts at. The
     // destination pitch is a whole global row, which is what makes a slice land
     // in the right place for every row in the batch.
     const size_t pitch = ctx->row_bytes();
-    const size_t baseline_bytes =
-        static_cast<size_t>(ctx->cfg.n_freq) * sizeof(float) * 2;
+    const size_t baseline_bytes = static_cast<size_t>(ctx->cfg.n_freq) * sizeof(float) * 2;
     char *base = static_cast<char *>(out);
     const bool time_slice = ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE;
     int32_t rows = -1;
+    corr_status st = CORR_OK;
+
+    // How many devices report. Under the time-slice split only device 0 does: its
+    // copy is ordered behind every peer's transfer and add, because it is the
+    // copy that leaves the summed row, so its completion is the whole answer.
+    Context::NotifyCount &n = ctx->fetch_notify;
+    n.cb = cb;
+    n.user = user;
+    n.outstanding.store(time_slice ? 1 : ctx->n_devices(), std::memory_order_release);
 
     // Under the time-slice split the devices hold *partial* rows -- each a whole
     // row of baselines over that device's share of the frames -- and they have to
-    // be added together. That addition happens on device 0 now instead of in a
-    // loop here, which changes which device's copy is the last one: device 0's
-    // accumulator is where the sum is built, so it is fetched *after* the loop
-    // rather than first.
-    //
-    // Why it moved, measured at this machine's production geometry (24 stations,
-    // n_freq 16384, four devices, one fetch per row): the fetch took 11.2 ms with
-    // the sum on the host and 7.6 ms with it on the device. The 3.6 ms is host
-    // CPU the pipeline thread no longer spends, out of a call it used to spend
-    // 11.2 ms inside.
-    //
-    // The comment this replaces recorded the host loop as 118 ms of a 167 ms
-    // fetch. Whatever geometry that came from, it is not this one -- the loop's
-    // cost scales with the baseline count and rows_per_fetch, and 40 stations is
-    // 2.7x these baselines rather than 30x. It is left mentioned only so that the
-    // number is not mistaken for a constant: it is geometry-dependent, and the
-    // figure that justifies the change is the one above.
+    // be added together. That addition happens on device 0, in kernel, so device
+    // 0's accumulator is where the sum is built and its copy is the one that
+    // leaves the device. Everything is queued here; nothing is waited for.
     for (int d = 0; d < ctx->n_devices(); ++d) {
-        corr_status st = select_device(ctx, d);
-        if (st != CORR_OK) return st;
+        if ((st = select_device(ctx, d)) != CORR_OK) return st;
         const corr::GpuPlacement &pl = ctx->plans[static_cast<size_t>(d)];
         int32_t got = 0;
         const size_t slice = ctx->slice_bytes(d);
-        uint64_t t_part = 0;
         const uint64_t tf0 = now_ns();
         if (time_slice) {
-            if (d == 0) {
-                // Nothing yet: see above, its accumulator is the sum.
-            } else {
+            if (d != 0) {
                 const size_t stage_need =
                     static_cast<size_t>(ctx->n_devices() - 1) * ctx->out_bytes();
                 if (ctx->scatter == nullptr || ctx->scatter_bytes < stage_need)
@@ -1209,10 +1281,10 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
                 // host-to-device copy was still reading.
                 char *stage = static_cast<char *>(ctx->scatter) +
                               static_cast<size_t>(d - 1) * ctx->out_bytes();
-                if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)], stage,
-                                              ctx->out_bytes(), 0, &got)) != CORR_OK)
+                if ((st = corr::gpu_row_fetch_submit(ctx->gpus[static_cast<size_t>(d)], stage,
+                                                     ctx->out_bytes(), 0, &got, nullptr,
+                                                     nullptr)) != CORR_OK)
                     return st;
-                t_part = now_ns() - tf0;
                 if (got > 0) {
                     g_fetch_dbg.bytes += static_cast<size_t>(got) * slice;
                     if ((st = corr::gpu_row_add_peer_row(ctx->gpus[0],
@@ -1223,30 +1295,16 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
                         return st;
                 }
             }
-            g_fetch_dbg.ns_transfer += t_part;
-        } else if (pl.baselines_are_contiguous) {
-            // One two-dimensional copy straight into the row buffer, at the
-            // offset this device's range starts at.
-            char *dst = base + static_cast<size_t>(pl.baselines.front()) * baseline_bytes;
-            if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)], dst,
-                                          slice * static_cast<size_t>(ctx->cfg.rows_per_fetch),
-                                          pitch, &got)) != CORR_OK)
-                return st;
         } else {
-            // Scattered baselines: fetch into the scratch and place each one.
-            if (ctx->scatter == nullptr || ctx->scatter_bytes < slice * ctx->cfg.rows_per_fetch)
-                return fail(CORR_ERR_INTERNAL, "scatter buffer is missing or too small");
-            if ((st = corr::gpu_row_fetch_scattered(
-                     ctx->gpus[static_cast<size_t>(d)], pl.baselines.data(), base, pitch,
-                     baseline_bytes, ctx->scatter, ctx->scatter_bytes, &got)) != CORR_OK)
+            char *dst = base + static_cast<size_t>(pl.baselines.front()) * baseline_bytes;
+            if ((st = corr::gpu_row_fetch_submit(
+                     ctx->gpus[static_cast<size_t>(d)], dst,
+                     slice * static_cast<size_t>(ctx->cfg.rows_per_fetch), pitch, &got,
+                     notify_when_last, &n)) != CORR_OK)
                 return st;
         }
         ctx->timing[static_cast<size_t>(d)].fetch += now_ns() - tf0;
-        if (time_slice) {
-            // Device 0 reports after the loop; the peers have to agree among
-            // themselves, and with it.
-            if (d == 0) continue;
-        }
+        if (time_slice && d == 0) continue; // it reports after the loop
         if (rows < 0) {
             rows = got;
         } else if (got != rows) {
@@ -1257,35 +1315,86 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
     }
 
     if (time_slice) {
-        // The sum is complete in device 0's accumulator, and its fetch is what
-        // copies it out -- and what clears that accumulator for the next row.
-        // Its D2H runs on the same stream as the peer transfers and adds, so it
-        // is ordered behind every one of them.
         int32_t got = 0;
         const uint64_t tf0 = now_ns();
-        corr_status st = corr::gpu_row_fetch(ctx->gpus[0], out, ctx->out_bytes(), 0, &got);
+        if ((st = corr::gpu_row_fetch_submit(ctx->gpus[0], out, ctx->out_bytes(), 0, &got,
+                                             notify_when_last, &n)) != CORR_OK)
+            return st;
         ctx->timing[0].fetch += now_ns() - tf0;
-        if (st != CORR_OK) return st;
         if (rows >= 0 && got != rows)
             return failf(CORR_ERR_INTERNAL,
                          "device 0 returned %d rows, the other devices returned %d", got,
                          rows);
         rows = got;
     }
+
     *out_rows = rows < 0 ? 0 : rows;
+    if (rows == 0) {
+        // Nothing was queued, so nobody will report: hand the count back rather
+        // than leave it armed for whichever call comes next.
+        n.cb = nullptr;
+        n.outstanding.store(0, std::memory_order_release);
+    }
+
     g_fetch_dbg.calls += 1;
-    // Time-based, not call-based: a one-second integration makes a handful of
-    // calls a minute and a 40.96 us row makes twenty thousand a second, and both
-    // are worth seeing.
-    if (fetch_debug_on()) {
-        static uint64_t last_report_ns = 0;
-        const uint64_t now = now_ns();
-        if (now - last_report_ns >= 1000000000ull) {
-            last_report_ns = now;
-            fetch_debug_report();
-        }
+    fetch_debug_maybe_report();
+    return CORR_OK;
+}
+
+extern "C" corr_status corr_rows_fetch_ready(void *h) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    for (int d = 0; d < ctx->n_devices(); ++d) {
+        corr_status st = select_device(ctx, d);
+        if (st != CORR_OK) return st;
+        if ((st = corr::gpu_rows_fetch_ready(ctx->gpus[static_cast<size_t>(d)])) != CORR_OK)
+            return st;
     }
     return CORR_OK;
+}
+
+/// The blocking wrapper's way of learning that a transfer finished.
+///
+/// A plain atomic and a poll, rather than a mutex and a condition variable: the
+/// callback runs on a CUDA-internal thread, where the contract is that it only
+/// signals, so it must not touch a lock. The poll costs a few microseconds on a
+/// call that is already milliseconds, and only this entry point pays it.
+namespace {
+struct FetchWaiter {
+    std::atomic<bool> done{false};
+};
+void fetch_waiter_cb(void *raw) {
+    static_cast<FetchWaiter *>(raw)->done.store(true, std::memory_order_release);
+}
+} // namespace
+
+extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
+                                       int32_t *out_rows) {
+    Context *ctx = as_ctx(h);
+    if (ctx == nullptr) return fail(CORR_ERR_ARG, "ctx is NULL");
+    if (out == nullptr) return fail(CORR_ERR_ARG, "out is NULL");
+    if (out_rows == nullptr) return fail(CORR_ERR_ARG, "out_rows is NULL");
+
+    // The split that places baselines on the host has nothing to wait for on a
+    // device, so it keeps its own path; see fetch_scattered_all.
+    if (split_fetches_on_the_host(ctx)) {
+        const size_t need = ctx->out_bytes();
+        if (out_bytes < need)
+            return failf(CORR_ERR_ARG,
+                         "out_bytes=%zu but %zu are required for rows_per_fetch=%d",
+                         out_bytes, need, ctx->cfg.rows_per_fetch);
+        return fetch_scattered_all(ctx, out, out_rows);
+    }
+
+    FetchWaiter w;
+    corr_status st = corr_rows_fetch_submit(h, out, out_bytes, out_rows, fetch_waiter_cb, &w);
+    if (st != CORR_OK) return st;
+    if (*out_rows == 0) return CORR_OK; // nothing was queued, so nothing will report
+    while (!w.done.load(std::memory_order_acquire))
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    // The callback cannot report a failure, so ask -- the same way an
+    // asynchronous caller does.
+    return corr_rows_fetch_ready(h);
 }
 
 // ---------------------------------------------------------------------------

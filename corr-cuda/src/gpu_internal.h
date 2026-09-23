@@ -123,6 +123,17 @@ corr_status gpu_rows_pending(GpuState *g, int32_t *out_pending);
 corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
                           int32_t *out_rows);
 
+/// Queue the copy and return. `notify` is called, on a CUDA-internal thread, once
+/// the bytes are in `out`; NULL means nobody asked and the caller finds out some
+/// other way. `out_rows` is filled here rather than on completion, because the
+/// rows being copied are the ones already closed.
+corr_status gpu_row_fetch_submit(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
+                                 int32_t *out_rows, corr_notify_fn notify, void *user);
+
+/// Non-blocking completion test for the copy above: 0 when done and clean,
+/// CORR_ERR_BUSY while in flight, the CUDA status otherwise.
+corr_status gpu_rows_fetch_ready(GpuState *g);
+
 /// Make room on this device to receive another device's row.
 ///
 /// For the split where every device holds a partial row of the whole baseline

@@ -934,26 +934,40 @@ corr_status gpu_rows_pending(GpuState *g, int32_t *out_pending) {
     return CORR_OK;
 }
 
-corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
-                          int32_t *out_rows) {
-    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch: null state");
-    if (out == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch: out is NULL");
-    if (out_rows == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch: out_rows is NULL");
+corr_status gpu_row_fetch_submit(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
+                                 int32_t *out_rows, corr_notify_fn notify, void *user) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch_submit: null state");
+    if (out == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch_submit: out is NULL");
+    if (out_rows == nullptr)
+        return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch_submit: out_rows is NULL");
 
     const size_t slice_bytes = g->row_elems * sizeof(float2);
     const size_t need = slice_bytes * (size_t)g->rows_per_fetch;
     if (out_bytes < need)
-        return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch: output buffer too small");
+        return gpu_fail(CORR_ERR_ARG, "gpu_row_fetch_submit: output buffer too small");
 
-    if (g->pending == 0) {
-        *out_rows = 0;
-        return CORR_OK;
-    }
+    // The count is known before the copy starts -- the rows are the ones already
+    // closed -- so the caller learns what it will get without waiting for it.
+    const int32_t rows = g->pending;
+    *out_rows = rows;
+    if (rows == 0) return CORR_OK;
+
+    // Order the copy behind the row's scaling kernel.
+    //
+    // `pending` counts rows that have been *closed*, and closing one only queues
+    // its scale; the copy is on another stream and would otherwise be free to run
+    // first and hand back an unscaled row. The ABI used to leave this to the
+    // caller -- wait for the rows, then fetch -- and a caller that did not lost
+    // most of the first row of every run, which is a trap rather than an
+    // interface. One wait on an event the device already records costs nothing
+    // and makes the call correct on its own.
+    corr_status st = cuda_check(cudaStreamWaitEvent(g->fetch_stream, g->row_done, 0),
+                                "cudaStreamWaitEvent(row_done)");
+    if (st != CORR_OK) return st;
 
     // Rows are always claimed from index 0 upward, so the pending rows are
     // contiguous at the front of the stack.
-    const size_t bytes = slice_bytes * (size_t)g->pending;
-    corr_status st = CORR_OK;
+    const size_t bytes = slice_bytes * (size_t)rows;
     if (dst_pitch == 0 || dst_pitch == slice_bytes) {
         st = cuda_check(
             cudaMemcpyAsync(out, g->d_acc, bytes, cudaMemcpyDeviceToHost, g->fetch_stream),
@@ -962,7 +976,7 @@ corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_p
         // Several devices write interleaved slices of one global row buffer, so
         // the destination rows are further apart than this device's slice.
         st = cuda_check(cudaMemcpy2DAsync(out, dst_pitch, g->d_acc, slice_bytes, slice_bytes,
-                                          (size_t)g->pending, cudaMemcpyDeviceToHost,
+                                          (size_t)rows, cudaMemcpyDeviceToHost,
                                           g->fetch_stream),
                         "cudaMemcpy2DAsync(D2H)");
     }
@@ -973,27 +987,50 @@ corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_p
                          "cudaEventRecord(fetch_done)")) != CORR_OK)
         return st;
 
-    // The caller expects the data to be in `out` when this returns.
-    if ((st = cuda_check(cudaStreamSynchronize(g->fetch_stream),
-                         "cudaStreamSynchronize(fetch)")) != CORR_OK)
-        return st;
-
-    // Clear only now: zeroing before the copy completed would hand back zeros.
-    // The memset goes on the compute stream so that it is ordered ahead of the
-    // kernels of the next row, and it waits on fetch_done so that it cannot
-    // clobber the accumulator while the copy engine is still reading it.
+    // Clearing the accumulator is *enqueued* on the compute stream, behind
+    // fetch_done, rather than done here. Zeroing before the copy completed would
+    // hand back zeros; the compute stream is where the next row's kernels run, so
+    // being ordered there is both necessary and sufficient. Nothing about it
+    // needs the host to wait.
     if ((st = cuda_check(cudaStreamWaitEvent(g->compute_stream, g->fetch_done),
                          "cudaStreamWaitEvent(fetch_done)")) != CORR_OK)
         return st;
-    if ((st = cuda_check(
-             cudaMemsetAsync(g->d_acc, 0, bytes, g->compute_stream),
-             "cudaMemsetAsync(acc)")) != CORR_OK)
+    if ((st = cuda_check(cudaMemsetAsync(g->d_acc, 0, bytes, g->compute_stream),
+                         "cudaMemsetAsync(acc)")) != CORR_OK)
         return st;
 
-    *out_rows = g->pending;
+    // Tell the caller when the bytes are really in `out`. A NULL notify means
+    // nobody asked -- which is what the blocking wrapper below passes, and what a
+    // caller that only wants the transfer queued can pass too.
+    if (notify != nullptr) {
+        st = gpu_notify_on(g, g->fetch_done, notify, user);
+        if (st != CORR_OK) return st;
+    }
+
     g->pending = 0;
     g->cur_row = 0;
     return CORR_OK;
+}
+
+corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
+                          int32_t *out_rows) {
+    corr_status st =
+        gpu_row_fetch_submit(g, out, out_bytes, dst_pitch, out_rows, nullptr, nullptr);
+    if (st != CORR_OK) return st;
+    if (*out_rows == 0) return CORR_OK;
+    // The same wait this always did, now that the queueing it waits on is shared
+    // with the asynchronous entry point: one implementation, two ways to ask.
+    return cuda_check(cudaEventSynchronize(g->fetch_done),
+                      "cudaEventSynchronize(fetch_done)");
+}
+
+corr_status gpu_rows_fetch_ready(GpuState *g) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_rows_fetch_ready: null state");
+    cudaError_t e = cudaEventQuery(g->fetch_done);
+    if (e == cudaSuccess) return CORR_OK;
+    if (e == cudaErrorNotReady) return CORR_ERR_BUSY;
+    return gpu_fail(CORR_ERR_CUDA,
+                    std::string("cudaEventQuery(fetch_done): ") + cudaGetErrorString(e));
 }
 
 corr_status gpu_peer_row_reserve(GpuState *g, size_t bytes) {

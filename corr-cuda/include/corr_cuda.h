@@ -488,6 +488,38 @@ corr_status corr_rows_fetch(void *ctx, void *out, size_t out_bytes,
                             int32_t *out_rows);
 
 /*
+ * The same fetch without the wait: `cb(user)` fires, from a CUDA-internal
+ * thread, once the bytes are in `out`.
+ *
+ * `out_rows` is filled before this returns, not on completion: the rows being
+ * copied are the ones already closed, so the count is known before the transfer
+ * starts. A caller that has to size something from it can therefore do so while
+ * the copy is in flight.
+ *
+ * `out` must stay valid, and unwritten by anyone else, until `cb` fires. That is
+ * a stronger requirement than the blocking call's, where the lifetime ends when
+ * it returns.
+ *
+ * Not available for the pair-covering split, whose fetch places baselines into
+ * the row on the host after the transfer: there would be nothing left to run
+ * that loop on the caller's thread. It returns CORR_ERR_NOT_IMPL there, and
+ * corr_rows_fetch() remains the way to fetch under that split.
+ *
+ * The same rules as the other callbacks apply: signal only, no CUDA calls, no
+ * lock the submitting thread may hold.
+ */
+corr_status corr_rows_fetch_submit(void *ctx, void *out, size_t out_bytes,
+                                   int32_t *out_rows, corr_notify_fn cb, void *user);
+
+/*
+ * Non-blocking: 0 when the last submitted fetch has completed and nothing
+ * failed, CORR_ERR_BUSY while it is in flight, and the CUDA status when it
+ * finished badly. This is where a failed transfer becomes visible, since a
+ * callback has no way to report one.
+ */
+corr_status corr_rows_fetch_ready(void *ctx);
+
+/*
  * Number of baselines for n_station stations, i.e. n_station*(n_station+1)/2.
  * Returns -1 for n_station < 1.
  *
