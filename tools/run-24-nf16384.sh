@@ -181,33 +181,46 @@ except Exception:
     nic = nic_override or "ens2f0np0"
 
 
-def prio0():
+def counters():
+    """两个计数器都要看。
+
+    `rx_prio0_discards` 是硬件队列丢弃，而本机现在主要丢在 `rx_out_of_buffer`
+    （驱动补接收缓冲来不及 —— RX ring 1024、上限 8192，中断合并 rx-usecs 32 /
+    rx-frames 64）。只看 prio0 的话，一次纯 out_of_buffer 的突发会被报成"安静"，
+    而那一腿的补零率会莫名其妙地高 —— 实测过：同一二进制相隔 3 分钟，
+    一腿补零 5.03%、一腿 0.0000%。
+    """
     # `ethtool -S` 的行首有缩进，别用 startswith（踩过：它静默地返回 None，
     # 于是整个检查"成功"地什么都没做）。
     out = subprocess.run(["ethtool", "-S", nic], capture_output=True, text=True).stdout
+    got = {}
     for line in out.splitlines():
         key, _, val = line.partition(":")
-        if key.strip() == "rx_prio0_discards":
+        k = key.strip()
+        if k in ("rx_prio0_discards", "rx_out_of_buffer"):
             try:
-                return int(val.strip())
+                got[k] = int(val.strip())
             except ValueError:
-                return None
-    return None
+                pass
+    return got
 
 
-a = prio0()
-if a is None:
+a = counters()
+if not a:
     sys.exit(0)
 print("网卡层静默检查（{}，20 s）...".format(nic), flush=True)
 time.sleep(20)
-d = (prio0() or a) - a
-if d > 0:
-    print("注意：这 20 s 内网卡 RX 队列丢了 {} 个包（{:.0f}/s）—— 包在网卡硬件队列就被扔了，"
-          "与接收程序无关，这腿的补零率会偏高。".format(d, d / 20.0), file=sys.stderr)
-    print("      判据：tools/loss_attribution.py；根因与那条改不动的命令：tools/README.md",
-          file=sys.stderr)
+b = counters()
+d0 = b.get("rx_prio0_discards", 0) - a.get("rx_prio0_discards", 0)
+d1 = b.get("rx_out_of_buffer", 0) - a.get("rx_out_of_buffer", 0)
+if d0 > 0 or d1 > 0:
+    print("注意：这 20 s 内网卡丢了 {} 个包（{:.0f}/s）—— prio0 {}、out_of_buffer {}。"
+          "包在网卡这一层就被扔了，与接收程序无关，这腿的补零率会偏高。"
+          .format(d0 + d1, (d0 + d1) / 20.0, d0, d1), file=sys.stderr)
+    print("      判据：tools/loss_attribution.py；根因（ring 1024/8192、中断合并）与那条"
+          "需要 root 的命令：tools/README.md", file=sys.stderr)
 else:
-    print("网卡层：安静（20 s 内无硬件队列丢弃）", flush=True)
+    print("网卡层：安静（20 s 内两个计数器都没动）", flush=True)
 NICCHK
 fi
 if [ "$DOCTOR" = "1" ]; then

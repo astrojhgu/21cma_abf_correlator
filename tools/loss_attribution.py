@@ -6,9 +6,13 @@ corr 的 `capacity:` 说的是**应用侧**先顶到谁（环、GPU 链路、CPU
 四层计数并排打出来，用增量判断责任：
 
     rx_prio0_discards 在涨  → 网卡 RX 队列（硬件）丢的：ring 太小、或中断被推迟
+    rx_out_of_buffer 在涨   → **同一条链，但计数不同**：驱动没来得及补上接收缓冲
+                              （NAPI 被推迟，或 RX ring 只有 1024 / 上限 8192）。
+                              本机现在主要丢在这一项，所以判定里必须带上它 ——
+                              少了它，一次纯 out_of_buffer 的丢包会被误判成"包没到本机"。
     softnet dropped 在涨    → 内核软中断 backlog 丢的（net.core.netdev_max_backlog）
     corr socket_drops 在涨  → 我们自己的 socket 缓冲丢的（SO_RCVBUF）
-    以上都不涨、loss 涨      → 包在这台机器之前就没了（前端 / 线路 / 交换机）
+    网卡那三项都不涨、loss 涨 → 包在这台机器之前就没了（前端 / 线路 / 交换机）
     以上都不涨、补零涨       → 应用侧（staging 环 / GPU / 写盘）
 
 为什么不用 `doctor.py`：它会 join 组播组做空闲丢包基线，**不能在别的 corr 正在跑的时候
@@ -185,6 +189,13 @@ def verdict(d):
     """一行说清责任。顺序就是证据的强度：越靠下越是我们自己的事。"""
     if d["nic_prio0"]:
         return "网卡 RX 队列（硬件）：ring 太小或中断被推迟 —— 需要 root 调 ring/IRQ"
+    if d["nic_oob"]:
+        # 本机的主要丢包形态：rx_prio0_discards 是 0，而这一项几十万，ring 是 1024/8192，
+        # 中断合并 rx-usecs 32 / rx-frames 64。少了这一条就会误判成"包没到本机"。
+        return (
+            "网卡没有缓冲可放（rx_out_of_buffer）：驱动补缓冲来不及 —— 调大 RX ring"
+            "（当前 1024，上限 8192）或减小中断合并 rx-usecs/rx-frames；需要 root"
+        )
     if d["nic_discards"] and not d["nic_prio0"]:
         return "网卡（PHY/端口层）丢的 —— 查 rx_crc/symbol/pause 那几个计数"
     if d["softnet_dropped"]:
@@ -257,7 +268,8 @@ def main():
             stamp = time.strftime("%H:%M:%S")
             print(
                 f"[{stamp}] {dt:.1f}s | 到达 {d['pkts']/dt/1e6:.2f} Mpps | "
-                f"网卡丢 +{d['nic_discards']:,}（prio0 +{d['nic_prio0']:,}） | "
+                f"网卡丢 +{d['nic_discards']:,}（prio0 +{d['nic_prio0']:,}，"
+                f"out_of_buffer +{d['nic_oob']:,}） | "
                 f"软中断丢 +{d['softnet_dropped']:,}（squeeze +{d['softnet_squeeze']:,}） | "
                 f"sockdrop +{d['sockdrop']:,} | corr lost +{d['lost']:,} "
                 f"{('zf ' + format(d['zf_win'], '.4f') + '%') if cur['running'] else '(未运行)'}"
