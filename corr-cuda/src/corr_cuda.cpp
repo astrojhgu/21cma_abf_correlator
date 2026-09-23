@@ -670,13 +670,19 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
 
     ctx->timing.assign(ctx->plans.size(), Context::Timing{});
 
-    // Room for one device's share of a fetch: the scattered-gather path needs it
-    // for a device whose baselines are not contiguous, and the time-slice split
-    // needs it for every device, because each holds a whole partial row.
+    // Pinned scratch, for two different jobs.
+    //
+    // A device whose baselines are scattered through the global numbering fetches
+    // its slice here and then places each baseline. And under the time-slice split
+    // every peer device's partial row lands here before being added into device
+    // 0's accumulator -- one slice per peer, because one shared slice would let a
+    // later device's transfer land on bytes an earlier device's copy is still
+    // reading.
+    if (cfg->split_mode == CORR_SPLIT_TIME_SLICE) {
+        ctx->scatter_bytes = static_cast<size_t>(ctx->n_devices() - 1) * ctx->out_bytes();
+    }
     for (const corr::GpuPlacement &pl : ctx->plans) {
-        const bool needed = !pl.baselines_are_contiguous ||
-                            cfg->split_mode == CORR_SPLIT_TIME_SLICE;
-        if (!needed) continue;
+        if (pl.baselines_are_contiguous || cfg->split_mode == CORR_SPLIT_TIME_SLICE) continue;
         const size_t need = static_cast<size_t>(pl.baselines.size()) *
                             static_cast<size_t>(cfg->n_freq) * sizeof(float) * 2 *
                             static_cast<size_t>(cfg->rows_per_fetch);
@@ -714,6 +720,27 @@ extern "C" corr_status corr_create(const corr_config *cfg, void **out_ctx) {
         cudaFreeHost(ctx->staging);
         delete ctx;
         return fail(st, msg);
+    }
+
+    // Room on device 0 for a peer's partial row, which is where the time-slice
+    // sum is built. One row's worth of every row in a batch, because the peers'
+    // partials are the same shape as device 0's own.
+    if (cfg->split_mode == CORR_SPLIT_TIME_SLICE && ctx->n_devices() > 1) {
+        if (select_device(ctx, 0) != CORR_OK) {
+            // Leave the error from select_device in place.
+            for (corr::GpuState *g : ctx->gpus) corr::gpu_destroy(g);
+            cudaFreeHost(ctx->staging);
+            delete ctx;
+            return fail(CORR_ERR_INTERNAL, "cannot select device 0 for the peer row");
+        }
+        st = corr::gpu_peer_row_reserve(ctx->gpus[0], ctx->out_bytes());
+        if (st != CORR_OK) {
+            const std::string msg = corr::last_error();
+            for (corr::GpuState *g : ctx->gpus) corr::gpu_destroy(g);
+            cudaFreeHost(ctx->staging);
+            delete ctx;
+            return fail(st, msg);
+        }
     }
 
     *out_ctx = ctx;
@@ -1138,7 +1165,28 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
     const size_t baseline_bytes =
         static_cast<size_t>(ctx->cfg.n_freq) * sizeof(float) * 2;
     char *base = static_cast<char *>(out);
+    const bool time_slice = ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE;
     int32_t rows = -1;
+
+    // Under the time-slice split the devices hold *partial* rows -- each a whole
+    // row of baselines over that device's share of the frames -- and they have to
+    // be added together. That addition happens on device 0 now instead of in a
+    // loop here, which changes which device's copy is the last one: device 0's
+    // accumulator is where the sum is built, so it is fetched *after* the loop
+    // rather than first.
+    //
+    // Why it moved, measured at this machine's production geometry (24 stations,
+    // n_freq 16384, four devices, one fetch per row): the fetch took 11.2 ms with
+    // the sum on the host and 7.6 ms with it on the device. The 3.6 ms is host
+    // CPU the pipeline thread no longer spends, out of a call it used to spend
+    // 11.2 ms inside.
+    //
+    // The comment this replaces recorded the host loop as 118 ms of a 167 ms
+    // fetch. Whatever geometry that came from, it is not this one -- the loop's
+    // cost scales with the baseline count and rows_per_fetch, and 40 stations is
+    // 2.7x these baselines rather than 30x. It is left mentioned only so that the
+    // number is not mistaken for a constant: it is geometry-dependent, and the
+    // figure that justifies the change is the one above.
     for (int d = 0; d < ctx->n_devices(); ++d) {
         corr_status st = select_device(ctx, d);
         if (st != CORR_OK) return st;
@@ -1147,44 +1195,32 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
         const size_t slice = ctx->slice_bytes(d);
         uint64_t t_part = 0;
         const uint64_t tf0 = now_ns();
-        if (ctx->cfg.split_mode == CORR_SPLIT_TIME_SLICE) {
-            // Every device holds a *partial* row -- a whole row of baselines over
-            // its share of the frames -- and the partials are added on the host.
-            // Device 0's is the output until the others are added to it, so it
-            // lands in the caller's buffer directly instead of in the scratch and
-            // then being copied out: a partial row is contiguous in baseline
-            // order, so the destination pitch is 0 and one copy does it.
-            //
-            // That pass is not a detail. Measured with CORR_FETCH_DEBUG at 24
-            // stations, one second integration: the D2H of four partial rows runs
-            // at 26 GB/s, and the host-side copy-or-add runs at 10.6 GB/s and
-            // takes 118 ms of the fetch's 167 ms. At one frame per row the same
-            // two halves are 58 us and 210 us.
-            const uint64_t tp0 = now_ns();
+        if (time_slice) {
             if (d == 0) {
-                if ((st = corr::gpu_row_fetch(ctx->gpus[0], out, ctx->out_bytes(), 0,
-                                              &got)) != CORR_OK)
-                    return st;
+                // Nothing yet: see above, its accumulator is the sum.
             } else {
-                if (ctx->scatter == nullptr ||
-                    ctx->scatter_bytes < ctx->out_bytes())
+                const size_t stage_need =
+                    static_cast<size_t>(ctx->n_devices() - 1) * ctx->out_bytes();
+                if (ctx->scatter == nullptr || ctx->scatter_bytes < stage_need)
                     return fail(CORR_ERR_INTERNAL,
-                                "partial-row buffer is missing or too small");
-                if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)],
-                                              ctx->scatter, ctx->scatter_bytes, 0,
-                                              &got)) != CORR_OK)
+                                "partial-row staging is missing or too small");
+                // One staging slice per peer device, not one shared: a later
+                // device's D2H would otherwise land on bytes an earlier device's
+                // host-to-device copy was still reading.
+                char *stage = static_cast<char *>(ctx->scatter) +
+                              static_cast<size_t>(d - 1) * ctx->out_bytes();
+                if ((st = corr::gpu_row_fetch(ctx->gpus[static_cast<size_t>(d)], stage,
+                                              ctx->out_bytes(), 0, &got)) != CORR_OK)
                     return st;
-            }
-            t_part = now_ns() - tp0;
-            if (got > 0) {
-                const float *src = static_cast<const float *>(ctx->scatter);
-                float *dst = reinterpret_cast<float *>(out);
-                const size_t values = (size_t)got * pitch / sizeof(float);
-                g_fetch_dbg.bytes += values * sizeof(float);
-                if (d > 0) {
-                    const uint64_t ts0 = now_ns();
-                    for (size_t i = 0; i < values; ++i) dst[i] += src[i];
-                    g_fetch_dbg.ns_sum += now_ns() - ts0;
+                t_part = now_ns() - tf0;
+                if (got > 0) {
+                    g_fetch_dbg.bytes += static_cast<size_t>(got) * slice;
+                    if ((st = corr::gpu_row_add_peer_row(ctx->gpus[0],
+                                                         ctx->gpus[static_cast<size_t>(d)],
+                                                         stage,
+                                                         static_cast<size_t>(got) * slice)) !=
+                        CORR_OK)
+                        return st;
                 }
             }
             g_fetch_dbg.ns_transfer += t_part;
@@ -1206,13 +1242,35 @@ extern "C" corr_status corr_rows_fetch(void *h, void *out, size_t out_bytes,
                 return st;
         }
         ctx->timing[static_cast<size_t>(d)].fetch += now_ns() - tf0;
-        if (d == 0) {
+        if (time_slice) {
+            // Device 0 reports after the loop; the peers have to agree among
+            // themselves, and with it.
+            if (d == 0) continue;
+        }
+        if (rows < 0) {
             rows = got;
         } else if (got != rows) {
             return failf(CORR_ERR_INTERNAL,
                          "devices disagree on fetched rows: device %d returned %d, "
-                         "device 0 returned %d", d, got, rows);
+                         "an earlier device returned %d", d, got, rows);
         }
+    }
+
+    if (time_slice) {
+        // The sum is complete in device 0's accumulator, and its fetch is what
+        // copies it out -- and what clears that accumulator for the next row.
+        // Its D2H runs on the same stream as the peer transfers and adds, so it
+        // is ordered behind every one of them.
+        int32_t got = 0;
+        const uint64_t tf0 = now_ns();
+        corr_status st = corr::gpu_row_fetch(ctx->gpus[0], out, ctx->out_bytes(), 0, &got);
+        ctx->timing[0].fetch += now_ns() - tf0;
+        if (st != CORR_OK) return st;
+        if (rows >= 0 && got != rows)
+            return failf(CORR_ERR_INTERNAL,
+                         "device 0 returned %d rows, the other devices returned %d", got,
+                         rows);
+        rows = got;
     }
     *out_rows = rows < 0 ? 0 : rows;
     g_fetch_dbg.calls += 1;

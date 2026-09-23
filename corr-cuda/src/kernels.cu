@@ -318,6 +318,10 @@ struct GpuState {
     float2 *d_acc = nullptr;
     size_t row_elems = 0;   // n_baseline * n_freq complex
     size_t acc_bytes = 0;
+    /// Where another device's row lands before it is added in. Only allocated on
+    /// the device that sums the partials, and only for the time-slice split.
+    float2 *d_peer = nullptr;
+    size_t d_peer_bytes = 0;
 
     int2 *d_pairs = nullptr;
     size_t d_pairs_bytes = 0;
@@ -380,6 +384,7 @@ void free_all(GpuState *g) {
         cudaFree(b.d_mask);
     }
     cudaFree(g->d_acc);
+    cudaFree(g->d_peer);
     cudaFree(g->d_pairs);
     delete g;
 }
@@ -387,6 +392,20 @@ void free_all(GpuState *g) {
 /// Record an event on `s` so that a later wait on it does not block.
 corr_status prime_event(cudaEvent_t e, cudaStream_t s) {
     return cuda_check(cudaEventRecord(e, s), "cudaEventRecord(prime)");
+}
+
+/// `dst += src`, elementwise over complex64 samples.
+///
+/// The row-sum the time-slice split needs when its partial rows are added
+/// together. It exists as a kernel rather than as a host loop because the host
+/// loop measured 10.6 GB/s against the 26 GB/s the transfer beside it ran at,
+/// and because doing it here is what lets the whole fetch stay off the CPU.
+__global__ void add_rows_kernel(float2 *dst, const float2 *src, size_t n) {
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        dst[i].x += src[i].x;
+        dst[i].y += src[i].y;
+    }
 }
 
 /// Queue `fn(user)` on the notify stream, to run once `ev` has completed.
@@ -975,6 +994,64 @@ corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_p
     g->pending = 0;
     g->cur_row = 0;
     return CORR_OK;
+}
+
+corr_status gpu_peer_row_reserve(GpuState *g, size_t bytes) {
+    if (g == nullptr) return gpu_fail(CORR_ERR_ARG, "gpu_peer_row_reserve: null state");
+    if (bytes == 0) return gpu_fail(CORR_ERR_ARG, "gpu_peer_row_reserve: bytes must be > 0");
+    if (g->d_peer != nullptr && g->d_peer_bytes >= bytes) return CORR_OK;
+    // The allocation belongs to this device, and the caller may have made another
+    // one current -- every stream and pointer below is this device's.
+    corr_status st = cuda_check(cudaSetDevice(g->device), "cudaSetDevice(peer row)");
+    if (st != CORR_OK) return st;
+    if (g->d_peer != nullptr) {
+        cudaFree(g->d_peer);
+        g->d_peer = nullptr;
+        g->d_peer_bytes = 0;
+    }
+    cudaError_t e = cudaMalloc(reinterpret_cast<void **>(&g->d_peer), bytes);
+    if (e != cudaSuccess)
+        return gpu_fail(CORR_ERR_NOMEM,
+                        std::string("cudaMalloc(peer row ") + std::to_string(bytes) +
+                            ") failed: " + cudaGetErrorString(e));
+    g->d_peer_bytes = bytes;
+    return CORR_OK;
+}
+
+corr_status gpu_row_add_peer_row(GpuState *dst, const GpuState *src,
+                                 const void *host_src, size_t bytes) {
+    if (dst == nullptr || src == nullptr || host_src == nullptr)
+        return gpu_fail(CORR_ERR_ARG, "gpu_row_add_peer_row: null argument");
+    if (bytes == 0) return gpu_fail(CORR_ERR_ARG, "gpu_row_add_peer_row: bytes must be > 0");
+    if (dst->d_peer == nullptr || dst->d_peer_bytes < bytes)
+        return gpu_fail(CORR_ERR_INTERNAL, "gpu_row_add_peer_row: no room reserved");
+
+    // Everything below -- the stream, the destination buffer, the kernel -- is
+    // device `dst`'s, and the caller has just made `src`'s device current,
+    // because that is whose row it fetched. A launch on another device's stream
+    // is what `cudaErrorInvalidResourceHandle` means.
+    corr_status st = cuda_check(cudaSetDevice(dst->device), "cudaSetDevice(peer add)");
+    if (st != CORR_OK) return st;
+
+    // The bytes are where they are because of `src`'s own fetch, which ran on
+    // another device's stream. Waiting on its *event* rather than on its stream
+    // is what makes that work across devices, and it is why those events are
+    // created with `cudaEventDisableTiming` -- a cross-device wait requires it.
+    st = cuda_check(cudaStreamWaitEvent(dst->fetch_stream, src->fetch_done, 0),
+                    "cudaStreamWaitEvent(peer fetch_done)");
+    if (st != CORR_OK) return st;
+    if ((st = cuda_check(cudaMemcpyAsync(dst->d_peer, host_src, bytes,
+                                         cudaMemcpyHostToDevice, dst->fetch_stream),
+                         "cudaMemcpyAsync(peer row)")) != CORR_OK)
+        return st;
+
+    const size_t elems = bytes / sizeof(float2);
+    const int threads = 256;
+    int blocks = static_cast<int>((elems + threads - 1) / threads);
+    if (blocks > 1024) blocks = 1024;
+    add_rows_kernel<<<blocks, threads, 0, dst->fetch_stream>>>(dst->d_acc, dst->d_peer,
+                                                               elems);
+    return cuda_check(cudaGetLastError(), "add_rows_kernel launch");
 }
 
 corr_status gpu_row_fetch_scattered(GpuState *g, const int32_t *global_baselines,

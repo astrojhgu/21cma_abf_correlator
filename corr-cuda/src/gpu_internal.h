@@ -123,6 +123,28 @@ corr_status gpu_rows_pending(GpuState *g, int32_t *out_pending);
 corr_status gpu_row_fetch(GpuState *g, void *out, size_t out_bytes, size_t dst_pitch,
                           int32_t *out_rows);
 
+/// Make room on this device to receive another device's row.
+///
+/// For the split where every device holds a partial row of the whole baseline
+/// axis and they have to be summed; only the device that does the summing needs
+/// it. Call once, before the first fetch.
+corr_status gpu_peer_row_reserve(GpuState *g, size_t bytes);
+
+/// Add the row `src` last fetched, now sitting in `host_src`, to `dst`'s
+/// accumulator.
+///
+/// The transfer and the add are queued on `dst`'s fetch stream, ordered behind
+/// `src`'s own fetch event, and nothing here blocks. That is the point: the
+/// addition used to be a host loop over the row, and at 24 stations and 16384
+/// channels that loop measured 118 ms of a 167 ms fetch -- 10.6 GB/s of host
+/// memcpy against the 26 GB/s the transfer alongside it ran at.
+///
+/// `host_src` must be page-locked: it is the destination of `src`'s D2H, and an
+/// H2D out of pageable memory would be staged through the runtime's own buffer,
+/// which is the synchronous copy this exists to avoid.
+corr_status gpu_row_add_peer_row(GpuState *dst, const GpuState *src,
+                                 const void *host_src, size_t bytes);
+
 /// Same, but for a device whose baselines are scattered through the global
 /// numbering: the slice is fetched contiguously into `scratch` and then copied
 /// out one baseline at a time to out[global_baseline * row_bytes_each]. The
