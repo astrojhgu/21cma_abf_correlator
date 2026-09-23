@@ -17,6 +17,7 @@
 | `ab_zerofill.sh` | 补零解耦的 A/B 单腿：同一份确定性回放（`--start-counter` 固定、`--gap-len/--gap-at` 造缺口、回放先起）打进指定二进制，存下 `blocks.csv`、运行报告与前后 load |
 | `compare_blocks.py` | 两条腿的 `blocks.csv` 逐行比对（按 `first_frame_id`+station 匹配），打印共有行数、逐行是否相同、以及排除启动首行后的缺失率 |
 | `run-24-nf16384.sh` | 手动跑一腿 24 路 / 16384 信道 / 1 s：前置检查（没有别的 corr 在跑、卡上有没有别的 CUDA 进程、二进制是否比源码旧）→ 起跑（`MODE=async|sync`、`WORKERS=N`，**默认一直跑到 Ctrl-C**，`DUR=<秒>` 可改成固定时长；起跑前还会花 20 s 做**网卡层静默检查**，已经在丢就当场警告，`CHK_NIC=0` 可跳过）→ 收尾按 `longrun_report.py` 判读；输出固定落 `/scratch/jhgu/corr/`，日志同目录 |
+| `run-24-nf16384-sync.sh` | 姊妹脚本的**同步腿固定版**：复用 `run-24-nf16384.sh` 做前置检查/日志/判读（`MODE=sync`），自己只多做三件事 —— 起跑前 `corr --check`（配置 + CUDA ABI + 编号一致性，只有同步二进制有这个开关，`CHECK=0` 跳过）、拒绝 `MODE=async`/`WORKERS=N` 这类「会让人以为在跑同步」的环境变量、以及按**同步腿的语义**解读日志里的 `STOPPED:`（最关键的一条：前端换纪元时同步腿**按设计停下**、异步腿会自己重置继续，所以长跑 A/B 的结束时刻本就不同；`RESTART_ON_EPOCH=1` 时它自己按剩余时长重跑、并 `NEW_SET=1` 另起一套）。因为纪元变化停下且不重跑时退出码 3。脚本每次跑之前会拿 `corr-rs/src/stop.rs` 对一遍停止原因的短语（改文案不会报错、只会让解释**静默**失效，此处已踩过） |
 | `async_bench.py` | 收包形状的 A/B 台架：同一份配置只换核池，交错跑 `corr`（一线程一站）与 `corr-async --workers W`（默认构建即产出），每腿 25 s；判据是**送达率**（收到的包 / 回放发出的包）＋三层丢包（应用缺口、`/proc/net/udp` 的 `drops`、网卡 `rx_missed_errors`）＋CPU µs/包。设计与数据见 `docs/DESIGN-async-receive.md` |
 
 ## phase_check
