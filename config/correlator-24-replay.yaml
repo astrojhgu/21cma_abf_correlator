@@ -214,7 +214,9 @@ cpu:
 monitoring:
   # 每行 JSON 输出到 stderr 的间隔。
   interval_ms: 1000
-  # 同时追加写到 <output_dir>/<run_name>/stats.csv。
+  # 接受但**不实现**：写了不会报错，也不会生成 stats.csv。本进程自己的记录是 stderr 那行
+  # 与运行报告；要看历史曲线，让监测程序按秒轮询 /status.json 自己攒
+  # （tools/corr-web.py 就是这么做的）。
   stats_csv: true
 
 # ---------------------------------------------------------------------------

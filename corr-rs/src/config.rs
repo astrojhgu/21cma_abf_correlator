@@ -528,11 +528,12 @@ pub struct MonitoringCfg {
     /// **0 disables it**, which is the right setting for a measurement whose
     /// output is being parsed line by line.
     pub interval_ms: u64,
-    /// Append the same numbers to `<output_dir>/<run_name>/stats.csv`.
+    /// **Accepted and ignored**: nothing writes `<output_dir>/<run_name>/stats.csv`.
     ///
-    /// **Not implemented yet**: the field is accepted and ignored, so that a
-    /// configuration written for it does not silently mean something else. The
-    /// line on stderr is the live view; the run report is the record.
+    /// The field exists so that a configuration written for it does not silently
+    /// mean something else. The line on stderr is the live view, the run report is
+    /// the record, and a monitor that wants history polls `/status.json` once a
+    /// second and keeps its own (`tools/corr-web.py` does exactly that).
     pub stats_csv: bool,
     /// The read-only status endpoint, for a monitor that runs as its own program
     /// (`tools/corr-web.py` is one): `GET /status.json` returns one JSON object,
