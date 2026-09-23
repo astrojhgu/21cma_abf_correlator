@@ -374,6 +374,17 @@ reactor 开销被它除掉了。
 
 ### 6.1 分支现状
 
+**合入情况（2026-09-23）**：§5.4 以前的全部收包改动（`no_recvmmsg` → `recvfrom-direct` →
+`recvfrom-std`）、异步后端的两个改进（tokio 持有 socket、一轮读干）以及 CUDA 侧三个提交
+（等待交回调用方、time-slice 部分行在设备上求和、取行不再等 + 与缩放的先后次序修复）已经
+cherry-pick 进 `master`。`pub(crate)` → `pub` 的那些放宽**没有**进 master：它们只为那个
+独立的实验 crate 存在。
+
+§5.5 起的一整个实验（一个 runtime 的 `corr-async`、四个探针、`tools/oneruntime_*`）
+留在分支 `async-tokio` 上存档，不再推进；它的结论是：异步收包的立论前提"站数 > 核数"
+正好是实测丢包的区间，而这张网卡在 4.69 Mpps 下每个核上的余量都已被占满
+（见 §5.9 与分支上的文档）。
+
 - `no_recvmmsg`（`f2b927c`）：只换收包系统调用，**其余结构未动**，所以它是干净的 A/B 变体。
 - `recvfrom-direct`：在它之上把批次形状的 API 也去掉，收包变成一次 `recvfrom` 返回一个
   `Packet`。且实测与 `no_recvmmsg` 逐项相同。
